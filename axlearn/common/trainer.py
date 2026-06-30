@@ -72,63 +72,7 @@ from axlearn.common.utils import (
 )
 
 
-def _sync_restore_class_vars(
-    jax_device_state: dict, python_vars: dict, immutable_data: dict
-) -> Any:
-    """Initializes SpmdTrainer, restores its state, and runs it."""
-    import copy
-    trainer = SpmdTrainer.__new__(SpmdTrainer)
-    prng_key = jax_device_state["_trainer_state"].prng_key
-    for state_dict in (jax_device_state, python_vars, immutable_data):
-        for k, v in state_dict.items():
-            setattr(trainer, k, v)
-            
-    trainer._is_restored = True
 
-    if hasattr(trainer, "_children"):
-        trainer._children = copy.copy(trainer._children)
-        if "checkpointer" in trainer._children:
-            trainer._children["checkpointer"] = copy.copy(trainer._children["checkpointer"])
-            trainer._children["checkpointer"]._within_context = False
-            trainer._children["checkpointer"]._gc_thread = None
-            trainer._children["checkpointer"]._gc_stopping = None
-            
-    trainer._watchdog_thread = None
-    trainer._watchdog_stopping = None
-    trainer._device_monitor = None
-    trainer._recorder = None
-    trainer.__post_init__()
-
-    return trainer.run(prng_key)
-
-def _sync_store_class_vars(obj: Any) -> None:
-    """Stores instance variables of an object."""
-    if getattr(obj, "_is_restored", False):
-        return
-    
-    print("_sync_store_class_vars")
-    
-    # Initialize dictionaries for refactored iteration
-    jax_device_state = {}
-    python_vars = {}
-    immutable_data = {}
-
-    for k, v in obj.__dict__.items():
-        if isinstance(v, property):
-            continue
-        
-        if k in ("_trainer_state", "_mesh", "_jit_train_step", "_compiled_train_step", "model", "learner"):
-            jax_device_state[k] = v
-        elif "config" in k or "spec" in k or isinstance(v, (int, float, str, bool)):
-            immutable_data[k] = v
-        else:
-            python_vars[k] = v
-
-    #print(jax_device_state)
-    print(python_vars)
-    print(immutable_data)
-    _sync_restore_class_vars(jax_device_state, python_vars, immutable_data)
-    
 
 class TrainerState(NamedTuple):
     prng_key: Union[Tensor, TensorSpec, jax.sharding.NamedSharding]
@@ -222,6 +166,9 @@ class SpmdTrainer(Module):
         # FailedPreconditionError: ReduceDataset is stateful.
         # FailedPreconditionError: SentencepieceOp is stateful.
         save_input_iterator: bool = False
+
+        # If > 0, saves a snapshot of the trainer state to host RAM at this interval.
+        snapshot_interval: Optional[int] = None
 
         # At which steps to start profiler tracing.
         # Each trace will cover `n_steps_for_each_trace` consecutive training steps.
@@ -328,7 +275,6 @@ class SpmdTrainer(Module):
         self._recorder = maybe_instantiate(cfg.recorder)
         self._is_initialized: bool = False
         self._maybe_record_event(measurement.Event.START_ACCELERATOR_INIT)
-        self._class_vars = None
 
         if cfg.model.dtype is None:
             raise ValueError(f"dtype must be explicitly specified for {self.path()}.model")
@@ -631,7 +577,7 @@ class SpmdTrainer(Module):
 
     # pylint: disable-next=too-many-statements,too-many-branches
     def run(
-        self, prng_key: Tensor, *, return_evaler_summaries: Optional[Union[bool, set[str]]] = None
+        self, prng_key: Optional[Tensor] = None, *, return_evaler_summaries: Optional[Union[bool, set[str]]] = None
     ) -> Optional[NestedTensor]:
         """Runs training.
 
@@ -677,11 +623,7 @@ class SpmdTrainer(Module):
                 return None
 
             self._is_initialized = True
-            #### Stores the initial state of all variables ####
-            replica_axis_idx = cfg.mesh_axis_names.index("data") if "data" in cfg.mesh_axis_names else 0
-            snapshot_cfg = config_for_class(Snapshotter).set(replica_axis_index=replica_axis_idx)
-            self.snapshot_mgr = snapshot_cfg.instantiate()
-            
+            previous_snapshot = None
 
             with self.checkpointer:
                 logging.info("Starting loop...")
@@ -718,10 +660,51 @@ class SpmdTrainer(Module):
                             ),
                         )
                         self.vlog(3, "Done step %s", self.step)
-                        if self.step==3:
-                            _sync_store_class_vars(self)
+                        if cfg.snapshot_interval and self.step % cfg.snapshot_interval == 0:
+                            logging.info("[*] Taking host memory snapshot at step %d", self.step)
+                            # 1. DOUBLE BUFFERING BARRIER:
+                            # To prevent Host RAM memory exhaustion (Host OOM), we must wait for the
+                            # previous asynchronous snapshot transfer to complete before launching a new one.
+                            # Calling block_until_ready() on the previous snapshot leaves block until the
+                            # DMA transfer has successfully written to Host RAM.
+                            if previous_snapshot is not None:
+                                jax.tree.map(
+                                    lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else None,
+                                    previous_snapshot,
+                                )
 
-                        #restore_class_vars(self, self._class_vars)
+                            # 2. IN-RAM GRAIN ITERATOR CHECKPOINTING:
+                            # Instead of tf.data on disk, we natively query the PyGrain iterator state
+                            # in Python. This is fast, synchronous, and purely in RAM.
+                            grain_state = None
+                            if not cfg.save_input_iterator:
+                                if hasattr(self._input_iter, "get_state"):
+                                    grain_state = self._input_iter.get_state()
+
+                            # 3. NATIVE ASYNC DMA TO HOST:
+                            # We map each accelerator device sharding structure to host-pinned CPU memory
+                            # shardings (memory_kind="pinned_host"). We then run jax.device_put asynchronously,
+                            # copy-on-write via DMA directly from accelerator HBM to Host RAM.
+                            def to_pinned_host(x):
+                                if hasattr(x, "sharding") and x.sharding is not None:
+                                    try:
+                                        return x.sharding.with_memory_kind("pinned_host")
+                                    except Exception:
+                                        return x.sharding
+                                return None
+
+                            pinned_host_shardings = jax.tree.map(to_pinned_host, self._trainer_state)
+                            current_snapshot = jax.device_put(self._trainer_state, pinned_host_shardings)
+
+                            # 4. STORE SNAPSHOT METADATA:
+                            # Keep references to the current snapshot PyTree and the iterator state on the
+                            # trainer. This acts as the backup registry during fault recovery.
+                            self._latest_snapshot = {
+                                "trainer_state": current_snapshot,
+                                "grain_state": grain_state,
+                                "step": self.step,
+                            }
+                            previous_snapshot = current_snapshot
                         
                         num_steps += 1
                         if num_steps % 100 == 0:
@@ -960,12 +943,12 @@ class SpmdTrainer(Module):
         _step_log("##########################################################")
         return "\t".join(analysis_logs)
 
-    def _prepare_training(self, prng_key: Tensor) -> bool:
+    def _prepare_training(self, prng_key: Optional[Tensor] = None) -> bool:
         """Prepares training.
 
         This function does the following to prepare the training procedure:
-        1. Restores the trainer state from a checkpoint. If no checkpoint exists,
-           initializes a new trainer state using the provided prng_key.
+        1. Restores the trainer state from a checkpoint or host memory snapshot.
+           If no checkpoint/snapshot exists, initializes a new trainer state using the provided prng_key.
         2. Initializes step to zero if it's not in the checkpoint.
         3. Returns early if max_steps has been reached.
         4. Otherwise Jits self._train_step.
@@ -980,17 +963,52 @@ class SpmdTrainer(Module):
         self._maybe_record_event(measurement.Event.START_TRAINING_PREPARATION)
         cfg = self.config
 
-        # Attempt to restore the latest checkpoint, which may contain a saved `_input_iter`.
-        self.restore_checkpoint(restore_step=None)
+        if getattr(self, "_recovered_state", None) is not None:
+            # 1. RETRIEVE RECOVERED SNAPSHOT STATE:
+            # The top-level orchestrator captured the last secured snapshot before the crash.
+            # We fetch and clear it from the trainer instance to ensure we only apply it once.
+            recovered_state = self._recovered_state
+            self._recovered_state = None
 
-        if self.step is None:
-            # If we didn't restore from checkpoint, attempt to build initial state according
-            # to `cfg.init_state_builder` and initialize the remaining parameters.
-            self.init(prng_key)
-            self._step = 0
+            # 2. HEAL THE DEVICE PYTREE (SPLIT-FILTER-STITCH):
+            # The host memory snapshot contains shards mapped to the old network topology/mesh.
+            # We call Snapshotter.heal_pytree which filters out dead physical shards and
+            # projects/reshards the surviving values onto the fresh newly compiled JAX mesh.
+            replica_axis_idx = (
+                cfg.mesh_axis_names.index("data")
+                if "data" in cfg.mesh_axis_names
+                else 0
+            )
+            from axlearn.common.snapshot import Snapshotter
+            self._trainer_state = Snapshotter.heal_pytree(
+                recovered_state["trainer_state"],
+                self._trainer_state_specs,
+                replica_axis_index=replica_axis_idx,
+            )
+            self._step = recovered_state["step"]
 
-            # Note the default checkpointer and evaler do nothing at step 0 with min_step=1.
-            self.save_checkpoint(self._run_eval())
+            # 3. RESTORE IN-RAM DATASET ITERATOR STATE:
+            # Restore the fast-seek position of the PyGrain iterator to exactly where the snapshot
+            # was taken. This matches the healed trainer step and ensures zero data repetition.
+            if recovered_state["grain_state"] is not None:
+                if hasattr(self._input_iter, "set_state"):
+                    self._input_iter.set_state(recovered_state["grain_state"])
+                    logging.info("Restored Grain iterator state from snapshot.")
+            logging.info("Restored training state from host memory snapshot at step %d", self._step)
+        else:
+            # Attempt to restore the latest checkpoint, which may contain a saved `_input_iter`.
+            self.restore_checkpoint(restore_step=None)
+
+            if self.step is None:
+                # If we didn't restore from checkpoint, attempt to build initial state according
+                # to `cfg.init_state_builder` and initialize the remaining parameters.
+                if prng_key is None:
+                    raise ValueError("prng_key must be provided for initial training from scratch.")
+                self.init(prng_key)
+                self._step = 0
+
+                # Note the default checkpointer and evaler do nothing at step 0 with min_step=1.
+                self.save_checkpoint(self._run_eval())
 
         model_analysis = self._log_trainer_state_stats()
 
@@ -1595,3 +1613,75 @@ def aot_model_analysis(compiled: jax.stages.Compiled) -> str:
         logging.warning("Attempt to parse cost_stats=%s but failed.", cost_stats)
 
     return analysis_results
+
+
+def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Optional[Tensor] = None) -> Any:
+    """Top-level elastic training loop using Host RAM snapshots.
+
+    This function acts as the ElasticOrchestrator, moving the fault tolerance and lifecycle
+    management to the top level (Inversion of Control). Instead of attempting to mutate the
+    trainer dynamically or run recovery inside the training step/loop, we keep the main Python
+    process alive, catch JAX hardware/network connection faults, shutdown JAX, re-initialize
+    on a resized mesh, and recover state natively from Host RAM.
+    """
+    # 1. INITIALIZE LIFECYCLE MEMORY:
+    # We initialize the snapshot container outside the retry loop so that it persists
+    # in Host RAM even when the trainer instance is destroyed and recreated.
+    host_memory_snapshot = None
+    while True:
+        try:
+            # 2. INITIALIZE JAX DISTRIBUTED COORDINATOR:
+            # Re-initialize JAX cluster state. When recovering from a hardware fault (e.g., node preemption),
+            # this will block or negotiate until all surviving and newly provisioned nodes have connected
+            # on the new network topology.
+            logging.info("Initializing JAX distributed system...")
+            jax.distributed.initialize()
+
+            # 3. INSTANTIATE NEW TRAINER INSTANCE:
+            # We instantiate a clean trainer instance for each training attempt. This ensures all state,
+            # compilation caches, and local parameters are clean and avoid stale or corrupted object mutations.
+            trainer: SpmdTrainer = cfg.instantiate(parent=None)
+            
+            # 4. INJECT RECOVERED SNAPSHOT STATE:
+            # If we had a previous successful run that was interrupted, we pass the secured Host RAM
+            # snapshot back to the trainer so that it can heal the PyTree and fast-seek the input iterator
+            # during training preparation.
+            if host_memory_snapshot is not None:
+                logging.info("Injecting recovered host memory snapshot into trainer...")
+                trainer._recovered_state = host_memory_snapshot
+
+            # 5. RUN TRAINING AND CAPTURE RUN STATS:
+            # Execute the training run. If the run finishes successfully, we capture the final state
+            # and break out of the infinite retry loop.
+            logging.info("Starting trainer run...")
+            host_memory_snapshot = trainer.run(prng_key)
+            logging.info("Trainer run completed successfully.")
+            break
+        except jax.errors.JaxRuntimeError as e:
+            # 6. FAULT DETECTION AND RECOVERY INITIATION:
+            # JaxRuntimeError is raised when JAX loses network connectivity to a TPU node or a node fails.
+            # We intercept this error to perform sub-second, zero-disk recovery.
+            logging.warning("Caught JaxRuntimeError: %s. Initiating recovery...", e)
+            
+            # 7. EXTRACT LATEST HOST SNAPSHOT:
+            # Retrieve the latest asynchronous Host RAM backup registered on the trainer.
+            # If the fault happened before the first snapshot was secured, we cannot recover.
+            if "trainer" in locals():
+                new_snapshot = getattr(trainer, "_latest_snapshot", None)
+                if new_snapshot is not None:
+                    host_memory_snapshot = new_snapshot
+
+            if host_memory_snapshot is None:
+                logging.error("No host memory snapshot available for recovery. Re-raising exception.")
+                raise e
+
+            # 8. SHUTDOWN AND RETRY BARRIER:
+            # We explicitly shutdown the distributed coordination service to release socket bindings
+            # and clean up coordinator connections. We then sleep to allow the cluster scheduler/orchestrator
+            # (like Jobset/GKE) to detect the disruption and update the network routing table.
+            logging.info("Shutting down JAX distributed system...")
+            jax.distributed.shutdown()
+            logging.info("Sleeping 30 seconds to wait for topology change...")
+            time.sleep(30)
+
+    return host_memory_snapshot

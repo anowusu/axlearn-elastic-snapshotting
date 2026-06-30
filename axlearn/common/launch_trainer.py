@@ -208,8 +208,11 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                 f,
             )
 
-    trainer: SpmdTrainer = trainer_config.instantiate(parent=None)
     prng_key = jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
-    output = trainer.run(prng_key)
+    # We substitute the standard direct trainer run with the top-level elastic training loop
+    # orchestrator. This wraps JAX initialization, shutdown, and error recovery/retries
+    # natively within the same Python process.
+    from axlearn.common.trainer import elastic_training_loop
+    output = elastic_training_loop(trainer_config, prng_key=prng_key)
     measurement.record_event(measurement.Event.END_JOB)
     return output

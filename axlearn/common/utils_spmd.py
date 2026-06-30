@@ -45,6 +45,7 @@ def setup(
     # Use a GSPMD-friendly PRNG implementation.
     jax.config.update("jax_default_prng_impl", "rbg")
 
+
     global _jax_distributed_initialized  # pylint: disable=global-statement
     if not _jax_distributed_initialized:
         init_kwargs = {}
@@ -97,3 +98,4 @@ def setup(
 
         jax.distributed.initialize(**init_kwargs)
         _jax_distributed_initialized = True
+

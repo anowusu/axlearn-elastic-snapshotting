@@ -120,6 +120,9 @@ class RegistryTest(TestCase):
                     cfg.find_links,
                 )
             self.assertSameElements(["tpu", "test"], cfg.extras)
+            if hasattr(cfg, "target"):
+                self.assertEqual("tpu", cfg.target)
+
 
 
 class CloudBuildBundlerTest(TestCase):

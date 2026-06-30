@@ -324,6 +324,10 @@ class BaseBastionManagedJob(FlagConfigurable):
             cfg.bundler = get_bundler_config(
                 bundler_type=fv.bundler_type, spec=fv.bundler_spec, fv=fv
             )
+            if fv.runner_name and "tpu" in fv.runner_name:
+                from axlearn.cloud.gcp.bundler import with_tpu_extras
+                cfg.bundler = with_tpu_extras(cfg.bundler)
+
             # Build launch command. We take the same flags provided to this module and run the
             # command again, this time on the bastion with action="run".
             # For backwards compatibility with legacy behavior where command is specified with argv

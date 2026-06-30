@@ -474,7 +474,10 @@ def with_tpu_extras(bundler: Bundler.Config) -> Bundler.Config:
     extras = canonicalize_to_list(bundler.extras)
     extras.append("tpu")
     bundler.set(extras=extras)
+    if hasattr(bundler, "target"):
+        maybe_set_config(bundler, target="tpu")
     return bundler
+
 
 
 if __name__ == "__main__":

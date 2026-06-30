@@ -76,9 +76,14 @@ ARG EXTRAS=
 # Ensure we install the TPU version, even if building locally.
 # Jax will fallback to CPU when run on a machine without TPU.
 COPY pyproject.toml README.md /root/
+COPY pathwaysutils /opt/venv/lib/python3.12/site-packages/pathwaysutils
+COPY pathwaysutils-0.1.10.dist-info /opt/venv/lib/python3.12/site-packages/pathwaysutils-0.1.10.dist-info
 RUN uv pip install -qq --prerelease=allow .[core,tpu] && uv cache clean
+
 RUN if [ -n "$EXTRAS" ]; then uv pip install -qq .[$EXTRAS] && uv cache clean; fi
 COPY . .
+RUN uv pip install -qq --force-reinstall --no-deps . && uv cache clean
+
 
 ################################################################################
 # Colocated Python container spec.                                             #

@@ -97,7 +97,8 @@ gcp = [
 tpu = [
     "axlearn[gcp]",
     "jax[tpu]==0.10.1",  # must be >=0.4.19 for compat with v5p.
-    "pathwaysutils==0.1.2",  # For JAX+Pathways single-controller accelerator coordinator.
+    "fastapi",
+    "uvicorn",
 ]
 # Dataflow dependencies.
 dataflow = [

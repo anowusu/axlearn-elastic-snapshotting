@@ -86,6 +86,7 @@ def running_from_vm() -> bool:
     return (out.returncode == 0) and "Metadata-Flavor: Google" in out.stdout
 
 
+
 def running_from_k8s() -> bool:
     """Check if we're running from K8s."""
     return os.environ.get("KUBERNETES_SERVICE_HOST", None) is not None
