@@ -508,6 +508,9 @@ class TPUJobBuilder(SingleReplicatedJob):
         job_labels: Optional[dict[str, str]] = None
         topology_assignment: Optional[list[list[str]]] = None
         shared_memory_size_gb: Optional[int] = None
+        # Custom node selectors to be applied to the PodSpec. Needed to route physical
+        # ICI links and establish SliceBuilder connections on raw GKE pods.
+        node_selectors: dict[str, str] = {}
 
     @classmethod
     def define_flags(cls, fv: flags.FlagValues):
@@ -542,6 +545,13 @@ class TPUJobBuilder(SingleReplicatedJob):
             "shared_memory_size_gb",
             None,
             "Limit /dev/shm to this size in GiB (e.g. 500). 0 means unlimited.",
+            **common_kwargs,
+        )
+        flags.DEFINE_multi_string(
+            "node_selector",
+            [],
+            "Node selector in the format key:value. Needed to route physical ICI links "
+            "and establish SliceBuilder connections on raw GKE pods.",
             **common_kwargs,
         )
 
@@ -588,6 +598,7 @@ class TPUJobBuilder(SingleReplicatedJob):
                 storage_class=storage_class,
                 size_gb=fv.persistent_disk_size_gb,
             )
+        cfg.node_selectors = {**cfg.node_selectors, **parse_kv_flags(fv.node_selector)}
         return cfg
 
     def __init__(self, cfg: Config, *, bundler: Bundler):
@@ -1022,10 +1033,13 @@ class TPUJobBuilder(SingleReplicatedJob):
             hostnames=["metadata", "metadata.google.internal"],
         )
 
+        # Merges user-specified node selectors (needed to route physical ICI links
+        # and establish SliceBuilder connections on raw GKE pods).
         node_selector_dict = {
             "cloud.google.com/gke-tpu-accelerator": system.gke_accelerator,
             "cloud.google.com/gke-tpu-topology": cfg.accelerator.topology or system.topology,
             **selector,
+            **cfg.node_selectors,
         }
 
         spec = dict(

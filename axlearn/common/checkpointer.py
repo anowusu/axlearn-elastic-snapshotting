@@ -28,6 +28,7 @@ from axlearn.common import utils
 from axlearn.common.array_serialization import (
     BoundedDataShardedAsyncCheckpointManager,
     GlobalAsyncCheckpointManager,
+    PathwaysGlobalAsyncCheckpointManager,
 )
 from axlearn.common.config import (
     REQUIRED,
@@ -455,9 +456,17 @@ class TensorStoreStateStorage(StateStorage):
     def __init__(self, cfg: Config):
         super().__init__(cfg)
         cfg = self.config
-        # TODO(markblee): Consider making BoundedDataShardedAsyncCheckpointManager
-        # the default once stable.
-        if cfg.max_concurrent_gb is not None or cfg.max_data_shard_degree:
+        # PRE-EXISTING GAP / PATHWAYS INTEGRATION:
+        # The hardcoded use of standard JAX asynchronous checkpoint managers was a PRE-EXISTING
+        # gap in AXLearn. In a Pathways proxy environment, checkpoint saving must be routed through
+        # Pathways' coordinator to ensure coordination between client and worker checkpoint shards.
+        # Otherwise, the client will attempt to save shards directly which fails on multi-host mesh.
+        # We solve this by dynamically selecting PathwaysGlobalAsyncCheckpointManager when the
+        # Pathways proxy backend is active.
+        if utils.is_pathways_proxy():
+            logging.info("Pathways proxy backend detected. Instantiating PathwaysGlobalAsyncCheckpointManager.")
+            self._manager = PathwaysGlobalAsyncCheckpointManager(timeout_secs=cfg.timeout_secs)
+        elif cfg.max_concurrent_gb is not None or cfg.max_data_shard_degree:
             self._manager = BoundedDataShardedAsyncCheckpointManager(
                 max_concurrent_gb=cfg.max_concurrent_gb,
                 timeout_secs=cfg.timeout_secs,

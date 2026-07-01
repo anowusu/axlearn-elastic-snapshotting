@@ -55,7 +55,10 @@ def named_runner_configs(
         ),
         "gke_tpu_pathways": GKERunnerJob.default_config().set(
             inner=GKEPathwaysJobSet.default_config().set(
-                builder=PathwaysReplicatedJob.default_config()
+                builder=PathwaysReplicatedJob.default_config(),
+                # Exclusive topology configuration is needed to route physical ICI links
+                # and establish SliceBuilder connections on raw GKE pods.
+                annotations=config_for_function(exclusive_topology_annotations),
             ),
         ),
         "gke_tpu_pathways_multihead": GKERunnerJob.default_config().set(

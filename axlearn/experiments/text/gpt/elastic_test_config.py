@@ -12,6 +12,9 @@ def elastic_test_config():
     cfg.checkpointer.save_policy.n = 5
     cfg.checkpointer.save_policy.max_step = 100
     
+    # Configure Host RAM snapshotting interval
+    cfg.snapshot_interval = 2
+    
     return cfg
 
 def named_trainer_configs():

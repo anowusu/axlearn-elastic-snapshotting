@@ -13,7 +13,7 @@ from axlearn.common import file_system as fs
 from axlearn.common import measurement
 from axlearn.common.config import TrainerConfigFn, get_named_trainer_config
 from axlearn.common.trainer import SpmdTrainer, select_mesh_config
-from axlearn.common.utils import MeshShape, get_data_dir, infer_mesh_shape
+from axlearn.common.utils import MeshShape, get_data_dir, infer_mesh_shape, is_pathways_proxy
 
 # Trainer-specific flags.
 flags.DEFINE_string(
@@ -148,7 +148,8 @@ def get_trainer_config(
     if flag_values.mesh_selector is not None:
         select_mesh_config(trainer_config, mesh_selector=flag_values.mesh_selector)
     trainer_config.mesh_axis_names = trainer_config.mesh_axis_names or ("data", "model")
-    trainer_config.mesh_shape = trainer_config.mesh_shape or (len(jax.devices()), 1)
+    if not is_pathways_proxy():
+        trainer_config.mesh_shape = trainer_config.mesh_shape or (len(jax.devices()), 1)
     if isinstance(trainer_config.mesh_shape, MeshShape):
         trainer_config.mesh_shape = infer_mesh_shape(trainer_config.mesh_shape)
     trainer_config.start_trace_steps = [int(el) for el in flag_values.trace_at_steps]
@@ -193,7 +194,24 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
     measurement.record_event(measurement.Event.START_JOB)
     trainer_config_debug_string = trainer_config.debug_string()
     logging.info("Trainer config:\n%s", trainer_config_debug_string)
-    if jax.process_index() == 0:
+    # PRE-EXISTING DESIGN BUG:
+    # Early JAX backend loading is a PRE-EXISTING launcher design that conflicts with dynamic
+    # elastic recovery loops. In the standard runner, calls like `jax.process_index()` and
+    # `jax.random.PRNGKey()` are executed eagerly before the actual training loop starts.
+    # When using Pathways proxy backend, calling these functions prematurely forces JAX to load
+    # the backend before the Pathways proxy and coordinator are initialized, causing execution
+    # failures or loading the wrong backend.
+    #
+    # FIX:
+    # We check if Pathways proxy is active and, if so, defer all early JAX calls (such as
+    # `process_index()` and key generation) until we are safely inside the training loop.
+    is_pathways = is_pathways_proxy()
+    if is_pathways:
+        is_process_0 = True
+    else:
+        is_process_0 = jax.process_index() == 0
+
+    if is_process_0:
         trainer_config_file = os.path.join(trainer_config.dir, "trainer_config")
         with fs.open(trainer_config_file, "w") as f:
             f.write(trainer_config_debug_string)
@@ -208,11 +226,20 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                 f,
             )
 
-    prng_key = jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
+    # PRE-EXISTING BUG / DEFERRAL:
+    # If Pathways proxy is active, generating the PRNG key eagerly will trigger JAX backend loading.
+    # We defer it by passing a lambda factory. The top-level training loop evaluates the key
+    # after the coordination backend setup has completed.
+    if is_pathways:
+        prng_key = lambda: jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
+    else:
+        prng_key = jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
+
     # We substitute the standard direct trainer run with the top-level elastic training loop
     # orchestrator. This wraps JAX initialization, shutdown, and error recovery/retries
     # natively within the same Python process.
     from axlearn.common.trainer import elastic_training_loop
     output = elastic_training_loop(trainer_config, prng_key=prng_key)
+
     measurement.record_event(measurement.Event.END_JOB)
     return output

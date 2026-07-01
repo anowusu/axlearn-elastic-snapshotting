@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from typing import Any, Callable, ContextManager, Literal, NamedTuple, Optional, Union
 
 import jax
+import jax.extend
 import numpy as np
 from absl import logging
 from jax import numpy as jnp
@@ -624,6 +625,9 @@ class SpmdTrainer(Module):
 
             self._is_initialized = True
             previous_snapshot = None
+            previous_grain_state = None
+            previous_snapshot_step = None
+            self._latest_ready_snapshot = None
 
             with self.checkpointer:
                 logging.info("Starting loop...")
@@ -672,6 +676,13 @@ class SpmdTrainer(Module):
                                     lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else None,
                                     previous_snapshot,
                                 )
+                                from axlearn.common.snapshot import to_local_numpy
+                                self._latest_ready_snapshot = {
+                                    "trainer_state": to_local_numpy(previous_snapshot),
+                                    "grain_state": previous_grain_state,
+                                    "step": previous_snapshot_step,
+                                }
+                                logging.info("[*] Saved completed snapshot from step %d to ready registry", previous_snapshot_step)
 
                             # 2. IN-RAM GRAIN ITERATOR CHECKPOINTING:
                             # Instead of tf.data on disk, we natively query the PyGrain iterator state
@@ -697,14 +708,14 @@ class SpmdTrainer(Module):
                             current_snapshot = jax.device_put(self._trainer_state, pinned_host_shardings)
 
                             # 4. STORE SNAPSHOT METADATA:
-                            # Keep references to the current snapshot PyTree and the iterator state on the
-                            # trainer. This acts as the backup registry during fault recovery.
                             self._latest_snapshot = {
                                 "trainer_state": current_snapshot,
                                 "grain_state": grain_state,
                                 "step": self.step,
                             }
                             previous_snapshot = current_snapshot
+                            previous_grain_state = grain_state
+                            previous_snapshot_step = self.step
                         
                         num_steps += 1
                         if num_steps % 100 == 0:
@@ -1634,8 +1645,19 @@ def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Optional[Tensor] = 
             # Re-initialize JAX cluster state. When recovering from a hardware fault (e.g., node preemption),
             # this will block or negotiate until all surviving and newly provisioned nodes have connected
             # on the new network topology.
-            logging.info("Initializing JAX distributed system...")
-            jax.distributed.initialize()
+            #
+            # INTRODUCED BUG:
+            # Bypassed when Pathways proxy is active, as the lack of this bypass was an INTRODUCED bug in
+            # our elastic snapshotting implementation. Because Pathways manages its own distributed state
+            # and client connection pools natively, calling `jax.distributed.initialize()` here directly
+            # conflicts with Pathways' internal initialization workflow, causing coordinator initialization
+            # failures and crashes.
+            if not utils.is_pathways_proxy():
+                logging.info("Initializing JAX distributed system...")
+                jax.distributed.initialize()
+            else:
+                logging.info("Pathways proxy backend detected. Bypassing JAX distributed initialization.")
+
 
             # 3. INSTANTIATE NEW TRAINER INSTANCE:
             # We instantiate a clean trainer instance for each training attempt. This ensures all state,
@@ -1654,7 +1676,8 @@ def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Optional[Tensor] = 
             # Execute the training run. If the run finishes successfully, we capture the final state
             # and break out of the infinite retry loop.
             logging.info("Starting trainer run...")
-            host_memory_snapshot = trainer.run(prng_key)
+            actual_prng_key = prng_key() if callable(prng_key) else prng_key
+            host_memory_snapshot = trainer.run(actual_prng_key)
             logging.info("Trainer run completed successfully.")
             break
         except jax.errors.JaxRuntimeError as e:
@@ -1667,9 +1690,13 @@ def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Optional[Tensor] = 
             # Retrieve the latest asynchronous Host RAM backup registered on the trainer.
             # If the fault happened before the first snapshot was secured, we cannot recover.
             if "trainer" in locals():
-                new_snapshot = getattr(trainer, "_latest_snapshot", None)
+                new_snapshot = getattr(trainer, "_latest_ready_snapshot", None)
                 if new_snapshot is not None:
-                    host_memory_snapshot = new_snapshot
+                    host_memory_snapshot = {
+                        "trainer_state": new_snapshot["trainer_state"],
+                        "grain_state": new_snapshot["grain_state"],
+                        "step": new_snapshot["step"],
+                    }
 
             if host_memory_snapshot is None:
                 logging.error("No host memory snapshot available for recovery. Re-raising exception.")
@@ -1679,8 +1706,35 @@ def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Optional[Tensor] = 
             # We explicitly shutdown the distributed coordination service to release socket bindings
             # and clean up coordinator connections. We then sleep to allow the cluster scheduler/orchestrator
             # (like Jobset/GKE) to detect the disruption and update the network routing table.
-            logging.info("Shutting down JAX distributed system...")
-            jax.distributed.shutdown()
+            #
+            # INTRODUCED BUG:
+            # Bypassed when Pathways proxy is active, as the lack of this bypass was an INTRODUCED bug in
+            # our elastic snapshotting implementation. Calling `jax.distributed.shutdown()` directly conflicts
+            # with Pathways' native lifecycle management of its proxy backend client and connection pools,
+            # causing socket cleanup or coordinator state errors during preemption recovery.
+            if not utils.is_pathways_proxy():
+                logging.info("Shutting down JAX distributed system...")
+                jax.distributed.shutdown()
+            else:
+                logging.info("Pathways proxy backend detected. Leaking executables to avoid destructor segfaults...")
+                global _leaked_executables
+                if "_leaked_executables" not in globals():
+                    globals()["_leaked_executables"] = []
+                leaked_count = 0
+                try:
+                    from jax._src import xla_bridge as xb
+                    backend = xb.get_backend()
+                    execs = backend.live_executables()
+                    for exec_obj in execs:
+                        globals()["_leaked_executables"].append(exec_obj)
+                        leaked_count += 1
+                except Exception as e:
+                    logging.warning("Failed to leak executables via live_executables(): %s", e)
+                logging.info("Leaking %d executables complete (total leaked: %d).", leaked_count, len(globals()["_leaked_executables"]))
+                logging.info("Clearing JAX compilation caches...")
+                jax.clear_caches()
+                logging.info("Clearing JAX backends cache...")
+                jax.extend.backend.clear_backends()
             logging.info("Sleeping 30 seconds to wait for topology change...")
             time.sleep(30)
 

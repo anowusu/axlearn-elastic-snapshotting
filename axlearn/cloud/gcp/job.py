@@ -226,13 +226,16 @@ class GKEJob(GCPJob):
         if cfg.enable_tpu_slice_auto_provisioning:
             annotations.pop("alpha.jobset.sigs.k8s.io/exclusive-topology", None)
 
-        return dict(
+        spec = dict(
             metadata=dict(name=cfg.name, annotations=annotations, labels=labels),
             spec=dict(
                 failurePolicy=self._build_failure_policy(replicated_jobs),
                 replicatedJobs=replicated_jobs,
             ),
         )
+        _serialize_command_in_exec_form(spec)
+        return spec
+
 
     def _execute(self) -> Any:
         """Submits a JobSet to the cluster."""
@@ -257,7 +260,8 @@ def exclusive_topology_annotations() -> dict:
     The exclusive topology annotation will ensure that all Pods will have affinity rules added that
     will ensure that they are fully scheduled on the same pod-slice node-pools.
     """
-    return {"alpha.jobset.sigs.k8s.io/exclusive-topology": "cloud.google.com/gke-nodepool"}
+    return {"alpha.jobset.sigs.k8s.io/exclusive-topology": "kubernetes.io/hostname"}
+
 
 
 class CPUJob(GCPJob):
@@ -524,13 +528,16 @@ class GKELeaderWorkerSet(GCPJob):
             for key in exclusive_topology_annotation:
                 annotations.pop(key, None)
 
-        return dict(
+        spec = dict(
             metadata=dict(name=cfg.name, annotations=annotations, labels=labels),
             spec=dict(
                 replicas=cfg.num_replicas,
                 leaderWorkerTemplate=self._builder(),
             ),
         )
+        _serialize_command_in_exec_form(spec)
+        return spec
+
 
     def _execute(self):
         cfg: GKELeaderWorkerSet.Config = self.config
@@ -584,3 +591,68 @@ def exclusive_topology_annotations_leaderworkerset() -> dict:
     return {
         "leaderworkerset.sigs.k8s.io/subgroup-exclusive-topology": "cloud.google.com/gke-nodepool"
     }
+
+
+def _serialize_command_in_exec_form(spec: Nested[Any]):
+    # PRE-EXISTING BUG:
+    # This quote-stripping behavior was a PRE-EXISTING bug in AXLearn's runner infrastructure.
+    # Historically, AXLearn's runner joined command arguments into a single shell-escaped string
+    # using `" ".join(args)`. When GKE JobSet ran this command inside `bash -c`, the shell would
+    # perform another round of unescaping, stripping quote characters and breaking arguments
+    # with spaces or nested quotes.
+    #
+    # FIX:
+    # By serializing commands in Exec Form (an array of arguments) instead of joining them into
+    # a shell string, we ensure that Kubernetes processes them as distinct argument boundaries,
+    # preserving all quotes and spaces correctly.
+    if isinstance(spec, dict):
+        if "command" in spec and isinstance(spec["command"], list):
+            cmd = spec["command"]
+            if len(cmd) == 3 and cmd[0] == "bash" and cmd[1] == "-c" and isinstance(cmd[2], str):
+                import shlex
+                user_cmd = cmd[2]
+                setup_cmd = ""
+                cleanup_cmd = ""
+                main_cmd = user_cmd
+                
+                if " && " in main_cmd:
+                    parts = main_cmd.split(" && ", 1)
+                    setup_cmd = parts[0] + " && "
+                    main_cmd = parts[1]
+                
+                if "; " in main_cmd:
+                    parts = main_cmd.split("; ", 1)
+                    main_cmd = parts[0]
+                    cleanup_cmd = "; " + parts[1]
+                
+                try:
+                    args = shlex.split(main_cmd)
+                    
+                    # Check if the split command contains any shell operators or environment variables.
+                    # If it does, we must fallback to standard shell execution so that bash can interpret
+                    # the operators (like pipes, redirects) or expand the variables correctly.
+                    has_shell_constructs = False
+                    for token in args:
+                        if any(op in token for op in [";", "|", "<", ">", "$", "`", "\n"]):
+                            has_shell_constructs = True
+                            break
+                        if "&" in token:
+                            # Allow & inside URLs or GCS paths (e.g. key=val&key2=val2)
+                            if not (token.startswith("http://") or token.startswith("https://") or token.startswith("gs://") or "://" in token):
+                                has_shell_constructs = True
+                                break
+                    
+                    if not has_shell_constructs:
+                        if setup_cmd or cleanup_cmd:
+                            spec["command"] = ["bash", "-c", f"{setup_cmd}\"$@\"{cleanup_cmd}", "--", *args]
+                        else:
+                            spec["command"] = args
+                except Exception:  # pylint: disable=broad-except
+                    # Fallback to the original command if parsing fails
+                    pass
+        for v in spec.values():
+            _serialize_command_in_exec_form(v)
+    elif isinstance(spec, list):
+        for item in spec:
+            _serialize_command_in_exec_form(item)
+

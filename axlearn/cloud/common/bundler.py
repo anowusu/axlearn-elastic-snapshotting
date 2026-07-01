@@ -80,6 +80,10 @@ BUNDLE_EXCLUDE = [
     "__pycache__",
     ".ruff_cache",
     ".DS_Store",
+    "bazel-bin",
+    "bazel-out",
+    "bazel-testlogs",
+    "bazel-axlearn-snapshotting",
 ]
 FLAGS = flags.FLAGS
 _DEFAULT_DOCKER_PLATFORM = "linux/amd64"

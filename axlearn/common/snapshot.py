@@ -13,8 +13,50 @@ from orbax.checkpoint.experimental.v1 import training  # pytype: disable=import-
 from orbax.checkpoint.experimental.v1._src.tree import types as tree_types  # pytype: disable=import-error
 from pathwaysutils.experimental import concatenate_by_mesh_axis  # pytype: disable=import-error
 from pathwaysutils.experimental import split_by_mesh_axis  # pytype: disable=import-error
+import numpy as np
 
 _logger = logging.getLogger(__name__)
+
+
+def get_local_numpy_array(x: jax.Array) -> np.ndarray:
+  """Retrieve process-local addressable data of a sharded array as a numpy array."""
+  if not x.addressable_shards:
+    return None
+
+  # Bounding box calculation of all local addressable shards
+  indices = [shard.index for shard in x.addressable_shards]
+  local_slices = []
+  for dim in range(x.ndim):
+    dim_slices = [idx[dim] for idx in indices]
+    start = min((s.start if s.start is not None else 0) for s in dim_slices)
+    stop = max((s.stop if s.stop is not None else x.shape[dim]) for s in dim_slices)
+    local_slices.append(slice(start, stop))
+
+  local_array_shape = tuple(s.stop - s.start for s in local_slices)
+  local_np = np.empty(local_array_shape, dtype=x.dtype)
+
+  for shard in x.addressable_shards:
+    # Get relative slice in local array
+    relative_slices = tuple(
+        slice(
+            (s.start if s.start is not None else 0) - local_slices[dim].start,
+            (s.stop if s.stop is not None else x.shape[dim]) - local_slices[dim].start
+        )
+        for dim, s in enumerate(shard.index)
+    )
+    # Convert shard data to numpy locally
+    local_np[relative_slices] = np.array(shard.data)
+
+  return local_np
+
+
+def to_local_numpy(pytree: Any) -> Any:
+  """Convert all JAX arrays in pytree to process-local numpy arrays without network sync."""
+  def leaf_fn(x):
+    if isinstance(x, jax.Array):
+      return get_local_numpy_array(x)
+    return x
+  return jax.tree.map(leaf_fn, pytree)
 
 
 class Snapshotter:
@@ -95,6 +137,7 @@ class Snapshotter:
     """
     # Check if pathwaysutils' split/concatenate functions are available and working.
     use_pathways = False
+    is_snapshot_backend_alive = True
     try:
       from pathwaysutils import jax as pw_jax
       if type(pw_jax.concatenate_by_mesh_axis).__name__ != "_FakeJaxFunction":
@@ -103,6 +146,24 @@ class Snapshotter:
       pass
 
     if use_pathways:
+      try:
+        from jax._src import xla_bridge as xb
+        active_backend = xb.get_backend()
+        first_array = None
+        for leaf in jax.tree.leaves(host_snapshot):
+          if hasattr(leaf, "sharding") and leaf.sharding is not None:
+            first_array = leaf
+            break
+        if first_array is not None:
+          if first_array.devices():
+            snapshot_backend = first_array.devices()[0].client
+            if snapshot_backend is not active_backend:
+              is_snapshot_backend_alive = False
+              _logger.info("Host snapshot backend is dead/stale. Disabling pathways split/concat.")
+      except Exception as e:
+        _logger.warning("Failed to check snapshot backend health: %s", e)
+
+    if use_pathways and is_snapshot_backend_alive:
       from pathwaysutils.experimental import concatenate_by_mesh_axis
       from pathwaysutils.experimental import split_by_mesh_axis
 
@@ -160,37 +221,6 @@ class Snapshotter:
       # Since we are on a surviving host, the local addressable shards of host_snapshot are intact.
       # We extract the local addressable data from the host_snapshot arrays as numpy arrays,
       # and then call jax.device_put to reshard them onto the new mesh.
-      import numpy as np
-
-      def get_local_numpy_array(x: jax.Array) -> np.ndarray:
-        if not x.addressable_shards:
-          return None
-
-        # Bounding box calculation of all local addressable shards
-        indices = [shard.index for shard in x.addressable_shards]
-        local_slices = []
-        for dim in range(x.ndim):
-          dim_slices = [idx[dim] for idx in indices]
-          start = min((s.start if s.start is not None else 0) for s in dim_slices)
-          stop = max((s.stop if s.stop is not None else x.shape[dim]) for s in dim_slices)
-          local_slices.append(slice(start, stop))
-
-        local_array_shape = tuple(s.stop - s.start for s in local_slices)
-        local_np = np.empty(local_array_shape, dtype=x.dtype)
-
-        for shard in x.addressable_shards:
-          # Get relative slice in local array
-          relative_slices = tuple(
-              slice(
-                  (s.start if s.start is not None else 0) - local_slices[dim].start,
-                  (s.stop if s.stop is not None else x.shape[dim]) - local_slices[dim].start
-              )
-              for dim, s in enumerate(shard.index)
-          )
-          # Convert shard data to numpy locally
-          local_np[relative_slices] = np.array(shard.data)
-
-        return local_np
 
       def heal_leaf(x, abstract):
         if not hasattr(x, "sharding") or x.sharding is None:
@@ -199,7 +229,8 @@ class Snapshotter:
 
         # Check if the array is healthy and block until ready
         try:
-          jax.block_until_ready(x)
+          if is_snapshot_backend_alive:
+            jax.block_until_ready(x)
           # If block_until_ready succeeds, the array is healthy.
           # We can convert it to a local numpy array.
           # To avoid cross-host gather (which might hang if a host is dead),

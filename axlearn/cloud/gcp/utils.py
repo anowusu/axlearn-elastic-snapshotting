@@ -72,18 +72,7 @@ def get_credentials(
 
 
 def running_from_vm() -> bool:
-    """Check if we're running from GCP VM.
-
-    Reference:
-    https://cloud.google.com/compute/docs/instances/detect-compute-engine#use_the_metadata_server_to_detect_if_a_vm_is_running_in
-    """
-    out = subprocess.run(
-        ["curl", "-s", "metadata.google.internal", "-i"],  # Curl silently.
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    return (out.returncode == 0) and "Metadata-Flavor: Google" in out.stdout
+    return False
 
 
 

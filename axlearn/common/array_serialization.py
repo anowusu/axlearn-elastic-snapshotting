@@ -1333,3 +1333,150 @@ class BoundedDataShardedAsyncCheckpointManager(GlobalAsyncCheckpointManager):
 
         logging.info("D2H during save took %fs. Starting async commit.", time.time() - start_t)
         self._start_async_commit(on_commit_callback)
+
+
+class PathwaysGlobalAsyncCheckpointManager(serialization.GlobalAsyncCheckpointManagerBase):
+    """Responsible for serializing via Pathways persistence API."""
+
+    def __init__(self, timeout_secs: Union[int, float] = 300, *args, **kwargs):
+        import datetime  # pylint: disable=import-outside-toplevel
+
+        self._timeout = datetime.timedelta(seconds=timeout_secs) if timeout_secs else None
+        self._cond = threading.Condition()
+        self._pending_disk_writes = False
+        self._exception = None
+        self._write_future = None
+
+    def check_for_errors(self):
+        with self._cond:
+            if self._exception is not None:
+                raise self._exception
+
+    def wait_until_finished(self):
+        logging.info("PathwaysGACM: wait_until_finished called")
+        with self._cond:
+            while self._pending_disk_writes:
+                self._cond.wait()
+        self.check_for_errors()
+        logging.info("PathwaysGACM: wait_until_finished completed")
+
+    def _convert_specs(self, specs: Sequence[dict]) -> tuple[str, list[str]]:
+        # Reconstruct full GCS paths
+        full_paths = []
+        is_gcs = False
+        for spec in specs:
+            kv = spec.get("kvstore", {})
+            driver = kv.get("driver")
+            if driver == "gcs":
+                bucket = kv.get("bucket")
+                path = kv.get("path")
+                full_paths.append(f"{bucket}/{path}")
+                is_gcs = True
+            elif driver in ("gfile", "file"):
+                full_paths.append(kv.get("path"))
+            else:
+                raise ValueError(f"Unsupported kvstore driver: {driver} in spec {spec}")
+
+        # Find common path
+        commonpath = os.path.commonpath([os.path.dirname(p) for p in full_paths])
+        commonpath_len = len(commonpath)
+        names = []
+        for p in full_paths:
+            names.append(p[commonpath_len:].lstrip("/"))
+
+        if is_gcs:
+            commonpath = f"gs://{commonpath}"
+
+        return commonpath, names
+
+    def serialize(
+        self,
+        arrays: Sequence[jax.Array],
+        tensorstore_specs: Sequence[dict],
+        *,
+        on_commit_callback: Callable[[], None],
+        additional_futures: Optional[list[futures.Future]] = None,
+    ) -> None:
+        logging.info("PathwaysGACM: serialize called with %d arrays", len(arrays))
+        self.wait_until_finished()
+
+        location, names = self._convert_specs(tensorstore_specs)
+        logging.info("PathwaysGACM: Writing to location: %s, names: %s", location, names)
+
+        # Call write_arrays on all processes (TPU hosts)
+        import pathwaysutils.persistence.helper as pathways_helper  # pylint: disable=import-outside-toplevel
+
+        write_future = pathways_helper.write_arrays(location, names, arrays, self._timeout)
+
+        self._pending_disk_writes = True
+
+        def wait_thread():
+            try:
+                write_future.result()
+                logging.info("PathwaysGACM: write_arrays future finished successfully")
+
+                # Wait for additional futures (e.g. TF state save)
+                if additional_futures:
+                    logging.info(
+                        "PathwaysGACM: waiting for %d additional futures", len(additional_futures)
+                    )
+                    for f in additional_futures:
+                        f.result()
+
+                # Execute commit callback ONLY on process 0 to avoid write conflicts
+                if jax.process_index() == 0:
+                    logging.info("PathwaysGACM: process 0 executing commit callback")
+                    on_commit_callback()
+                    logging.info("PathwaysGACM: commit callback executed successfully")
+            except Exception as e:  # pylint: disable=broad-except
+                logging.exception("PathwaysGACM: Exception in write thread")
+                with self._cond:
+                    self._exception = e
+            finally:
+                with self._cond:
+                    self._pending_disk_writes = False
+                    self._cond.notify_all()
+
+        t = threading.Thread(target=wait_thread, name="pathways_gacm_commit_thread")
+        t.start()
+
+    def deserialize(
+        self,
+        shardings: Sequence[jax.sharding.Sharding],
+        tensorstore_specs: Sequence[dict],
+        global_shapes: Optional[Sequence[tuple]] = None,
+        dtypes: Optional[Sequence[np.dtype]] = None,
+        concurrent_gb: int = 32,
+    ) -> Sequence[jax.Array]:
+        logging.info("PathwaysGACM: deserialize called")
+        assert global_shapes, "global_shapes must be specified for Pathways persistence"
+        assert dtypes, "dtypes must be specified for Pathways persistence"
+
+        location, names = self._convert_specs(tensorstore_specs)
+        logging.info("PathwaysGACM: Reading from location: %s, names: %s", location, names)
+
+        # Group by mesh to match _deserialize_on_single_mesh behavior
+        mesh = shardings[0].mesh
+        for s in shardings:
+            assert s.mesh == mesh, "All shardings must be on the same mesh"
+
+        np_dtypes = [np.dtype(d) for d in dtypes]
+
+        # Call read_arrays on all processes (TPU hosts)
+        import pathwaysutils.persistence.helper as pathways_helper  # pylint: disable=import-outside-toplevel
+
+        arrays, read_future = pathways_helper.read_arrays(
+            location,
+            names,
+            np_dtypes,
+            global_shapes,
+            shardings,
+            mesh.devices,
+            self._timeout,
+        )
+
+        logging.info("PathwaysGACM: waiting for read_arrays to complete")
+        read_future.result()
+        logging.info("PathwaysGACM: read_arrays completed successfully")
+        return arrays
+

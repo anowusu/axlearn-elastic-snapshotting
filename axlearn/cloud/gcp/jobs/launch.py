@@ -324,7 +324,8 @@ class BaseBastionManagedJob(FlagConfigurable):
             cfg.bundler = get_bundler_config(
                 bundler_type=fv.bundler_type, spec=fv.bundler_spec, fv=fv
             )
-            if fv.runner_name and "tpu" in fv.runner_name:
+            runner_name = getattr(fv, "runner_name", None)
+            if runner_name and "tpu" in runner_name:
                 from axlearn.cloud.gcp.bundler import with_tpu_extras
                 cfg.bundler = with_tpu_extras(cfg.bundler)
 

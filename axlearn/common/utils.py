@@ -2209,3 +2209,9 @@ def get_tpu_dot_precision(dtype) -> jax.lax.Precision:
     if dtype == jnp.bfloat16:
         return jax.lax.Precision.DEFAULT
     raise ValueError(f"Unsupported dtype {dtype}")
+
+
+def is_pathways_proxy() -> bool:
+    """Returns True if the active JAX backend is Pathways proxy."""
+    return bool(jax.config.jax_platforms and "proxy" in jax.config.jax_platforms)
+

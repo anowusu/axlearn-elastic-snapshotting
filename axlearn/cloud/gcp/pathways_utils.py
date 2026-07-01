@@ -641,6 +641,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             f"--instance_count={pathways_instance_count}",
             f"--instance_type={instance_type}",
             f"--gcs_scratch_location={gcs_scratch_location}",
+            "--pathways_expected_instances=",
         ]
         if self.config.pathways_debug:
             rm_args.append(PATHWAYS_DEBUG_VMODULE)
@@ -711,6 +712,16 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         node_selector = {
             _PATHWAYS_HEAD_NODE_POOL_SELECTOR_KEY: _PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE,
         }
+        if "cloud.google.com/gke-nodepool" in cfg.node_selectors:
+            node_selector = cfg.node_selectors
+            tolerations.append(
+                {
+                    "key": "google.com/tpu",
+                    "operator": "Equal",
+                    "value": "present",
+                    "effect": "NoSchedule",
+                }
+            )
 
         head_container = self._build_pathways_head_container()
         init_containers = [
@@ -724,6 +735,49 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             ip=_METADATA_GOOGLE_INTERNAL_IP,
             hostnames=["metadata", "metadata.google.internal"],
         )
+        affinity = {}
+        if "cloud.google.com/gke-nodepool" in cfg.node_selectors:
+            affinity = {
+                "podAffinity": {
+                    "requiredDuringSchedulingIgnoredDuringExecution": [
+                        {
+                            "labelSelector": {
+                                "matchExpressions": [
+                                    {
+                                        "key": "jobset.sigs.k8s.io/jobset-name",
+                                        "operator": "In",
+                                        "values": [cfg.name],
+                                    }
+                                ]
+                            },
+                            "namespaceSelector": {},
+                            "topologyKey": "cloud.google.com/gke-nodepool",
+                        }
+                    ]
+                },
+                "podAntiAffinity": {
+                    "requiredDuringSchedulingIgnoredDuringExecution": [
+                        {
+                            "labelSelector": {
+                                "matchExpressions": [
+                                    {
+                                        "key": "jobset.sigs.k8s.io/jobset-name",
+                                        "operator": "NotIn",
+                                        "values": [cfg.name],
+                                    },
+                                    {
+                                        "key": "job-name",
+                                        "operator": "Exists",
+                                    },
+                                ]
+                            },
+                            "namespaceSelector": {},
+                            "topologyKey": "cloud.google.com/gke-nodepool",
+                        }
+                    ]
+                },
+            }
+
         head_pod_spec = {
             "terminationGracePeriodSeconds": 60,
             # Fail if any pod fails, and allow retries to happen at JobSet level.
@@ -737,6 +791,8 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             "serviceAccountName": cfg.service_account,
             "dnsPolicy": "ClusterFirstWithHostNet",
         }
+        if affinity:
+            head_pod_spec["affinity"] = affinity
 
         if cfg.priority_class:
             head_pod_spec["priorityClassName"] = cfg.priority_class
@@ -907,13 +963,14 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         annotations = _LoadBalancer(
             jobset_name=cfg.name, replicated_job_name=replicated_job_name
         ).metadata
+        annotations.update({
+            "alpha.jobset.sigs.k8s.io/exclusive-topology": "cloud.google.com/gke-nodepool"
+        })
 
         labels = {}
         # If we are using slice auto provisioning, we don't want exclusive topology
         if not cfg.enable_tpu_slice_auto_provisioning:
-            annotations.update(
-                {"alpha.jobset.sigs.k8s.io/exclusive-topology": "cloud.google.com/gke-nodepool"}
-            )
+            pass
         else:
             # If we are using tpu slice provisioning, we do want to have the slice
             # selectors injected
@@ -1638,6 +1695,16 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         node_selector = {
             _PATHWAYS_HEAD_NODE_POOL_SELECTOR_KEY: _PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE,
         }
+        if "cloud.google.com/gke-nodepool" in cfg.node_selectors:
+            node_selector = cfg.node_selectors
+            tolerations.append(
+                {
+                    "key": "google.com/tpu",
+                    "operator": "Equal",
+                    "value": "present",
+                    "effect": "NoSchedule",
+                }
+            )
 
         containers = [
             self._build_head_container(),
