@@ -439,9 +439,8 @@ class SpmdTrainer(Module):
             return None
         ready_step = self.snapshot_manager._latest_ready_snapshot["step"]
         grain_state = None
-        if getattr(self, "_latest_ready_grain_state", None) is not None:
-            if self._latest_ready_grain_state["step"] == ready_step:
-                grain_state = self._latest_ready_grain_state["grain_state"]
+        if getattr(self, "_latest_ready_grain_states", None) is not None:
+            grain_state = self._latest_ready_grain_states.get(ready_step)
         return {
             "trainer_state": self.snapshot_manager._latest_ready_snapshot["trainer_state"],
             "grain_state": grain_state,
@@ -453,7 +452,7 @@ class SpmdTrainer(Module):
         if value is None:
             if hasattr(self, "snapshot_manager"):
                 self.snapshot_manager._latest_ready_snapshot = None
-            self._latest_ready_grain_state = None
+            self._latest_ready_grain_states = {}
 
     @property
     def trainer_state_specs(self):
@@ -738,10 +737,12 @@ class SpmdTrainer(Module):
                                         grain_state = self._input_iter.get_state()
                                 
                                 self.snapshot_manager.save_pytree(self.step, self._trainer_state)
-                                self._latest_ready_grain_state = {
-                                    "grain_state": grain_state,
-                                    "step": self.step,
-                                }
+                                if not hasattr(self, "_latest_ready_grain_states"):
+                                    self._latest_ready_grain_states = {}
+                                self._latest_ready_grain_states[self.step] = grain_state
+                                if len(self._latest_ready_grain_states) > 2:
+                                    min_step = min(self._latest_ready_grain_states.keys())
+                                    del self._latest_ready_grain_states[min_step]
                         
                         num_steps += 1
                         if num_steps % 100 == 0:

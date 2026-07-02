@@ -293,7 +293,17 @@ class Snapshotter:
           local_np = x
 
         if local_np is None:
-          raise RuntimeError("Failed to retrieve any local addressable data for array.")
+          # Construct an empty numpy array of the expected local shape to participate in collective creation.
+          try:
+            from jax._src.sharding_impls import num_addressable_indices
+            local_shape = tuple(
+                num_addressable_indices(abstract.sharding, dim, abstract.shape)
+                for dim in range(len(abstract.shape))
+            )
+          except Exception:
+            # Fallback to zero-shape for all dimensions if lookup fails
+            local_shape = tuple(0 for _ in abstract.shape)
+          local_np = np.empty(local_shape, dtype=abstract.dtype)
 
         # Assemble global jax.Array from process-local NumPy slices to avoid shape mismatch
         return jax.make_array_from_process_local_data(
