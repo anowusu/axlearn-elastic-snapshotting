@@ -1008,6 +1008,11 @@ class SpmdTrainer(Module):
             recovered_state = self._recovered_state
             self._recovered_state = None
 
+            logging.warning(
+                "[RECOVERY_PHASE] >>> STATE INJECTION STARTING: Healing device PyTree on fresh JAX mesh for step %d <<<",
+                recovered_state["step"],
+            )
+
             # 2. HEAL THE DEVICE PYTREE (SPLIT-FILTER-STITCH):
             # The host memory snapshot contains shards mapped to the old network topology/mesh.
             # We call Snapshotter.heal_pytree which filters out dead physical shards and
@@ -1018,20 +1023,41 @@ class SpmdTrainer(Module):
                 else 0
             )
             from axlearn.common.snapshot import Snapshotter
+            logging.warning(
+                "[RECOVERY_PHASE] >>> Healing device PyTree: resharding surviving process-local shards onto new mesh... <<<"
+            )
             self._trainer_state = Snapshotter.heal_pytree(
                 recovered_state["trainer_state"],
                 self._trainer_state_specs,
                 replica_axis_index=replica_axis_idx,
             )
             self._step = recovered_state["step"]
+            logging.warning(
+                "[RECOVERY_PHASE] >>> PyTree healed successfully. Step updated to %d <<<",
+                self._step,
+            )
 
             # 3. RESTORE IN-RAM DATASET ITERATOR STATE:
             # Restore the fast-seek position of the PyGrain iterator to exactly where the snapshot
             # was taken. This matches the healed trainer step and ensures zero data repetition.
             if recovered_state["grain_state"] is not None:
                 if hasattr(self._input_iter, "set_state"):
+                    logging.warning(
+                        "[RECOVERY_PHASE] >>> Restoring Grain iterator state to match step %d <<<",
+                        self._step,
+                    )
                     self._input_iter.set_state(recovered_state["grain_state"])
-                    logging.info("Restored Grain iterator state from snapshot.")
+                    logging.warning(
+                        "[RECOVERY_PHASE] >>> Grain iterator state restored successfully from snapshot. <<<"
+                    )
+                else:
+                    logging.warning(
+                        "[RECOVERY_PHASE] >>> WARNING: Input iterator does not support set_state(). Skip restoring Grain state. <<<"
+                    )
+            else:
+                logging.warning(
+                    "[RECOVERY_PHASE] >>> Grain state is None in recovered snapshot. Skip restoring Grain state. <<<"
+                )
 
             # 4. PRUNE INVALID FUTURE CHECKPOINTS:
             # Since we rolled back training to `self._step`, any checkpoint
@@ -1042,19 +1068,29 @@ class SpmdTrainer(Module):
                 from axlearn.common.checkpointer import Checkpointer, build_step_dir
                 try:
                     all_steps = Checkpointer.checkpoint_steps(ckpt_dir_base)
+                    logging.warning(
+                        "[RECOVERY_PHASE] >>> Found existing checkpoints to evaluate for pruning: %s <<<",
+                        all_steps,
+                    )
                     for ckpt_step in all_steps:
                         if ckpt_step > self._step:
                             ckpt_path_to_clean = build_step_dir(ckpt_dir_base, step=ckpt_step)
-                            logging.info(
-                                "[*] Rollback: Pruning invalid future checkpoint at step %d path: %s",
+                            logging.warning(
+                                "[RECOVERY_PHASE] >>> [*] Rollback: Pruning invalid future checkpoint at step %d path: %s <<<",
                                 ckpt_step,
                                 ckpt_path_to_clean,
                             )
                             Checkpointer.cleanup_checkpoint(ckpt_path_to_clean, sync=True)
                 except Exception as prune_err:
-                    logging.warning("Failed to prune future checkpoints during rollback: %s", prune_err)
+                    logging.warning(
+                        "[RECOVERY_PHASE] >>> Failed to prune future checkpoints during rollback: %s <<<",
+                        prune_err,
+                    )
 
-            logging.info("Restored training state from host memory snapshot at step %d", self._step)
+            logging.warning(
+                "[RECOVERY_PHASE] >>> STATE INJECTION SUCCESSFUL: Restored training state from host memory snapshot at step %d <<<",
+                self._step,
+            )
         else:
             # Attempt to restore the latest checkpoint, which may contain a saved `_input_iter`.
             self.restore_checkpoint(restore_step=None)
@@ -1680,6 +1716,7 @@ def aot_model_analysis(compiled: jax.stages.Compiled) -> str:
 
 def _cleanup_pathways_proxy_sockets():
     """Closes all leaked TCP connections to localhost:29000 (Pathways proxy)."""
+    logging.info("[RECOVERY_PHASE] >>> Starting cleanup of leaked Pathways proxy sockets... <<<")
     import os
     target_inodes = set()
     for net_file in ["/proc/net/tcp", "/proc/net/tcp6"]:
@@ -1721,37 +1758,70 @@ def _cleanup_pathways_proxy_sockets():
                     closed_count += 1
         except Exception:
             pass
-    logging.info("Closed %d leaked proxy sockets.", closed_count)
+    logging.warning(
+        "[RECOVERY_PHASE] >>> Sockets cleaned. Closed %d leaked proxy sockets. <<<",
+        closed_count,
+    )
 
 
 def _wait_for_workers_ready(jobset_name: str, num_workers: int = 8, timeout_seconds: int = 300) -> bool:
     import socket
     import time
 
-    logging.info("Waiting for all %d workers of JobSet %s to be TCP ready...", num_workers, jobset_name)
+    logging.warning(
+        "[RECOVERY_PHASE] >>> Waiting for all %d workers of JobSet %s to be TCP ready... <<<",
+        num_workers,
+        jobset_name,
+    )
     start_time = time.time()
+    iteration = 0
     while time.time() - start_time < timeout_seconds:
+        iteration += 1
+        logging.info(
+            "[RECOVERY_PHASE] >>> [Attempt %d] Checking connectivity for all workers... elapsed time: %.1fs <<<",
+            iteration,
+            time.time() - start_time,
+        )
         all_ready = True
         for i in range(num_workers):
             hostname = f"{jobset_name}-pwwk-0-{i}.{jobset_name}"
             try:
                 # Attempt to connect to Pathways worker daemon port 29001
                 with socket.create_connection((hostname, 29001), timeout=2):
-                    pass
+                    logging.info(
+                        "[RECOVERY_PHASE] >>> Worker %d (%s) is reachable on port 29001. <<<",
+                        i,
+                        hostname,
+                    )
             except (socket.timeout, ConnectionRefusedError, socket.gaierror) as e:
-                logging.info("Worker %d (%s) is not ready yet: %s", i, hostname, e)
+                logging.info(
+                    "[RECOVERY_PHASE] >>> Worker %d (%s) connection failed: %s <<<",
+                    i,
+                    hostname,
+                    e,
+                )
                 all_ready = False
                 break
 
         if all_ready:
-            logging.info("All %d workers are TCP ready!", num_workers)
+            logging.warning(
+                "[RECOVERY_PHASE] >>> SUCCESS: All %d workers of JobSet %s are TCP ready! <<<",
+                num_workers,
+                jobset_name,
+            )
             return True
 
-        logging.info("Some workers not ready. Sleeping 10 seconds before next check...")
+        logging.info(
+            "[RECOVERY_PHASE] >>> Some workers are not ready yet. Sleeping 10 seconds before next check... <<<"
+        )
         time.sleep(10)
 
-    logging.warning("Timed out waiting for workers after %d seconds.", timeout_seconds)
+    logging.warning(
+        "[RECOVERY_PHASE] >>> TIMEOUT: Timed out waiting for workers after %d seconds. <<<",
+        timeout_seconds,
+    )
     return False
+
 
 
 def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Optional[Tensor] = None) -> Any:
@@ -1797,7 +1867,10 @@ def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Optional[Tensor] = 
             # snapshot back to the trainer so that it can heal the PyTree and fast-seek the input iterator
             # during training preparation.
             if host_memory_snapshot is not None:
-                logging.info("Injecting recovered host memory snapshot into trainer...")
+                logging.warning(
+                    "[RECOVERY_PHASE] >>> INJECTING RECOVERED STATE SNAPSHOT INTO TRAINER INSTANCE (step: %d) <<<",
+                    host_memory_snapshot.get("step", -1),
+                )
                 trainer._recovered_state = host_memory_snapshot
 
             # 5. RUN TRAINING AND CAPTURE RUN STATS:
@@ -1812,18 +1885,20 @@ def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Optional[Tensor] = 
             # 6. FAULT DETECTION AND RECOVERY INITIATION:
             # JaxRuntimeError is raised when JAX loses network connectivity to a TPU node or a node fails.
             # We intercept this error to perform sub-second, zero-disk recovery.
-            logging.warning("Caught JaxRuntimeError: %s. Initiating recovery...", e)
+            logging.warning("[RECOVERY_PHASE] >>> STARTING PREEMPTION RECOVERY PROCESS <<<")
+            logging.warning("[RECOVERY_PHASE] >>> Caught JaxRuntimeError: %s <<<", e)
 
             # 1. EXTRACT LATEST HOST SNAPSHOT:
             # Retrieve the latest asynchronous Host RAM backup registered on the trainer.
             if "trainer" in locals():
                 if hasattr(trainer, "snapshot_manager"):
-                    logging.info("Cancelling and waiting for background snapshotter...")
+                    logging.info("[RECOVERY_PHASE] >>> Snapshotter status: Cancelling and waiting for background thread... <<<")
                     try:
                         trainer.snapshot_manager.cancel()
                         trainer.snapshot_manager.join()
+                        logging.info("[RECOVERY_PHASE] >>> Snapshotter background thread joined successfully. <<<")
                     except Exception as cancel_err:
-                        logging.warning("Snapshotter cancel/join failed during recovery: %s", cancel_err)
+                        logging.warning("[RECOVERY_PHASE] >>> Snapshotter cancel/join failed during recovery: %s <<<", cancel_err)
                 new_snapshot = getattr(trainer, "_latest_ready_snapshot", None)
                 if new_snapshot is not None:
                     host_memory_snapshot = {
@@ -1831,18 +1906,22 @@ def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Optional[Tensor] = 
                         "grain_state": new_snapshot["grain_state"],
                         "step": new_snapshot["step"],
                     }
+                    logging.warning(
+                        "[RECOVERY_PHASE] >>> Retrieved latest memory snapshot from step %d <<<",
+                        host_memory_snapshot["step"],
+                    )
 
             if host_memory_snapshot is None:
-                logging.warning("No host memory snapshot available for recovery. Retrying startup from scratch...")
+                logging.warning("[RECOVERY_PHASE] >>> No host memory snapshot available for recovery. Retrying startup from scratch... <<<")
 
             # 2. SHUTDOWN AND RETRY BARRIER:
             if not utils.is_pathways_proxy():
-                logging.info("Shutting down JAX distributed system...")
+                logging.warning("[RECOVERY_PHASE] >>> Shutting down JAX distributed system... <<<")
                 jax.distributed.shutdown()
-                logging.info("Sleeping 30 seconds to wait for topology change...")
+                logging.warning("[RECOVERY_PHASE] >>> Sleeping 30 seconds to wait for topology change... <<<")
                 time.sleep(30)
             else:
-                logging.info("Pathways proxy backend detected. Leaking executables to avoid destructor segfaults...")
+                logging.warning("[RECOVERY_PHASE] >>> Pathways proxy backend detected. Leaking executables to avoid destructor segfaults... <<<")
                 global _leaked_executables
                 if "_leaked_executables" not in globals():
                     globals()["_leaked_executables"] = []
@@ -1855,26 +1934,29 @@ def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Optional[Tensor] = 
                         globals()["_leaked_executables"].append(exec_obj)
                         leaked_count += 1
                 except Exception as leak_err:
-                    logging.warning("Failed to leak executables via live_executables(): %s", leak_err)
-                logging.info("Leaking %d executables complete (total leaked: %d).", leaked_count, len(globals()["_leaked_executables"]))
+                    logging.warning("[RECOVERY_PHASE] >>> Failed to leak executables via live_executables(): %s <<<", leak_err)
+                logging.warning("[RECOVERY_PHASE] >>> Leaking %d executables complete (total leaked: %d). <<<", leaked_count, len(globals()["_leaked_executables"]))
 
-                logging.info("Clearing JAX compilation caches...")
+                logging.info("[RECOVERY_PHASE] >>> Clearing JAX compilation caches... <<<")
                 jax.clear_caches()
-                logging.info("Clearing JAX backends cache...")
+                logging.info("[RECOVERY_PHASE] >>> Clearing JAX backends cache... <<<")
                 jax.extend.backend.clear_backends()
 
                 # Close leaked gRPC sockets to Pathways proxy to release the old session
                 try:
-                    logging.info("Cleaning up leaked Pathways proxy sockets...")
+                    logging.warning("[RECOVERY_PHASE] >>> Initiating cleanup of leaked Pathways proxy sockets <<<")
                     _cleanup_pathways_proxy_sockets()
+                    logging.warning("[RECOVERY_PHASE] >>> Completed cleanup of leaked Pathways proxy sockets <<<")
                 except Exception as socket_err:
-                    logging.warning("Failed to clean up proxy sockets: %s", socket_err)
+                    logging.warning("[RECOVERY_PHASE] >>> Failed to clean up proxy sockets: %s <<<", socket_err)
 
                 # Extract JobSet name from trainer directory and block until all workers are ready
                 import os
                 jobset_name = os.path.basename(cfg.dir.rstrip("/"))
-                _wait_for_workers_ready(jobset_name)
-                logging.info("Sleeping an additional 30 seconds to allow Pathways workers to stabilize...")
+                logging.warning("[RECOVERY_PHASE] >>> Invoking blocking worker TCP readiness check for JobSet: %s <<<", jobset_name)
+                ready_success = _wait_for_workers_ready(jobset_name)
+                logging.warning("[RECOVERY_PHASE] >>> Worker readiness check completed. Result: %s <<<", ready_success)
+                logging.warning("[RECOVERY_PHASE] >>> Sleeping an additional 30 seconds to allow Pathways workers to stabilize... <<<")
                 time.sleep(30)
 
     return host_memory_snapshot
