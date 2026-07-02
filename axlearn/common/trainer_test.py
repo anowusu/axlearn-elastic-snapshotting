@@ -1416,6 +1416,7 @@ class TrainerTest(test_utils.TestCase):
         )
         cfg.max_step = 5
         cfg.snapshot_interval = 2
+        cfg.checkpointer.save_policy = config_for_function(every_n_steps_policy).set(n=10)
         # Disable disk-based input iterator checkpointing so that we rely exclusively on
         # our native get_state/set_state RAM recovery path.
         cfg.save_input_iterator = False
@@ -1523,6 +1524,7 @@ class TrainerTest(test_utils.TestCase):
         )
         cfg.max_step = 5
         cfg.snapshot_interval = 2
+        cfg.checkpointer.save_policy = config_for_function(every_n_steps_policy).set(n=10)
         cfg.save_input_iterator = False
 
         with mock.patch("jax.distributed.initialize") as mock_init, \

@@ -389,6 +389,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
         cfg: OrbaxCheckpointer.Config = self.config
         save_policy = cfg.save_policy.instantiate()
+        self._save_policy = save_policy
 
         if cfg.enable_single_replica_ckpt_restoring:
             array_handler = ocp.type_handlers.SingleReplicaArrayHandler(
@@ -474,6 +475,10 @@ class OrbaxCheckpointer(BaseCheckpointer):
                 ),
             },
         )
+
+    def should_save(self, *, step: int, evaler_summaries: Optional[dict[str, Any]] = None) -> bool:
+        """See `BaseCheckpointer.should_save`."""
+        return self._save_policy(step=step, evaler_summaries=(evaler_summaries or {}))
 
     def _get_spec(self, *, step: int, state: Nested[Any]) -> Nested[Any]:
         spec = {"index": [("step", step)]}
@@ -605,6 +610,17 @@ class OrbaxCheckpointer(BaseCheckpointer):
                 if k == "step":
                     step = v
                     break
+
+        # If we successfully restored, clean up any checkpoints newer than the restored step
+        # to prevent collisions on subsequent saves.
+        if step is not None:
+            try:
+                for s in self.checkpoint_steps(cfg.dir):
+                    if s > step:
+                        logging.info("Deleting newer checkpoint step %d to prevent collision during resume.", s)
+                        self._manager.delete(s)
+            except Exception as delete_err:
+                logging.warning("Failed to clean up newer checkpoints: %s", delete_err)
 
         # Validate ckpt structure.
         check_state_structure(

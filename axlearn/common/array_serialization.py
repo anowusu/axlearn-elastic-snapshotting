@@ -441,7 +441,7 @@ async def _async_serialize(
         await ts.open(
             ts.Spec(tensorstore_spec),
             create=True,
-            open=True,
+            delete_existing=True,
             context=serialization.TS_CONTEXT,
         )
     t = await ts.open(

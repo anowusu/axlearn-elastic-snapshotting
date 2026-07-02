@@ -13,6 +13,36 @@ from collections.abc import Sequence
 from typing import Any, Callable, ContextManager, Literal, NamedTuple, Optional, Union
 
 import jax
+# Workaround for JAX profiler bug that overwrites tensorflow trace.enabled with a bool
+try:
+    import jax.profiler
+    _original_start_trace = jax.profiler.start_trace
+    def _patched_start_trace(*args, **kwargs):
+        res = _original_start_trace(*args, **kwargs)
+        try:
+            from tensorflow.python.profiler import trace as tf_trace
+            if isinstance(tf_trace.enabled, bool):
+                val = tf_trace.enabled
+                tf_trace.enabled = lambda: val
+        except ImportError:
+            pass
+        return res
+    jax.profiler.start_trace = _patched_start_trace
+
+    _original_stop_trace = jax.profiler.stop_trace
+    def _patched_stop_trace(*args, **kwargs):
+        res = _original_stop_trace(*args, **kwargs)
+        try:
+            from tensorflow.python.profiler import trace as tf_trace
+            if isinstance(tf_trace.enabled, bool):
+                val = tf_trace.enabled
+                tf_trace.enabled = lambda: val
+        except ImportError:
+            pass
+        return res
+    jax.profiler.stop_trace = _patched_stop_trace
+except Exception:  # pylint: disable=broad-except
+    pass
 import jax.extend
 import numpy as np
 from absl import logging
@@ -275,6 +305,12 @@ class SpmdTrainer(Module):
         self._device_monitor = maybe_instantiate(cfg.device_monitor)
         self._recorder = maybe_instantiate(cfg.recorder)
         self._is_initialized: bool = False
+        replica_axis_idx = (
+            cfg.mesh_axis_names.index("data")
+            if cfg.mesh_axis_names and "data" in cfg.mesh_axis_names
+            else 0
+        )
+        self.snapshot_manager = Snapshotter(replica_axis_index=replica_axis_idx)
         self._maybe_record_event(measurement.Event.START_ACCELERATOR_INIT)
 
         if cfg.model.dtype is None:
@@ -396,6 +432,28 @@ class SpmdTrainer(Module):
     @property
     def trainer_state(self):
         return self._trainer_state
+
+    @property
+    def _latest_ready_snapshot(self) -> dict[str, Any] | None:
+        if self.snapshot_manager._latest_ready_snapshot is None:
+            return None
+        ready_step = self.snapshot_manager._latest_ready_snapshot["step"]
+        grain_state = None
+        if getattr(self, "_latest_ready_grain_state", None) is not None:
+            if self._latest_ready_grain_state["step"] == ready_step:
+                grain_state = self._latest_ready_grain_state["grain_state"]
+        return {
+            "trainer_state": self.snapshot_manager._latest_ready_snapshot["trainer_state"],
+            "grain_state": grain_state,
+            "step": ready_step,
+        }
+
+    @_latest_ready_snapshot.setter
+    def _latest_ready_snapshot(self, value):
+        if value is None:
+            if hasattr(self, "snapshot_manager"):
+                self.snapshot_manager._latest_ready_snapshot = None
+            self._latest_ready_grain_state = None
 
     @property
     def trainer_state_specs(self):
@@ -641,6 +699,7 @@ class SpmdTrainer(Module):
                     self._maybe_record_event(measurement.Event.START_DATA_LOADING)
                     try:
                         input_batch = next(input_iterator)
+                        print(f"[*] Training loop read input batch for step (before increment)={self.step}", flush=True)
                         self._maybe_record_event(measurement.Event.END_DATA_LOADING)
                         logging.log_first_n(
                             logging.INFO, "host_input_batch=%s", 3, utils.shapes(input_batch)
@@ -664,58 +723,25 @@ class SpmdTrainer(Module):
                             ),
                         )
                         self.vlog(3, "Done step %s", self.step)
+                        print(f"[*] DEBUG: cfg.snapshot_interval={cfg.snapshot_interval}, self.step={self.step}, modulo={self.step % cfg.snapshot_interval if cfg.snapshot_interval else 'N/A'}", flush=True)
                         if cfg.snapshot_interval and self.step % cfg.snapshot_interval == 0:
-                            logging.info("[*] Taking host memory snapshot at step %d", self.step)
-                            # 1. DOUBLE BUFFERING BARRIER:
-                            # To prevent Host RAM memory exhaustion (Host OOM), we must wait for the
-                            # previous asynchronous snapshot transfer to complete before launching a new one.
-                            # Calling block_until_ready() on the previous snapshot leaves block until the
-                            # DMA transfer has successfully written to Host RAM.
-                            if previous_snapshot is not None:
-                                jax.tree.map(
-                                    lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else None,
-                                    previous_snapshot,
-                                )
-                                from axlearn.common.snapshot import to_local_numpy
-                                self._latest_ready_snapshot = {
-                                    "trainer_state": to_local_numpy(previous_snapshot),
-                                    "grain_state": previous_grain_state,
-                                    "step": previous_snapshot_step,
+                            print(f"[*] Snapshot interval reached at step {self.step}", flush=True)
+                            is_checkpoint_step = self.checkpointer.should_save(step=self.step)
+                            print(f"[*] is_checkpoint_step={is_checkpoint_step} at step {self.step}", flush=True)
+                            if is_checkpoint_step:
+                                logging.info("Step %d is a checkpoint step. Skipping host snapshot.", self.step)
+                            else:
+                                logging.info("[*] Launching async host memory snapshot at step %d", self.step)
+                                grain_state = None
+                                if not cfg.save_input_iterator:
+                                    if hasattr(self._input_iter, "get_state"):
+                                        grain_state = self._input_iter.get_state()
+                                
+                                self.snapshot_manager.save_pytree(self.step, self._trainer_state)
+                                self._latest_ready_grain_state = {
+                                    "grain_state": grain_state,
+                                    "step": self.step,
                                 }
-                                logging.info("[*] Saved completed snapshot from step %d to ready registry", previous_snapshot_step)
-
-                            # 2. IN-RAM GRAIN ITERATOR CHECKPOINTING:
-                            # Instead of tf.data on disk, we natively query the PyGrain iterator state
-                            # in Python. This is fast, synchronous, and purely in RAM.
-                            grain_state = None
-                            if not cfg.save_input_iterator:
-                                if hasattr(self._input_iter, "get_state"):
-                                    grain_state = self._input_iter.get_state()
-
-                            # 3. NATIVE ASYNC DMA TO HOST:
-                            # We map each accelerator device sharding structure to host-pinned CPU memory
-                            # shardings (memory_kind="pinned_host"). We then run jax.device_put asynchronously,
-                            # copy-on-write via DMA directly from accelerator HBM to Host RAM.
-                            def to_pinned_host(x):
-                                if hasattr(x, "sharding") and x.sharding is not None:
-                                    try:
-                                        return x.sharding.with_memory_kind("pinned_host")
-                                    except Exception:
-                                        return x.sharding
-                                return None
-
-                            pinned_host_shardings = jax.tree.map(to_pinned_host, self._trainer_state)
-                            current_snapshot = jax.device_put(self._trainer_state, pinned_host_shardings)
-
-                            # 4. STORE SNAPSHOT METADATA:
-                            self._latest_snapshot = {
-                                "trainer_state": current_snapshot,
-                                "grain_state": grain_state,
-                                "step": self.step,
-                            }
-                            previous_snapshot = current_snapshot
-                            previous_grain_state = grain_state
-                            previous_snapshot_step = self.step
                         
                         num_steps += 1
                         if num_steps % 100 == 0:
@@ -1005,6 +1031,28 @@ class SpmdTrainer(Module):
                 if hasattr(self._input_iter, "set_state"):
                     self._input_iter.set_state(recovered_state["grain_state"])
                     logging.info("Restored Grain iterator state from snapshot.")
+
+            # 4. PRUNE INVALID FUTURE CHECKPOINTS:
+            # Since we rolled back training to `self._step`, any checkpoint
+            # directory saved at steps > self._step is now invalid and must be pruned
+            # to avoid ALREADY_EXISTS tensorstore creation conflicts.
+            if self.checkpointer is not None:
+                ckpt_dir_base = self.checkpointer.config.dir
+                from axlearn.common.checkpointer import Checkpointer, build_step_dir
+                try:
+                    all_steps = Checkpointer.checkpoint_steps(ckpt_dir_base)
+                    for ckpt_step in all_steps:
+                        if ckpt_step > self._step:
+                            ckpt_path_to_clean = build_step_dir(ckpt_dir_base, step=ckpt_step)
+                            logging.info(
+                                "[*] Rollback: Pruning invalid future checkpoint at step %d path: %s",
+                                ckpt_step,
+                                ckpt_path_to_clean,
+                            )
+                            Checkpointer.cleanup_checkpoint(ckpt_path_to_clean, sync=True)
+                except Exception as prune_err:
+                    logging.warning("Failed to prune future checkpoints during rollback: %s", prune_err)
+
             logging.info("Restored training state from host memory snapshot at step %d", self._step)
         else:
             # Attempt to restore the latest checkpoint, which may contain a saved `_input_iter`.
@@ -1086,6 +1134,9 @@ class SpmdTrainer(Module):
             # tensorflow when tensorflow dataset iterator checkpoints are not found
             # pylint: disable-next=broad-exception-caught
             except Exception as e:
+                # Do not catch JAX runtime errors, which should propagate to the outer recovery loop.
+                if isinstance(e, jax.errors.JaxRuntimeError) or "jax" in type(e).__module__:
+                    raise e
                 logging.warning(
                     "Attempt to restore checkpoint with restore_input_iter=%s failed: %s",
                     restore_input_iter,
@@ -1626,6 +1677,82 @@ def aot_model_analysis(compiled: jax.stages.Compiled) -> str:
     return analysis_results
 
 
+def _cleanup_pathways_proxy_sockets():
+    """Closes all leaked TCP connections to localhost:29000 (Pathways proxy)."""
+    import os
+    target_inodes = set()
+    for net_file in ["/proc/net/tcp", "/proc/net/tcp6"]:
+        if os.path.exists(net_file):
+            try:
+                with open(net_file, "r") as f:
+                    lines = f.readlines()
+                    for line in lines[1:]:
+                        parts = line.strip().split()
+                        if len(parts) < 10:
+                            continue
+                        remote_addr = parts[2]
+                        # 29000 in hex is 7148. Check if connection is to remote port 29000.
+                        if remote_addr.endswith(":7148"):
+                            inode = parts[9]
+                            target_inodes.add(inode)
+            except Exception as e:
+                logging.warning("Error reading %s: %s", net_file, e)
+
+    if not target_inodes:
+        logging.info("No active Pathways proxy sockets found in net/tcp.")
+        return
+
+    logging.info("Found target socket inodes to clean up: %s", target_inodes)
+
+    fd_dir = "/proc/self/fd"
+    closed_count = 0
+    for fd_name in os.listdir(fd_dir):
+        try:
+            fd = int(fd_name)
+            if fd in (0, 1, 2):
+                continue
+            link = os.readlink(os.path.join(fd_dir, fd_name))
+            if link.startswith("socket:["):
+                inode = link[8:-1]
+                if inode in target_inodes:
+                    logging.info("Closing leaked proxy socket FD %d (inode %s)", fd, inode)
+                    os.close(fd)
+                    closed_count += 1
+        except Exception:
+            pass
+    logging.info("Closed %d leaked proxy sockets.", closed_count)
+
+
+def _wait_for_workers_ready(jobset_name: str, num_workers: int = 8, timeout_seconds: int = 300) -> bool:
+    import socket
+    import time
+
+    logging.info("Waiting for all %d workers of JobSet %s to be TCP ready...", num_workers, jobset_name)
+    start_time = time.time()
+    while time.time() - start_time < timeout_seconds:
+        all_ready = True
+        for i in range(num_workers):
+            hostname = f"{jobset_name}-pwwk-0-{i}.{jobset_name}"
+            try:
+                # Attempt to connect to Pathways worker daemon port 29001
+                with socket.create_connection((hostname, 29001), timeout=2):
+                    pass
+            except (socket.timeout, ConnectionRefusedError, socket.gaierror) as e:
+                logging.info("Worker %d (%s) is not ready yet: %s", i, hostname, e)
+                all_ready = False
+                break
+
+        if all_ready:
+            logging.info("All %d workers are TCP ready!", num_workers)
+            return True
+
+        logging.info("Some workers not ready. Sleeping 10 seconds before next check...")
+        time.sleep(10)
+
+    logging.warning("Timed out waiting for workers after %d seconds.", timeout_seconds)
+    return False
+
+
 def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Optional[Tensor] = None) -> Any:
     """Top-level elastic training loop using Host RAM snapshots.
 
@@ -1685,11 +1812,17 @@ def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Optional[Tensor] = 
             # JaxRuntimeError is raised when JAX loses network connectivity to a TPU node or a node fails.
             # We intercept this error to perform sub-second, zero-disk recovery.
             logging.warning("Caught JaxRuntimeError: %s. Initiating recovery...", e)
-            
-            # 7. EXTRACT LATEST HOST SNAPSHOT:
+
+            # 1. EXTRACT LATEST HOST SNAPSHOT:
             # Retrieve the latest asynchronous Host RAM backup registered on the trainer.
-            # If the fault happened before the first snapshot was secured, we cannot recover.
             if "trainer" in locals():
+                if hasattr(trainer, "snapshot_manager"):
+                    logging.info("Cancelling and waiting for background snapshotter...")
+                    try:
+                        trainer.snapshot_manager.cancel()
+                        trainer.snapshot_manager.join()
+                    except Exception as cancel_err:
+                        logging.warning("Snapshotter cancel/join failed during recovery: %s", cancel_err)
                 new_snapshot = getattr(trainer, "_latest_ready_snapshot", None)
                 if new_snapshot is not None:
                     host_memory_snapshot = {
@@ -1699,22 +1832,14 @@ def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Optional[Tensor] = 
                     }
 
             if host_memory_snapshot is None:
-                logging.error("No host memory snapshot available for recovery. Re-raising exception.")
-                raise e
+                logging.warning("No host memory snapshot available for recovery. Retrying startup from scratch...")
 
-            # 8. SHUTDOWN AND RETRY BARRIER:
-            # We explicitly shutdown the distributed coordination service to release socket bindings
-            # and clean up coordinator connections. We then sleep to allow the cluster scheduler/orchestrator
-            # (like Jobset/GKE) to detect the disruption and update the network routing table.
-            #
-            # INTRODUCED BUG:
-            # Bypassed when Pathways proxy is active, as the lack of this bypass was an INTRODUCED bug in
-            # our elastic snapshotting implementation. Calling `jax.distributed.shutdown()` directly conflicts
-            # with Pathways' native lifecycle management of its proxy backend client and connection pools,
-            # causing socket cleanup or coordinator state errors during preemption recovery.
+            # 2. SHUTDOWN AND RETRY BARRIER:
             if not utils.is_pathways_proxy():
                 logging.info("Shutting down JAX distributed system...")
                 jax.distributed.shutdown()
+                logging.info("Sleeping 30 seconds to wait for topology change...")
+                time.sleep(30)
             else:
                 logging.info("Pathways proxy backend detected. Leaking executables to avoid destructor segfaults...")
                 global _leaked_executables
@@ -1728,14 +1853,27 @@ def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Optional[Tensor] = 
                     for exec_obj in execs:
                         globals()["_leaked_executables"].append(exec_obj)
                         leaked_count += 1
-                except Exception as e:
-                    logging.warning("Failed to leak executables via live_executables(): %s", e)
+                except Exception as leak_err:
+                    logging.warning("Failed to leak executables via live_executables(): %s", leak_err)
                 logging.info("Leaking %d executables complete (total leaked: %d).", leaked_count, len(globals()["_leaked_executables"]))
+
                 logging.info("Clearing JAX compilation caches...")
                 jax.clear_caches()
                 logging.info("Clearing JAX backends cache...")
                 jax.extend.backend.clear_backends()
-            logging.info("Sleeping 30 seconds to wait for topology change...")
-            time.sleep(30)
+
+                # Close leaked gRPC sockets to Pathways proxy to release the old session
+                try:
+                    logging.info("Cleaning up leaked Pathways proxy sockets...")
+                    _cleanup_pathways_proxy_sockets()
+                except Exception as socket_err:
+                    logging.warning("Failed to clean up proxy sockets: %s", socket_err)
+
+                # Extract JobSet name from trainer directory and block until all workers are ready
+                import os
+                jobset_name = os.path.basename(cfg.dir.rstrip("/"))
+                _wait_for_workers_ready(jobset_name)
+                logging.info("Sleeping an additional 30 seconds to allow Pathways workers to stabilize...")
+                time.sleep(30)
 
     return host_memory_snapshot

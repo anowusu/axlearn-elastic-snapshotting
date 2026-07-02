@@ -574,6 +574,9 @@ class TensorStoreStateStorage(StateStorage):
         # `on_commit_callback` to finalize the checkpoint.
         spec = self._get_spec(step, state, ckpt_dir)
         if jax.process_index() == 0:
+            if fs.exists(ckpt_dir):
+                logging.info("Deleting existing incomplete checkpoint directory: %s", ckpt_dir)
+                fs.rmtree(ckpt_dir)
             # Only process 0 should create directories to avoid remote filesystem rate limiting
             # on directory/object creation requests per object.
             # For example, GCS only allows 1 write per second to the same object name.
@@ -915,6 +918,10 @@ class BaseCheckpointer(Module):
         # Note: returning None here lets the caller handle the exception, if any.
         self._within_context = False
 
+    def should_save(self, *, step: int, evaler_summaries: Optional[dict[str, Any]] = None) -> bool:
+        """Returns True if the checkpointer would save at the given step."""
+        raise NotImplementedError(type(self))
+
     def save(
         self, *, step: int, state: NestedTensor, evaler_summaries: Optional[dict[str, Any]] = None
     ):
@@ -1113,6 +1120,10 @@ class Checkpointer(BaseCheckpointer):
         """Obtains the checkpoint dir for the given step."""
         cfg: Checkpointer.Config = self.config
         return build_step_dir(cfg.dir, step=step)
+
+    def should_save(self, *, step: int, evaler_summaries: Optional[dict[str, Any]] = None) -> bool:
+        """See `BaseCheckpointer.should_save`."""
+        return self._save_policy(step=step, evaler_summaries=(evaler_summaries or {}))
 
     def save(
         self, *, step: int, state: NestedTensor, evaler_summaries: Optional[dict[str, Any]] = None

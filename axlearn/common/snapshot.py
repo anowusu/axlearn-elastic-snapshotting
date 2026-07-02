@@ -5,8 +5,10 @@
 import logging
 import queue
 import threading
-from typing import Any
+from typing import Any, Callable, Optional
 
+import concurrent.futures
+import time
 from etils import epath
 import jax
 from orbax.checkpoint.experimental.v1 import training  # pytype: disable=import-error
@@ -50,43 +52,92 @@ def get_local_numpy_array(x: jax.Array) -> np.ndarray:
   return local_np
 
 
-def to_local_numpy(pytree: Any) -> Any:
+def to_local_numpy(pytree: Any, is_cancelled: Optional[Callable[[], bool]] = None) -> Any:
   """Convert all JAX arrays in pytree to process-local numpy arrays without network sync."""
+  leaves, treedef = jax.tree_util.tree_flatten(pytree)
   def leaf_fn(x):
+    if is_cancelled and is_cancelled():
+      raise RuntimeError("Snapshotting cancelled.")
     if isinstance(x, jax.Array):
       return get_local_numpy_array(x)
     return x
-  return jax.tree.map(leaf_fn, pytree)
+  from axlearn.common.utils import is_pathways_proxy
+  if is_pathways_proxy():
+    # Under Pathways proxy, excessive multi-threaded fetching can saturate the gRPC
+    # connection and starve keep-alive signals. We use a limited pool of 16 workers
+    # to speed up transfer while maintaining connection health.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+      numpy_leaves = list(executor.map(leaf_fn, leaves))
+  else:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+      numpy_leaves = list(executor.map(leaf_fn, leaves))
+  return jax.tree_util.tree_unflatten(treedef, numpy_leaves)
 
 
 class Snapshotter:
   """Manages asynchronous backups of JAX array states to pinned host memory."""
 
   def __init__(self, *, replica_axis_index: int = 0):
-    self._latest_snapshot: tuple[tree_types.PyTree, int] | None = None
+    self._latest_snapshot: tuple[tree_types.PyTree, int] | None = None  # Pinned host JAX arrays
+    self._latest_ready_snapshot: dict[str, Any] | None = None  # CPU NumPy state
     self._lock = threading.Lock()
     self._queue = queue.Queue(maxsize=1)
     self.replica_axis_index = replica_axis_index
+    self._cancelled = False
     self._worker_thread = threading.Thread(target=self._worker, daemon=True)
     self._worker_thread.start()
 
+  def cancel(self) -> None:
+    """Cancels any in-progress or queued snapshot operations."""
+    with self._lock:
+      self._cancelled = True
+      # Clear the queue
+      try:
+        while True:
+          self._queue.get_nowait()
+          self._queue.task_done()
+      except queue.Empty:
+        pass
+
   def _worker(self):
+    print("[*] Snapshotter worker thread started", flush=True)
     while True:
       pinned_state, step = self._queue.get()
+      print(f"[*] Snapshotter worker got item for step {step}", flush=True)
+      with self._lock:
+        if self._cancelled:
+          self._queue.task_done()
+          continue
       try:
-        _logger.info(
+        logging.info(
             "[*] [Snapshot Thread] Waiting for snapshot at step %d to be ready...",
             step,
         )
         jax.block_until_ready(pinned_state)
-        _logger.info(
-            "[*] [Snapshot Thread] Snapshot at step %d is ready and secured.",
+        with self._lock:
+          if self._cancelled:
+            raise RuntimeError("Cancelled")
+        logging.info(
+            "[*] [Snapshot Thread] Snapshot at step %d is ready. Converting to local NumPy...",
             step,
         )
+        # Perform JAX Array -> local NumPy array conversion in background thread
+        start_time = time.time()
+        numpy_state = to_local_numpy(pinned_state, is_cancelled=lambda: self._cancelled)
+        duration = time.time() - start_time
         with self._lock:
           self._latest_snapshot = (pinned_state, step)
+          self._latest_ready_snapshot = {
+              "trainer_state": numpy_state,
+              "step": step,
+          }
+        logging.info(
+            "[*] [Snapshot Thread] Secured NumPy snapshot for step %d in %.3f seconds.",
+            step,
+            duration,
+        )
       except Exception as e:  # pylint: disable=broad-except
-        _logger.warning(
+        logging.warning(
             "[*] [Snapshot Thread] Failed to secure snapshot at step %d: %s.",
             step,
             e,
@@ -98,8 +149,9 @@ class Snapshotter:
       self, step: int, state: tree_types.PyTreeOf[jax.Array]
   ) -> None:
     """Move arrays onto CPU worker devices."""
+    print(f"[*] save_pytree called for step {step}", flush=True)
     if self._queue.full():
-      _logger.warning("Snapshotter busy. Skipping snapshot for step %d", step)
+      logging.warning("Snapshotter busy. Skipping snapshot for step %d", step)
       return
 
     pinned_shardings = jax.tree.map(
@@ -163,7 +215,7 @@ class Snapshotter:
       except Exception as e:
         _logger.warning("Failed to check snapshot backend health: %s", e)
 
-    if use_pathways and is_snapshot_backend_alive:
+    if use_pathways and is_snapshot_backend_alive and first_array is not None:
       from pathwaysutils.experimental import concatenate_by_mesh_axis
       from pathwaysutils.experimental import split_by_mesh_axis
 
@@ -223,29 +275,32 @@ class Snapshotter:
       # and then call jax.device_put to reshard them onto the new mesh.
 
       def heal_leaf(x, abstract):
-        if not hasattr(x, "sharding") or x.sharding is None:
-          # Non-JAX array (e.g. Python scalar or metadata), return as is or put to device
-          return jax.device_put(x, abstract.sharding) if hasattr(abstract, "sharding") else x
+        if not hasattr(abstract, "sharding") or abstract.sharding is None:
+          # Non-JAX target, return as is
+          return x
 
-        # Check if the array is healthy and block until ready
-        try:
-          if is_snapshot_backend_alive:
-            jax.block_until_ready(x)
-          # If block_until_ready succeeds, the array is healthy.
-          # We can convert it to a local numpy array.
-          # To avoid cross-host gather (which might hang if a host is dead),
-          # we reconstruct the local addressable data from its addressable shards.
-          local_np = get_local_numpy_array(x)
-        except Exception as e:
-          # If the global array access fails, try to extract surviving local shards
-          _logger.warning("Global array access failed: %s. Attempting local shard extraction...", e)
-          local_np = get_local_numpy_array(x)
+        # If it is a JAX array target, but the source is a numpy array (process local data)
+        # or if the source is still a jax.Array (which shouldn't happen if we converted to local NumPy, but just in case)
+        if isinstance(x, jax.Array):
+          try:
+            if is_snapshot_backend_alive:
+              jax.block_until_ready(x)
+            local_np = get_local_numpy_array(x)
+          except Exception as e:
+            _logger.warning("Global array access failed: %s. Attempting local shard extraction...", e)
+            local_np = get_local_numpy_array(x)
+        else:
+          local_np = x
 
         if local_np is None:
           raise RuntimeError("Failed to retrieve any local addressable data for array.")
 
-        # Put the local numpy array onto the new TPU mesh sharding
-        return jax.device_put(local_np, abstract.sharding)
+        # Assemble global jax.Array from process-local NumPy slices to avoid shape mismatch
+        return jax.make_array_from_process_local_data(
+            sharding=abstract.sharding,
+            local_data=local_np,
+            global_shape=tuple(abstract.shape),
+        )
 
       return jax.tree.map(heal_leaf, host_snapshot, abstract_target_state)
 
@@ -272,9 +327,10 @@ class Snapshotter:
       RuntimeError: If no snapshots are available to restore from.
     """
     with self._lock:
-      if self._latest_snapshot is None:
+      if self._latest_ready_snapshot is None:
         raise RuntimeError("No snapshots available to restore from.")
-      pinned_state, step = self._latest_snapshot
+      pinned_state = self._latest_ready_snapshot["trainer_state"]
+      step = self._latest_ready_snapshot["step"]
 
     _logger.info("Restoring from snapshot at step %d...", step)
     restored_state = self.heal_pytree(
@@ -287,8 +343,13 @@ class Snapshotter:
           lambda x: x.sharding.with_memory_kind("pinned_host"), abstract_state
       )
       host_target_state = jax.device_put(restored_state, host_target_shardings)
+      numpy_state = to_local_numpy(host_target_state)
       with self._lock:
         self._latest_snapshot = (host_target_state, step)
+        self._latest_ready_snapshot = {
+            "trainer_state": numpy_state,
+            "step": step,
+        }
 
     return restored_state
 
@@ -300,9 +361,9 @@ class Snapshotter:
   def latest(self) -> training.CheckpointMetadata[None] | None:
     """Returns the training step of the most recently pinned backup."""
     with self._lock:
-      if self._latest_snapshot is None:
+      if self._latest_ready_snapshot is None:
         return None
-      _, step = self._latest_snapshot
+      step = self._latest_ready_snapshot["step"]
     return training.CheckpointMetadata(
         step=step,
         path=epath.Path(),

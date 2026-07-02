@@ -423,6 +423,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         pathways_head_cpu: Optional[str] = None
         pathways_head_mem: Optional[str] = None
         pathways_debug: Optional[bool] = None
+        num_elastic_instances: Optional[int] = None
 
         colocated_python: Required[PathwaysColocatedPythonPlugin.Config] = REQUIRED
 
@@ -457,6 +458,12 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             "pathways_debug",
             None,
             "Enable debug logging for Pathways.",
+            **common_kwargs,
+        )
+        flags.DEFINE_integer(
+            "num_elastic_instances",
+            None,
+            "The minimum number of active instances/slices required to keep training.",
             **common_kwargs,
         )
 
@@ -630,6 +637,8 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             cmd_args.append(PATHWAYS_DEBUG_VMODULE)
         if self._colocated_python.is_colocated_python_enabled:
             cmd_args.append("--sidecar_name=external")
+        if self.config.num_elastic_instances:
+            cmd_args.append(f"--num_elastic_slices={self.config.num_elastic_instances}")
         cmd_args.extend(xla_flags_from_options(self._xla_options).split())
 
         instance_type = f"{pathways_tpu_version}:{system.topology}"

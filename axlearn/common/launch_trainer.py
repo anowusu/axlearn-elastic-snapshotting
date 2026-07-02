@@ -191,6 +191,16 @@ def get_trainer_config(
 
 
 def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
+    # Register atexit fast termination to prevent process hangs on socket destruction at normal exit
+    import atexit
+    import os
+    
+    def force_exit():
+        logging.info("Exiting training process via atexit force_exit.")
+        os._exit(0)
+        
+    atexit.register(force_exit)
+
     measurement.record_event(measurement.Event.START_JOB)
     trainer_config_debug_string = trainer_config.debug_string()
     logging.info("Trainer config:\n%s", trainer_config_debug_string)
