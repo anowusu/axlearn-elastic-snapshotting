@@ -193,7 +193,14 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
     measurement.record_event(measurement.Event.START_JOB)
     trainer_config_debug_string = trainer_config.debug_string()
     logging.info("Trainer config:\n%s", trainer_config_debug_string)
-    if jax.process_index() == 0:
+    
+    is_pathways = getattr(jax.config, "jax_backend", None) == "proxy"
+    if is_pathways:
+        is_process_0 = True
+    else:
+        is_process_0 = jax.process_index() == 0
+
+    if is_process_0:
         trainer_config_file = os.path.join(trainer_config.dir, "trainer_config")
         with fs.open(trainer_config_file, "w") as f:
             f.write(trainer_config_debug_string)
@@ -208,8 +215,13 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                 f,
             )
 
-    trainer: SpmdTrainer = trainer_config.instantiate(parent=None)
-    prng_key = jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
-    output = trainer.run(prng_key)
+    if is_pathways:
+        prng_key = lambda: jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
+    else:
+        prng_key = jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
+
+    from axlearn.common.trainer import elastic_training_loop
+    output = elastic_training_loop(trainer_config, prng_key=prng_key)
+
     measurement.record_event(measurement.Event.END_JOB)
     return output
