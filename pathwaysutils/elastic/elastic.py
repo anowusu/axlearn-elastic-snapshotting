@@ -28,7 +28,13 @@ from typing import Any
 
 import jax
 import numpy as np
+from pathwaysutils import _initialize
 from pathwaysutils.debug import timing
+
+try:
+  from pathways.jax.ifrt import client as pathways_ifrt_client
+except ImportError:
+  pathways_ifrt_client = None
 
 
 _logger = logging.getLogger(__name__)
@@ -94,14 +100,29 @@ class DefaultSliceHealthChecker(SliceHealthChecker):
     return jax.pmap(self._plus_one, devices=devices)(test_input)
 
   def dispatch(self) -> None:
-    self.results = {
-        slice_index: self._simple_execution(devices)
-        for slice_index, devices in self.slice_to_devices.items()
-    }
+    self.results = {}
+    for slice_index, devices in self.slice_to_devices.items():
+      try:
+        self.results[slice_index] = self._simple_execution(devices)
+      except Exception as error:  # pylint: disable=broad-exception-caught
+        _logger.debug(
+            "Caught exception during dispatch for slice_index=%s: %s",
+            slice_index,
+            error,
+        )
+        self.results[slice_index] = error
 
   def validate(self) -> Set[int]:
     active_slice_indices = set()
     for slice_index, x in self.results.items():
+      if isinstance(x, Exception):
+        if isinstance(x, jax.errors.JaxRuntimeError) and is_error_due_to_slice_down(x):
+          _logger.debug(
+              "Slice %s is down (dispatch error): %s", slice_index, x
+          )
+          continue
+        raise x
+
       expected = (
           np.zeros(len(self.slice_to_devices[slice_index]), dtype=float)
           + _SIMPLE_EXECUTION_TEST_VALUE
@@ -123,6 +144,37 @@ class DefaultSliceHealthChecker(SliceHealthChecker):
         )
         if not is_error_due_to_slice_down(error):
           raise
+    return active_slice_indices
+
+
+class PathwaysSliceHealthChecker(SliceHealthChecker):
+  """Checks slice health using Pathways' devices_placement_active API."""
+
+  def dispatch(self) -> None:
+    pass
+
+  def validate(self) -> Set[int]:
+    if pathways_ifrt_client is None:
+      raise RuntimeError(
+          "Pathways IFRT client is not available. Ensure pathways is installed."
+      )
+
+    active_slice_indices = set()
+    for slice_index, devices in self.slice_to_devices.items():
+      try:
+        active_statuses = pathways_ifrt_client.devices_placement_active(devices)
+        if all(active_statuses):
+          active_slice_indices.add(slice_index)
+        else:
+          _logger.debug(
+              "Slice %s is inactive. Device active statuses: %s",
+              slice_index,
+              active_statuses,
+          )
+      except Exception as error:  # pylint: disable=broad-exception-caught
+        _logger.debug(
+            "Caught error checking health for slice %s: %s", slice_index, error
+        )
     return active_slice_indices
 
 
@@ -159,7 +211,15 @@ def get_active_slice_indices(
     slice_to_devices = get_slice_to_devices(tuple(jax.devices()))
 
   if checker is None:
-    checker = DefaultSliceHealthChecker(slice_to_devices)
+    if _initialize.is_pathways_backend_used() and pathways_ifrt_client is not None:
+      checker = PathwaysSliceHealthChecker(slice_to_devices)
+    else:
+      if _initialize.is_pathways_backend_used():
+        _logger.warning(
+            "Pathways backend detected, but pathways client is not installed. "
+            "Falling back to DefaultSliceHealthChecker."
+        )
+      checker = DefaultSliceHealthChecker(slice_to_devices)
 
   _logger.debug(
       "Getting active slice indices for slices: %s",
@@ -196,7 +256,7 @@ def wait_for_slices(
   Raises:
     TimeoutError: If the timeout is reached before the slices become
       active.
-  """
+    """
   if slice_to_devices is None:
     _logger.debug("slice_to_devices is None. Getting from jax.devices().")
     slice_to_devices = get_slice_to_devices(jax.devices())

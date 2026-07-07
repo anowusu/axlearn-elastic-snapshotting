@@ -194,9 +194,33 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
     # Register atexit fast termination to prevent process hangs on socket destruction at normal exit
     import atexit
     import os
+    import sys
+    import threading
     
+    _has_exception = False
+    
+    # Track uncaught exceptions in the main thread
+    _original_excepthook = sys.excepthook
+    def _exception_tracking_hook(etype, evalue, tb):
+        nonlocal _has_exception
+        _has_exception = True
+        _original_excepthook(etype, evalue, tb)
+    sys.excepthook = _exception_tracking_hook
+    
+    # Track uncaught exceptions in background threads
+    _original_thread_hook = getattr(threading, "excepthook", None)
+    def _thread_exception_tracking_hook(args):
+        nonlocal _has_exception
+        _has_exception = True
+        if _original_thread_hook:
+            _original_thread_hook(args)
+    if _original_thread_hook:
+        threading.excepthook = _thread_exception_tracking_hook
+
     def force_exit():
         logging.info("Exiting training process via atexit force_exit.")
+        if _has_exception:
+            os._exit(1)
         os._exit(0)
         
     atexit.register(force_exit)

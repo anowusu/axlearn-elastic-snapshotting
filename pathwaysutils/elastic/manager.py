@@ -62,7 +62,6 @@ def _elastic_event_cleanup() -> None:
     _logger.exception("Error cleaning up ongoing traces")
     raise
 
-  jax.clear_caches()
   for array in jax.live_arrays():
     array.delete()
 
@@ -167,7 +166,6 @@ class Manager:
     except Exception:  # pylint: disable=broad-exception-caught
       _logger.exception("Error cleaning up ongoing traces")
 
-    jax.clear_caches()
     for array in jax.live_arrays():
       array.delete()
 
