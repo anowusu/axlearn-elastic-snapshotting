@@ -1,3 +1,0 @@
-[console_scripts]
-collect_profile=pathwaysutils.collect_profile:main
-
