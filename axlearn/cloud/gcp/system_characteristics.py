@@ -558,7 +558,9 @@ _SUBBLOCK_MAPPING = {
 # Map TPU version to chips per host bounds
 _TPU_VERSION_TO_CHIPS_PER_HOST_BOUNDS = {
     "7x": (2, 2, 1),
+    "v5litepod": (2, 2),
 }
+
 
 
 def get_subblock_characteristics(tpu_version: str) -> Optional[_SystemCharacteristics]:
@@ -606,6 +608,11 @@ def get_host_bounds(
     topology_parts = topology.split("x")
     topology_dims = tuple(int(x) for x in topology_parts)
 
+    if len(chips_per_host_bounds) == 2:
+        chips_per_host_bounds = chips_per_host_bounds + (1,)
+        if len(topology_dims) == 2:
+            topology_dims = topology_dims + (1,)
+
     # Check if dimensions match
     if len(topology_dims) != len(chips_per_host_bounds):
         return None
@@ -614,6 +621,7 @@ def get_host_bounds(
     host_bounds = tuple(t // c for t, c in zip(topology_dims, chips_per_host_bounds))
 
     return (chips_per_host_bounds, host_bounds)
+
 
 
 def get_system_characteristics(

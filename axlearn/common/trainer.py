@@ -435,14 +435,14 @@ class SpmdTrainer(Module):
 
     @property
     def _latest_ready_snapshot(self) -> dict[str, Any] | None:
-        if self.snapshot_manager._latest_ready_snapshot is None:
+        if self.snapshot_manager._latest_snapshot is None:
             return None
-        ready_step = self.snapshot_manager._latest_ready_snapshot["step"]
+        ready_step = self.snapshot_manager._latest_snapshot[1]
         grain_state = None
         if getattr(self, "_latest_ready_grain_states", None) is not None:
             grain_state = self._latest_ready_grain_states.get(ready_step)
         return {
-            "trainer_state": self.snapshot_manager._latest_ready_snapshot["trainer_state"],
+            "trainer_state": self.snapshot_manager._latest_snapshot[0],
             "grain_state": grain_state,
             "step": ready_step,
         }
@@ -451,7 +451,7 @@ class SpmdTrainer(Module):
     def _latest_ready_snapshot(self, value):
         if value is None:
             if hasattr(self, "snapshot_manager"):
-                self.snapshot_manager._latest_ready_snapshot = None
+                self.snapshot_manager._latest_snapshot = None
             self._latest_ready_grain_states = {}
 
     @property
@@ -1714,113 +1714,7 @@ def aot_model_analysis(compiled: jax.stages.Compiled) -> str:
     return analysis_results
 
 
-def _cleanup_pathways_proxy_sockets():
-    """Closes all leaked TCP connections to localhost:29000 (Pathways proxy)."""
-    logging.info("[RECOVERY_PHASE] >>> Starting cleanup of leaked Pathways proxy sockets... <<<")
-    import os
-    target_inodes = set()
-    for net_file in ["/proc/net/tcp", "/proc/net/tcp6"]:
-        if os.path.exists(net_file):
-            try:
-                with open(net_file, "r") as f:
-                    lines = f.readlines()
-                    for line in lines[1:]:
-                        parts = line.strip().split()
-                        if len(parts) < 10:
-                            continue
-                        remote_addr = parts[2]
-                        # 29000 in hex is 7148. Check if connection is to remote port 29000.
-                        if remote_addr.endswith(":7148"):
-                            inode = parts[9]
-                            target_inodes.add(inode)
-            except Exception as e:
-                logging.warning("Error reading %s: %s", net_file, e)
 
-    if not target_inodes:
-        logging.info("No active Pathways proxy sockets found in net/tcp.")
-        return
-
-    logging.info("Found target socket inodes to clean up: %s", target_inodes)
-
-    fd_dir = "/proc/self/fd"
-    closed_count = 0
-    for fd_name in os.listdir(fd_dir):
-        try:
-            fd = int(fd_name)
-            if fd in (0, 1, 2):
-                continue
-            link = os.readlink(os.path.join(fd_dir, fd_name))
-            if link.startswith("socket:["):
-                inode = link[8:-1]
-                if inode in target_inodes:
-                    logging.info("Closing leaked proxy socket FD %d (inode %s)", fd, inode)
-                    os.close(fd)
-                    closed_count += 1
-        except Exception:
-            pass
-    logging.warning(
-        "[RECOVERY_PHASE] >>> Sockets cleaned. Closed %d leaked proxy sockets. <<<",
-        closed_count,
-    )
-
-
-def _wait_for_workers_ready(jobset_name: str, num_workers: int = 8, timeout_seconds: int = 300) -> bool:
-    import socket
-    import time
-
-    logging.warning(
-        "[RECOVERY_PHASE] >>> Waiting for all %d workers of JobSet %s to be TCP ready... <<<",
-        num_workers,
-        jobset_name,
-    )
-    start_time = time.time()
-    iteration = 0
-    while time.time() - start_time < timeout_seconds:
-        iteration += 1
-        logging.info(
-            "[RECOVERY_PHASE] >>> [Attempt %d] Checking connectivity for all workers... elapsed time: %.1fs <<<",
-            iteration,
-            time.time() - start_time,
-        )
-        all_ready = True
-        for i in range(num_workers):
-            hostname = f"{jobset_name}-pwwk-0-{i}.{jobset_name}"
-            try:
-                # Attempt to connect to Pathways worker daemon port 29001
-                with socket.create_connection((hostname, 29001), timeout=2):
-                    logging.info(
-                        "[RECOVERY_PHASE] >>> Worker %d (%s) is reachable on port 29001. <<<",
-                        i,
-                        hostname,
-                    )
-            except (socket.timeout, ConnectionRefusedError, socket.gaierror) as e:
-                logging.info(
-                    "[RECOVERY_PHASE] >>> Worker %d (%s) connection failed: %s <<<",
-                    i,
-                    hostname,
-                    e,
-                )
-                all_ready = False
-                break
-
-        if all_ready:
-            logging.warning(
-                "[RECOVERY_PHASE] >>> SUCCESS: All %d workers of JobSet %s are TCP ready! <<<",
-                num_workers,
-                jobset_name,
-            )
-            return True
-
-        logging.info(
-            "[RECOVERY_PHASE] >>> Some workers are not ready yet. Sleeping 10 seconds before next check... <<<"
-        )
-        time.sleep(10)
-
-    logging.warning(
-        "[RECOVERY_PHASE] >>> TIMEOUT: Timed out waiting for workers after %d seconds. <<<",
-        timeout_seconds,
-    )
-    return False
 
 
 
@@ -1837,6 +1731,10 @@ def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Optional[Tensor] = 
     # We initialize the snapshot container outside the retry loop so that it persists
     # in Host RAM even when the trainer instance is destroyed and recreated.
     host_memory_snapshot = None
+    target_slice_count = 1
+    if utils.is_pathways_proxy():
+        target_slice_count = len({d.slice_index for d in jax.devices()})
+        logging.info("Target slice count initialized to %d", target_slice_count)
     while True:
         try:
             # 2. INITIALIZE JAX DISTRIBUTED COORDINATOR:
@@ -1937,26 +1835,11 @@ def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Optional[Tensor] = 
                     logging.warning("[RECOVERY_PHASE] >>> Failed to leak executables via live_executables(): %s <<<", leak_err)
                 logging.warning("[RECOVERY_PHASE] >>> Leaking %d executables complete (total leaked: %d). <<<", leaked_count, len(globals()["_leaked_executables"]))
 
-                logging.info("[RECOVERY_PHASE] >>> Clearing JAX compilation caches... <<<")
-                jax.clear_caches()
-                logging.info("[RECOVERY_PHASE] >>> Clearing JAX backends cache... <<<")
-                jax.extend.backend.clear_backends()
-
-                # Close leaked gRPC sockets to Pathways proxy to release the old session
-                try:
-                    logging.warning("[RECOVERY_PHASE] >>> Initiating cleanup of leaked Pathways proxy sockets <<<")
-                    _cleanup_pathways_proxy_sockets()
-                    logging.warning("[RECOVERY_PHASE] >>> Completed cleanup of leaked Pathways proxy sockets <<<")
-                except Exception as socket_err:
-                    logging.warning("[RECOVERY_PHASE] >>> Failed to clean up proxy sockets: %s <<<", socket_err)
-
-                # Extract JobSet name from trainer directory and block until all workers are ready
-                import os
-                jobset_name = os.path.basename(cfg.dir.rstrip("/"))
-                logging.warning("[RECOVERY_PHASE] >>> Invoking blocking worker TCP readiness check for JobSet: %s <<<", jobset_name)
-                ready_success = _wait_for_workers_ready(jobset_name)
-                logging.warning("[RECOVERY_PHASE] >>> Worker readiness check completed. Result: %s <<<", ready_success)
-                logging.warning("[RECOVERY_PHASE] >>> Sleeping an additional 30 seconds to allow Pathways workers to stabilize... <<<")
-                time.sleep(30)
+                from pathwaysutils.elastic import elastic
+                logging.warning(
+                    "[RECOVERY_PHASE] >>> Waiting for %d slices to be active via JAX device health pings... <<<",
+                    target_slice_count,
+                )
+                elastic.wait_for_slices(slice_count=target_slice_count)
 
     return host_memory_snapshot

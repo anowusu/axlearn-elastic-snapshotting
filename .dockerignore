@@ -1,0 +1,6 @@
+.venv
+.git
+bazel-bin
+bazel-out
+bazel-testlogs
+bazel-axlearn-snapshotting

@@ -1192,6 +1192,17 @@ py_library(
 )
 
 py_library(
+    name = "snapshot",
+    srcs = ["snapshot.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@axlearn_pip//etils",
+        "@axlearn_pip//jax",
+        "@axlearn_pip//orbax_checkpoint",
+    ],
+)
+
+py_library(
     name = "trainer",
     srcs = ["trainer.py"],
     visibility = ["//visibility:public"],
@@ -1209,6 +1220,7 @@ py_library(
         ":module",
         ":optimizer_base",
         ":param_init",
+        ":snapshot",
         ":state_builder",
         ":summary_writer",
         ":update_transformation",

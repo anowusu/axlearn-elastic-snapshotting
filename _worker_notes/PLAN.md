@@ -1,19 +1,19 @@
-# Restoring Verbose Logs, Debug Prints, and Workaround Comments
+# Plan - Synthesis of Elastic Recovery Refactor
 
-We are restoring the verbose logs, debug prints, and warning comments explaining workarounds that were previously stripped out during branch cleanup, while preserving critical functional recovery fixes.
+1. **Modify google3 `pathwaysutils` files**:
+   - `third_party/pathways/jax/ifrt/BUILD`: Add visibility for `//third_party/py/pathwaysutils/...` to `users` package group.
+   - `third_party/py/pathwaysutils/elastic/BUILD`: Add `//third_party/pathways/jax/ifrt:client` dependency.
+   - `third_party/py/pathwaysutils/elastic/elastic.py`: Implement `PathwaysSliceHealthChecker` using per-slice `devices_placement_active` calls (Worker 0's strategy) and copybara import tags.
+   - `third_party/py/pathwaysutils/elastic/manager.py`: Remove `jax.clear_caches()` calls.
+   - `third_party/py/pathwaysutils/test/google_internal/elastic/BUILD`: Ensure `//third_party/py/pathwaysutils:_initialize` dependency is added to `elastic_test`.
+   - `third_party/py/pathwaysutils/test/google_internal/elastic/elastic_test.py`: Mock `devices_placement_active` inside tests.
+   - `third_party/py/pathwaysutils/test/google_internal/elastic/manager_test.py`: Update assertions to check that `clear_caches` is not called.
 
-## Steps
+2. **Verify `axlearn` open-source changes**:
+   - Verify that changes on branch `elastic-preemption-recovery-fixes-cleaned` compile and that `pytest common/trainer_test.py` passes.
 
-1. **Verify Baseline and Staged State**:
-   - Swapped active changes to a temporary branch `temp-bug-fixes` to preserve the bug fixes (grain state dictionary mapping and zero local shards healing fallback).
-   - Switched to the original comment-rich `elastic-preemption-recovery-fixes` branch.
+3. **Verify google3 `pathwaysutils` changes**:
+   - Run `blaze test //third_party/py/pathwaysutils/test/google_internal/elastic/...`.
 
-2. **Re-Apply Bug Fixes**:
-   - In `axlearn/common/snapshot.py`, applied the zero local shards healing fix by constructing process-local empty numpy arrays to participate in collective creation instead of crashing with `RuntimeError`.
-   - In `axlearn/common/trainer.py`, applied the grain state dictionary caching fix (mapping step -> state) to prevent input iterator state loss during active asynchronous snapshot windows.
-
-3. **Verify and Run Tests**:
-   - Confirmed that all 47 unit tests in `TrainerTest` pass successfully in the local virtual environment.
-
-4. **Document and Update Workspace**:
-   - Updated `elastic-preemption-recovery-fixes-cleaned` branch to point to the restored verbose state.
+4. **Write Handoff Report**:
+   - Document final workspace path and verification results in `_worker_notes/README.md`.
