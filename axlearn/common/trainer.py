@@ -385,13 +385,7 @@ class SpmdTrainer(Module):
                 )
         self._maybe_record_event(measurement.Event.END_ACCELERATOR_INIT)
         
-        replica_axis_idx = (
-            cfg.mesh_axis_names.index("data")
-            if cfg.mesh_axis_names and "data" in cfg.mesh_axis_names
-            else 0
-        )
-        from axlearn.common.snapshot import Snapshotter
-        self.snapshot_manager = Snapshotter(replica_axis_index=replica_axis_idx)
+        # We no longer initialize snapshot_manager here. It is lazily instantiated as snapshot_mgr in run().
 
     @property
     def step(self):
