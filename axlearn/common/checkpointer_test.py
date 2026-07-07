@@ -1550,6 +1550,43 @@ class TfIteratorTest(test_utils.TestCase):
         fut.result()
         self.assertEqual(["tf_ckpt"], fs.listdir(tmpdir))
 
+    def test_checkpointer_copy_and_deepcopy(self):
+        import copy
+        cfg = _checkpointer_config(Checkpointer)
+        ckpt = cfg.instantiate(parent=None)
+
+        # Verify initial state of executor
+        self.assertFalse(ckpt._storage._executor._shutdown)
+
+        # Test copy.copy
+        ckpt_copy = copy.copy(ckpt)
+        self.assertIsNot(ckpt, ckpt_copy)
+        self.assertIsNot(ckpt._storage, ckpt_copy._storage)
+        self.assertIsNot(ckpt._storage._executor, ckpt_copy._storage._executor)
+        self.assertFalse(ckpt._storage._executor._shutdown)
+        self.assertFalse(ckpt_copy._storage._executor._shutdown)
+
+        # Test copy.deepcopy
+        ckpt_deepcopy = copy.deepcopy(ckpt)
+        self.assertIsNot(ckpt, ckpt_deepcopy)
+        self.assertIsNot(ckpt._storage, ckpt_deepcopy._storage)
+        self.assertIsNot(ckpt._storage._executor, ckpt_deepcopy._storage._executor)
+        self.assertFalse(ckpt._storage._executor._shutdown)
+        self.assertFalse(ckpt_deepcopy._storage._executor._shutdown)
+
+        # Stop original checkpointer
+        ckpt.stop()
+        self.assertTrue(ckpt._storage._executor._shutdown)
+
+        # Verify the copies' executors are NOT shut down
+        self.assertFalse(ckpt_copy._storage._executor._shutdown)
+        self.assertFalse(ckpt_deepcopy._storage._executor._shutdown)
+
+        # Clean up copies
+        ckpt_copy.stop()
+        ckpt_deepcopy.stop()
+
+
 
 SWITCHABLE_VDICT_IMPL: Optional[type[VDict]] = None
 

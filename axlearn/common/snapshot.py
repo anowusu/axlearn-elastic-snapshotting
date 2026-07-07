@@ -2,6 +2,7 @@
 
 """Manages asynchronous backups of JAX array states to pinned host memory."""
 
+import contextlib
 import logging
 import queue
 import threading
@@ -11,6 +12,7 @@ import concurrent.futures
 import time
 from etils import epath
 import jax
+from jax._src.mesh import thread_resources
 from orbax.checkpoint.experimental.v1 import training  # pytype: disable=import-error
 from orbax.checkpoint.experimental.v1._src.tree import types as tree_types  # pytype: disable=import-error
 from pathwaysutils.experimental import concatenate_by_mesh_axis  # pytype: disable=import-error
@@ -102,48 +104,51 @@ class Snapshotter:
   def _worker(self):
     print("[*] Snapshotter worker thread started", flush=True)
     while True:
-      pinned_state, step = self._queue.get()
+      pinned_state, step, current_mesh = self._queue.get()
       print(f"[*] Snapshotter worker got item for step {step}", flush=True)
       with self._lock:
         if self._cancelled:
           self._queue.task_done()
           continue
-      try:
-        logging.info(
-            "[*] [Snapshot Thread] Waiting for snapshot at step %d to be ready...",
-            step,
-        )
-        jax.block_until_ready(pinned_state)
-        with self._lock:
-          if self._cancelled:
-            raise RuntimeError("Cancelled")
-        logging.info(
-            "[*] [Snapshot Thread] Snapshot at step %d is ready. Converting to local NumPy...",
-            step,
-        )
-        # Perform JAX Array -> local NumPy array conversion in background thread
-        start_time = time.time()
-        numpy_state = to_local_numpy(pinned_state, is_cancelled=lambda: self._cancelled)
-        duration = time.time() - start_time
-        with self._lock:
-          self._latest_snapshot = (pinned_state, step)
-          self._latest_ready_snapshot = {
-              "trainer_state": numpy_state,
-              "step": step,
-          }
-        logging.info(
-            "[*] [Snapshot Thread] Secured NumPy snapshot for step %d in %.3f seconds.",
-            step,
-            duration,
-        )
-      except Exception as e:  # pylint: disable=broad-except
-        logging.warning(
-            "[*] [Snapshot Thread] Failed to secure snapshot at step %d: %s.",
-            step,
-            e,
-        )
-      finally:
-        self._queue.task_done()
+      
+      context = current_mesh if current_mesh is not None and not current_mesh.empty else contextlib.nullcontext()
+      with context:
+        try:
+          logging.info(
+              "[*] [Snapshot Thread] Waiting for snapshot at step %d to be ready...",
+              step,
+          )
+          jax.block_until_ready(pinned_state)
+          with self._lock:
+            if self._cancelled:
+              raise RuntimeError("Cancelled")
+          logging.info(
+              "[*] [Snapshot Thread] Snapshot at step %d is ready. Converting to local NumPy...",
+              step,
+          )
+          # Perform JAX Array -> local NumPy array conversion in background thread
+          start_time = time.time()
+          numpy_state = to_local_numpy(pinned_state, is_cancelled=lambda: self._cancelled)
+          duration = time.time() - start_time
+          with self._lock:
+            self._latest_snapshot = (pinned_state, step)
+            self._latest_ready_snapshot = {
+                "trainer_state": numpy_state,
+                "step": step,
+            }
+          logging.info(
+              "[*] [Snapshot Thread] Secured NumPy snapshot for step %d in %.3f seconds.",
+              step,
+              duration,
+          )
+        except Exception as e:  # pylint: disable=broad-except
+          logging.warning(
+              "[*] [Snapshot Thread] Failed to secure snapshot at step %d: %s.",
+              step,
+              e,
+          )
+        finally:
+          self._queue.task_done()
 
   def save_pytree(
       self, step: int, state: tree_types.PyTreeOf[jax.Array]
@@ -160,7 +165,8 @@ class Snapshotter:
 
     pinned_state = jax.device_put(state, pinned_shardings)
 
-    self._queue.put((pinned_state, step))
+    current_mesh = thread_resources.env.physical_mesh
+    self._queue.put((pinned_state, step, current_mesh))
 
   @classmethod
   def heal_pytree(

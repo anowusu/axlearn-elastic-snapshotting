@@ -453,9 +453,7 @@ class TensorStoreStateStorage(StateStorage):
         max_concurrent_restore_gb: Optional[int] = None
         shard_threshold_bytes: Optional[int] = None
 
-    def __init__(self, cfg: Config):
-        super().__init__(cfg)
-        cfg = self.config
+    def _init_manager(self, cfg: Config):
         # PRE-EXISTING GAP / PATHWAYS INTEGRATION:
         # The hardcoded use of standard JAX asynchronous checkpoint managers was a PRE-EXISTING
         # gap in AXLearn. In a Pathways proxy environment, checkpoint saving must be routed through
@@ -480,6 +478,11 @@ class TensorStoreStateStorage(StateStorage):
                     "max_data_shard_degree is not set. It will not take any effect."
                 )
             self._manager = GlobalAsyncCheckpointManager(timeout_secs=cfg.timeout_secs)
+
+    def __init__(self, cfg: Config):
+        super().__init__(cfg)
+        cfg = self.config
+        self._init_manager(cfg)
         if cfg.max_concurrent_restore_gb is not None and cfg.max_concurrent_restore_gb <= 0:
             raise ValueError(
                 f"max_concurrent_restore_gb must be strictly positive. "
@@ -570,6 +573,8 @@ class TensorStoreStateStorage(StateStorage):
         on_commit_callback: StateStorageCommitCallback = write_index_file,
     ):
         start_time = time.perf_counter()
+        if self._executor._shutdown:
+            self._executor = futures.ThreadPoolExecutor()
         # We write data files directly to `ckpt_dir`. `index` is written into `ckpt_dir` in
         # `on_commit_callback` to finalize the checkpoint.
         spec = self._get_spec(step, state, ckpt_dir)
@@ -676,6 +681,27 @@ class TensorStoreStateStorage(StateStorage):
 
     def stop(self):
         self._executor.shutdown(wait=True)
+
+    def __copy__(self):
+        cls = self.__class__
+        result = cls.__new__(cls)
+        result.__dict__.update(self.__dict__)
+        result._executor = futures.ThreadPoolExecutor()
+        result._init_manager(self.config)
+        return result
+
+    def __deepcopy__(self, memo):
+        import copy
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        for k, v in self.__dict__.items():
+            if k in ("_executor", "_manager"):
+                continue
+            result.__dict__[k] = copy.deepcopy(v, memo)
+        result._executor = futures.ThreadPoolExecutor()
+        result._init_manager(result.config)
+        return result
 
 
 class CheckpointPolicy(Protocol):
@@ -1105,6 +1131,27 @@ class Checkpointer(BaseCheckpointer):
             self._gc_thread.join()
             self._gc_thread = None
             logging.info("gc_thread finished")
+
+    def __copy__(self):
+        import copy
+        cls = self.__class__
+        result = cls.__new__(cls)
+        result.__dict__.update(self.__dict__)
+        result._storage = copy.copy(self._storage)
+        result._gc_thread = None
+        result._gc_stopping = None
+        return result
+
+    def __deepcopy__(self, memo):
+        import copy
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        for k, v in self.__dict__.items():
+            result.__dict__[k] = copy.deepcopy(v, memo)
+        result._gc_thread = None
+        result._gc_stopping = None
+        return result
 
     def _gc_loop(self, *, context_stack: list[InvocationContext]):
         """Starts garbage collection loop. Will block the current thread."""
