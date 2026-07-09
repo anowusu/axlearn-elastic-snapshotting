@@ -194,7 +194,11 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
     trainer_config_debug_string = trainer_config.debug_string()
     logging.info("Trainer config:\n%s", trainer_config_debug_string)
     
-    is_pathways = getattr(jax.config, "jax_backend", None) == "proxy"
+    try:
+        is_pathways = FLAGS.jax_backend == "proxy"
+    except Exception:
+        is_pathways = getattr(jax.config, "jax_backend", None) == "proxy"
+
     if is_pathways:
         is_process_0 = True
     else:

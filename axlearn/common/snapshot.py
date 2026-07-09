@@ -11,8 +11,7 @@ from etils import epath
 import jax
 from orbax.checkpoint.experimental.v1 import training  # pytype: disable=import-error
 from orbax.checkpoint.experimental.v1._src.tree import types as tree_types  # pytype: disable=import-error
-from pathwaysutils.experimental import concatenate_by_mesh_axis  # pytype: disable=import-error
-from pathwaysutils.experimental import split_by_mesh_axis  # pytype: disable=import-error
+
 import jax.numpy as jnp
 from axlearn.common.utils import Nested, TensorSpec, get_current_abstract_or_physical_mesh
 
@@ -120,20 +119,29 @@ class Snapshotter:
         return x
       if x.shape == target_x.shape:
         return x
-      starts = [0] * x.ndim
-      stops = [min(s1, s2) for s1, s2 in zip(x.shape, target_x.shape)]
-      sliced_x = jax.lax.slice(x, starts, stops)
-      pad_widths = [(0, max(0, s2 - s1)) for s1, s2 in zip(x.shape, target_x.shape)]
-      if any(p > 0 for _, p in pad_widths):
-          sliced_x = jnp.pad(sliced_x, pad_widths)
+      
+      with jax.default_device(jax.devices("cpu")[0]):
+        starts = [0] * x.ndim
+        stops = [min(s1, s2) for s1, s2 in zip(x.shape, target_x.shape)]
+        sliced_x = jax.lax.slice(x, starts, stops)
+        pad_widths = [(0, max(0, s2 - s1)) for s1, s2 in zip(x.shape, target_x.shape)]
+        if any(p > 0 for _, p in pad_widths):
+            sliced_x = jnp.pad(sliced_x, pad_widths)
       return sliced_x
 
     _logger.info("Restoring from snapshot at step %d...", step)
-    pinned_state = jax.tree.map(get_active_pytree, pinned_state, abstract_state)
+    pinned_state = jax.tree.map(
+        get_active_pytree, 
+        pinned_state, 
+        abstract_state, 
+        is_leaf=lambda x: hasattr(x, "shape")
+    )
 
     # Re-shard on host to the target device mesh
     host_target_shardings = jax.tree.map(
-        lambda x: x.sharding.with_memory_kind("pinned_host") if hasattr(x, "sharding") else None, abstract_state
+        lambda x: x.sharding.with_memory_kind("pinned_host") if hasattr(x, "sharding") else None, 
+        abstract_state,
+        is_leaf=lambda x: hasattr(x, "shape")
     )
 
     host_target_state = jax.device_put(
@@ -142,7 +150,12 @@ class Snapshotter:
 
     # Move from host back to device (TPU) memory.
     restored_state = jax.device_put(
-        host_target_state, jax.tree.map(lambda x: x.sharding if hasattr(x, "sharding") else None, abstract_state)
+        host_target_state, 
+        jax.tree.map(
+            lambda x: x.sharding if hasattr(x, "sharding") else None, 
+            abstract_state,
+            is_leaf=lambda x: hasattr(x, "shape")
+        )
     )
     jax.block_until_ready(restored_state)
 

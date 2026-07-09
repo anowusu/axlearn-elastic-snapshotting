@@ -121,6 +121,12 @@ OTEL_COLLECTOR_SIDECAR_NAME = "otel-sidecar"
 OTEL_COLLECTOR_CONFIG_NAME = "otel-sidecar-config"
 OTEL_COLLECTOR_CONFIG_MOUNT_PATH = "/conf"
 
+PATHWAYS_DEBUG_VMODULE = (
+    "--vmodule=grpc_service_impl=3,ifrt_backend=3,rpc_transport=2,"
+    "resource_manager=2,device_set_manager=2,compilation_client=2,"
+    "grpc_host_buffer=3,rpc_helper=3,host_buffer=3"
+)
+
 
 def get_colocated_python_image(image_id: str) -> str:
     path, _ = image_id.rsplit(":", maxsplit=1)
@@ -319,6 +325,7 @@ def _build_base_pathways_worker_container(
     tpu_type: str,
     colocated_python_plugin: PathwaysColocatedPythonPlugin,
     resource_manager_address: str,
+    pathways_debug: bool = False,
 ) -> dict:
     """Builds a base pathways worker container.
 
@@ -351,6 +358,8 @@ def _build_base_pathways_worker_container(
         # Recycling host memory gives a slight increase in performance.
         "--tpu_pinned_host_allocation_recycle=true",
     ]
+    if pathways_debug:
+        args.append(PATHWAYS_DEBUG_VMODULE)
     if not colocated_python_plugin.is_colocated_python_enabled:
         args.append(
             # The flag below is needed for better H2D performance.
@@ -413,6 +422,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         pathways_xla_flags: list[str] = []
         pathways_head_cpu: Optional[str] = None
         pathways_head_mem: Optional[str] = None
+        pathways_debug: Optional[bool] = None
 
         colocated_python: Required[PathwaysColocatedPythonPlugin.Config] = REQUIRED
 
@@ -443,12 +453,19 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             "Memory request for pathways-head container in GiB. Default is 16GiB",
             **common_kwargs,
         )
+        flags.DEFINE_boolean(
+            "pathways_debug",
+            None,
+            "Enable debug logging for Pathways.",
+            **common_kwargs,
+        )
 
     @classmethod
     def set_defaults(cls, fv):
         super().set_defaults(fv)
         fv.set_default("pathways_head_cpu", fv.pathways_head_cpu or "1")
         fv.set_default("pathways_head_mem", fv.pathways_head_mem or "16")
+        fv.set_default("pathways_debug", fv.pathways_debug or False)
 
     @classmethod
     def default_config(cls):
@@ -609,6 +626,8 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             f"--resource_manager_address=localhost:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
             f"--server_port={_PATHWAYS_PROXY_PORT}",
         ]
+        if self.config.pathways_debug:
+            cmd_args.append(PATHWAYS_DEBUG_VMODULE)
         if self._colocated_python.is_colocated_python_enabled:
             cmd_args.append("--sidecar_name=external")
         cmd_args.extend(xla_flags_from_options(self._xla_options).split())
@@ -616,6 +635,37 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         instance_type = f"{pathways_tpu_version}:{system.topology}"
         if support_twisted_topology(self._tpu_type):
             instance_type = f"{instance_type}_untwisted"
+        rm_args = [
+            f"--server_port={_PATHWAYS_RESOURCE_MANAGER_PORT}",
+            "--node_type=resource_manager",
+            f"--instance_count={pathways_instance_count}",
+            f"--instance_type={instance_type}",
+            f"--gcs_scratch_location={gcs_scratch_location}",
+            "--temporary_flags_for_debugging=temporary_flag_for_debugging_compilation_service_num_compilation_threads=2",
+        ]
+        if self.config.pathways_debug:
+            rm_args.append(PATHWAYS_DEBUG_VMODULE)
+
+        # pathways-rm container runs the compilation service which is CPU and memory intensive.
+        # We set its limits to the same as the head pod to allow it to utilize the full node resources,
+        # but set requests low so that the total pod request does not exceed node capacity.
+        rm_resources = {
+            "requests": {"cpu": "2", "memory": "8Gi"},
+            "limits": {
+                "cpu": f"{float(self.config.pathways_head_cpu) * 1000}m",
+                "memory": f"{self.config.pathways_head_mem}Gi",
+            },
+        }
+
+        # pathways-proxy handles data transfer and grpc routing.
+        proxy_resources = {
+            "requests": {"cpu": "2", "memory": "8Gi"},
+            "limits": {
+                "cpu": "16",
+                "memory": "64Gi",
+            },
+        }
+
         return [
             dict(
                 name=_PATHWAYS_PROXY_CONTAINER_NAME,
@@ -639,6 +689,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                     dict(name="shared-output", mountPath="/output"),
                     dict(name=_PATHWAYS_SHM_VOLUME_NAME, mountPath=_PATHWAYS_SHM_DIR),
                 ],
+                resources=proxy_resources,
             ),
             dict(
                 name=_PATHWAYS_RESOURCE_MANAGER_CONTAINER_NAME,
@@ -652,14 +703,9 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                         "value": "true",
                     },
                 ],
-                args=[
-                    f"--server_port={_PATHWAYS_RESOURCE_MANAGER_PORT}",
-                    "--node_type=resource_manager",
-                    f"--instance_count={pathways_instance_count}",
-                    f"--instance_type={instance_type}",
-                    f"--gcs_scratch_location={gcs_scratch_location}",
-                ],
+                args=rm_args,
                 volumeMounts=[dict(name="shared-output", mountPath="/output")],
+                resources=rm_resources,
             ),
         ]
 
@@ -768,6 +814,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             tpu_type=self._tpu_type,
             colocated_python_plugin=self._colocated_python,
             resource_manager_address=pathways_head_address,
+            pathways_debug=self.config.pathways_debug,
         )
 
         env_list = worker_container.get("env", [])
@@ -1058,6 +1105,7 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         pathways_xla_flags: list[str] = []
         pathways_head_cpu: Optional[str] = None
         pathways_head_mem: Optional[str] = None
+        pathways_debug: Optional[bool] = None
 
         target_port: Optional[int] = None
         enable_service: bool = None
@@ -1153,12 +1201,19 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             "Port for health check endpoint used by startup and readiness probes.",
             **common_kwargs,
         )
+        flags.DEFINE_boolean(
+            "pathways_debug",
+            None,
+            "Enable debug logging for Pathways.",
+            **common_kwargs,
+        )
 
     @classmethod
     def set_defaults(cls, fv):
         super().set_defaults(fv)
         fv.set_default("pathways_head_cpu", fv.pathways_head_cpu or "1")
         fv.set_default("pathways_head_mem", fv.pathways_head_mem or "16")
+        fv.set_default("pathways_debug", fv.pathways_debug or False)
         fv.set_default("target_port", fv.target_port or 9000)
         fv.set_default("enable_service", fv.enable_service or False)
         fv.set_default("gke_gateway_route", fv.gke_gateway_route or False)
@@ -1232,6 +1287,7 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             tpu_type=self._tpu_type,
             colocated_python_plugin=self._colocated_python,
             resource_manager_address="$(LWS_LEADER_ADDRESS)",
+            pathways_debug=self.config.pathways_debug,
         )
 
     def build_worker_pod(self) -> dict:
@@ -1277,8 +1333,18 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             f"--resource_manager_address=localhost:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
             f"--server_port={_PATHWAYS_PROXY_PORT}",
         ]
+        if self.config.pathways_debug:
+            cmd_args.append(PATHWAYS_DEBUG_VMODULE)
         if self._colocated_python.is_colocated_python_enabled:
             cmd_args.append("--sidecar_name=external")
+
+        proxy_resources = {
+            "requests": {"cpu": "2", "memory": "8Gi"},
+            "limits": {
+                "cpu": "16",
+                "memory": "64Gi",
+            },
+        }
 
         return dict(
             name=_PATHWAYS_PROXY_CONTAINER_NAME,
@@ -1286,6 +1352,7 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             args=cmd_args,
             env=[{"name": "IFRT_PROXY_USE_INSECURE_GRPC_CREDENTIALS", "value": "true"}],
             ports=[dict(containerPort=_PATHWAYS_PROXY_PORT)],
+            resources=proxy_resources,
         )
 
     def _build_pathways_rm_container(self) -> dict:
@@ -1297,6 +1364,25 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
 
         system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
         pathways_tpu_version = get_pathways_tpu_version(system.gce_machine_type)
+
+        rm_args = [
+            f"--server_port={_PATHWAYS_RESOURCE_MANAGER_PORT}",
+            "--node_type=resource_manager",
+            "--instance_count=1",
+            f"--instance_type={pathways_tpu_version}:{system.topology}",
+            f"--gcs_scratch_location={gcs_scratch_location}",
+            "--temporary_flags_for_debugging=temporary_flag_for_debugging_compilation_service_num_compilation_threads=2",
+        ]
+        if self.config.pathways_debug:
+            rm_args.append(PATHWAYS_DEBUG_VMODULE)
+
+        rm_resources = {
+            "requests": {"cpu": "2", "memory": "8Gi"},
+            "limits": {
+                "cpu": f"{float(self.config.pathways_head_cpu) * 1000}m",
+                "memory": f"{self.config.pathways_head_mem}Gi",
+            },
+        }
 
         return dict(
             name=_PATHWAYS_RESOURCE_MANAGER_CONTAINER_NAME,
@@ -1311,14 +1397,9 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
                     "value": "$(LWS_LEADER_ADDRESS)",
                 },
             ],
-            args=[
-                f"--server_port={_PATHWAYS_RESOURCE_MANAGER_PORT}",
-                "--node_type=resource_manager",
-                "--instance_count=1",
-                f"--instance_type={pathways_tpu_version}:{system.topology}",
-                f"--gcs_scratch_location={gcs_scratch_location}",
-            ],
+            args=rm_args,
             ports=[dict(containerPort=_PATHWAYS_RESOURCE_MANAGER_PORT)],
+            resources=rm_resources,
         )
 
     def _get_notary_configmap_name(self, config_type: str) -> str:

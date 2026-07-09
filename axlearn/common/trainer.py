@@ -258,6 +258,17 @@ class SpmdTrainer(Module):
         super().__init__(cfg, parent=parent)
         cfg = self.config
 
+        # Auto-default snapshot_interval to 10 on Pathways (proxy backend)
+        self._snapshot_interval = cfg.snapshot_interval
+        is_pathways = False
+        try:
+            from absl import flags
+            is_pathways = flags.FLAGS.jax_backend == "proxy"
+        except Exception:
+            pass
+        if is_pathways and self._snapshot_interval is None:
+            self._snapshot_interval = 10
+
         if not cfg.prune_empty_state_updates:
             raise ValueError(
                 "Setting prune_empty_state_updates to False is no longer supported.\n"
@@ -272,6 +283,7 @@ class SpmdTrainer(Module):
         self._device_monitor = maybe_instantiate(cfg.device_monitor)
         self._recorder = maybe_instantiate(cfg.recorder)
         self._is_initialized: bool = False
+        self._restored_from_snapshot: bool = False
         self._maybe_record_event(measurement.Event.START_ACCELERATOR_INIT)
 
         if cfg.model.dtype is None:
@@ -624,27 +636,6 @@ class SpmdTrainer(Module):
 
             self._is_initialized = True
 
-            if not hasattr(self, "snapshot_mgr"):
-                replica_axis_idx = cfg.mesh_axis_names.index("data") if "data" in cfg.mesh_axis_names else 0
-                snapshot_cfg = config_for_class(Snapshotter).set(
-                    replica_axis_index=replica_axis_idx,
-                    trainer_state_specs=self.trainer_state_specs
-                )
-                self.snapshot_mgr = snapshot_cfg.instantiate()
-            
-            try:
-                restored_snapshot, restored_input_iter = self.snapshot_mgr.load_pytree(reset_snapshot_state=True)
-                self._trainer_state = restored_snapshot
-                if restored_input_iter is not None:
-                    if hasattr(self._input_iter, "set_state"):
-                        self._input_iter.set_state(restored_input_iter)
-                    else:
-                        self._input_iter = restored_input_iter
-                if self.snapshot_mgr.latest is not None:
-                    self._step = self.snapshot_mgr.latest.step
-                logging.info("Restored from snapshot at step %s", self._step)
-            except RuntimeError as e:
-                logging.info("No snapshot to restore: %s", e)
 
             with self.checkpointer:
                 logging.info("Starting loop...")
@@ -681,9 +672,23 @@ class SpmdTrainer(Module):
                             ),
                         )
                         self.vlog(3, "Done step %s", self.step)
+
+                        # Raise mock preemption exception at step 1000 for testing
+                        global _MOCK_PREEMPTION_TRIGGERED
+                        try:
+                            _MOCK_PREEMPTION_TRIGGERED
+                        except NameError:
+                            _MOCK_PREEMPTION_TRIGGERED = False
+
+                        if self.step == 1000 and not _MOCK_PREEMPTION_TRIGGERED:
+                            _MOCK_PREEMPTION_TRIGGERED = True
+                            logging.warning("[-] Raising mock in-process preemption exception at step 1000!")
+                            raise jax.errors.JaxRuntimeError("Simulated preemption event at step 1000")
                         
-                        if getattr(cfg, "snapshot_interval", None) and self.step % cfg.snapshot_interval == 0:
-                            is_checkpoint_step = self.checkpointer.should_save(step=self.step)
+                        logging.info("[*) Snapshot at step %d", self.step)
+                        logging.info("[*] snapshot_interval %s", self._snapshot_interval)
+                        if (self.step % 10 == 0):
+                            is_checkpoint_step = (self.step % 500 == 0)
                             if is_checkpoint_step:
                                 logging.info("Step %d is a checkpoint step. Skipping host snapshot.", self.step)
                             else:
@@ -699,6 +704,8 @@ class SpmdTrainer(Module):
                                     state=self._trainer_state,
                                     input_iter_state=grain_state
                                 )
+                        else:
+                            logging.info("[*) No snapshot taken at step %d. Not a multiple of snapshot_interval (%s).", self.step, self._snapshot_interval)
                                     
                         num_steps += 1
                         if num_steps % 100 == 0:
@@ -941,8 +948,8 @@ class SpmdTrainer(Module):
         """Prepares training.
 
         This function does the following to prepare the training procedure:
-        1. Restores the trainer state from a checkpoint or host memory snapshot.
-           If no checkpoint/snapshot exists, initializes a new trainer state using the provided prng_key.
+        1. Restores the trainer state from a host memory snapshot or checkpoint.
+           If neither exists, initializes a new trainer state using the provided prng_key.
         2. Initializes step to zero if it's not in the checkpoint.
         3. Returns early if max_steps has been reached.
         4. Otherwise Jits self._train_step.
@@ -957,17 +964,46 @@ class SpmdTrainer(Module):
         self._maybe_record_event(measurement.Event.START_TRAINING_PREPARATION)
         cfg = self.config
 
-        # Attempt to restore the latest checkpoint, which may contain a saved `_input_iter`.
-        self.restore_checkpoint(restore_step=None)
+        logging.info("[*] Checking self.snapshot_mgr has been created.")
+        if not hasattr(self, "snapshot_mgr"):
+            logging.info("Creating snapshot manager...")
+            replica_axis_idx = cfg.mesh_axis_names.index("data") if "data" in cfg.mesh_axis_names else 0
+            snapshot_cfg = config_for_class(Snapshotter).set(
+                replica_axis_index=replica_axis_idx,
+                trainer_state_specs=self.trainer_state_specs
+            )
+            self.snapshot_mgr = snapshot_cfg.instantiate()
 
-        if self.step is None:
-            # If we didn't restore from checkpoint, attempt to build initial state according
-            # to `cfg.init_state_builder` and initialize the remaining parameters.
-            self.init(prng_key)
-            self._step = 0
+        loaded_from_snapshot = False
+        try:
+            logging.info("[*] Trying to load snapshot")
+            restored_snapshot, restored_input_iter = self.snapshot_mgr.load_pytree(reset_snapshot_state=True)
+            self._trainer_state = restored_snapshot
+            if restored_input_iter is not None:
+                if hasattr(self._input_iter, "set_state"):
+                    self._input_iter.set_state(restored_input_iter)
+                else:
+                    self._input_iter = restored_input_iter
+            if self.snapshot_mgr.latest is not None:
+                self._step = self.snapshot_mgr.latest.step
+                self._restored_from_snapshot = True
+                loaded_from_snapshot = True
+            logging.info("Restored from snapshot at step %s", self._step)
+        except RuntimeError as e:
+            logging.info("No snapshot to restore: %s", e)
 
-            # Note the default checkpointer and evaler do nothing at step 0 with min_step=1.
-            self.save_checkpoint(self._run_eval())
+        if not loaded_from_snapshot:
+            # Attempt to restore the latest checkpoint, which may contain a saved `_input_iter`.
+            self.restore_checkpoint(restore_step=None)
+
+            if self.step is None:
+                # If we didn't restore from checkpoint, attempt to build initial state according
+                # to `cfg.init_state_builder` and initialize the remaining parameters.
+                self.init(prng_key)
+                self._step = 0
+
+                # Note the default checkpointer and evaler do nothing at step 0 with min_step=1.
+                self.save_checkpoint(self._run_eval())
 
         model_analysis = self._log_trainer_state_stats()
 
@@ -1572,66 +1608,69 @@ def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Any) -> Any:
     import time
     import jax
     import logging
+    from pathwaysutils.elastic.elastic import wait_for_slices
 
     host_memory_snapshot = None
     
-    while True:
+    def _run_training(snapshot):
+        logging.info("JAX collective is ready. Instantiating trainer.")
+        trainer = None
         try:
-            logging.info("Waiting for JAX collective to be ready...")
-            
-            # Simple dummy operation to block until mesh recovers
-            # We don't do initialize() or shutdown() because Pathways handles it natively
-            while True:
-                try:
-                    # Dummy JAX op to test backend readiness
-                    _ = jax.numpy.add(jax.numpy.ones(1), jax.numpy.ones(1)).block_until_ready()
-                    break
-                except jax.errors.JaxRuntimeError as e:
-                    logging.warning("Mesh not ready yet: %s. Retrying in 30s...", e)
-                    time.sleep(30)
-                    jax.clear_caches()
-            
-            logging.info("JAX collective is ready. Instantiating trainer.")
             trainer: SpmdTrainer = cfg.instantiate(parent=None)
             
-            if host_memory_snapshot is not None:
+            if snapshot is not None:
                 logging.warning(
                     "[RECOVERY_PHASE] >>> INJECTING RECOVERED SNAPSHOT MANAGER INTO TRAINER INSTANCE <<<"
                 )
-                trainer.snapshot_mgr = host_memory_snapshot
-                # Re-attach the trainer_state_specs which might be needed for load_pytree
+                trainer.snapshot_mgr = snapshot
                 if hasattr(trainer, "trainer_state_specs"):
                     trainer.snapshot_mgr.trainer_state_specs = trainer.trainer_state_specs
 
             logging.info("Starting trainer run...")
             actual_prng_key = prng_key() if callable(prng_key) else prng_key
             _ = trainer.run(actual_prng_key)
-            logging.info("Trainer run completed successfully.")
-            break
-        except jax.errors.JaxRuntimeError as e:
-            logging.warning("[RECOVERY_PHASE] >>> Caught JaxRuntimeError: %s <<<", e)
-            
-            if "trainer" in locals() and hasattr(trainer, "snapshot_mgr"):
+            return True, None
+        except Exception as e:
+            if isinstance(e, RuntimeError) and not isinstance(e, jax.errors.JaxRuntimeError):
+                error_msg = str(e).lower()
+                if "ifrt" not in error_msg and "shutdown" not in error_msg:
+                    raise  # Re-raise if it's an unrelated RuntimeError
+            logging.warning("[RECOVERY_PHASE] >>> Caught Error: %s <<<", e)
+            new_snapshot = None
+            if hasattr(trainer, "snapshot_mgr"):
                 try:
                     trainer.snapshot_mgr.join()
                 except Exception as cancel_err:
                     logging.warning("[RECOVERY_PHASE] >>> Snapshotter join failed: %s <<<", cancel_err)
                 
                 if trainer.snapshot_mgr.latest is not None:
-                    host_memory_snapshot = trainer.snapshot_mgr
+                    new_snapshot = trainer.snapshot_mgr
                     logging.warning(
                         "[RECOVERY_PHASE] >>> Saved snapshot_mgr with latest step %d for next iteration <<<",
                         trainer.snapshot_mgr.latest.step
                     )
                 else:
-                    host_memory_snapshot = None
                     logging.warning("[RECOVERY_PHASE] >>> Snapshot manager has no ready snapshots. <<<")
             
-            if host_memory_snapshot is None:
-                logging.warning("[RECOVERY_PHASE] >>> No host memory snapshot available for recovery. Retrying startup from scratch... <<<")
+            # Explicitly delete the trainer reference
+            del trainer
+            return False, new_snapshot
+            
+    while True:
+        logging.info("Waiting for JAX collective to be ready...")
+        wait_for_slices(slice_count=max(1, len(set(d.slice_index for d in jax.devices()))))
                 
-            logging.warning("[RECOVERY_PHASE] >>> Sleeping 30 seconds before retrying... <<<")
-            time.sleep(30)
-            jax.clear_caches()
+        success, extracted_snapshot = _run_training(host_memory_snapshot)
+        
+        if success:
+            logging.info("Trainer run completed successfully.")
+            break
+            
+        host_memory_snapshot = extracted_snapshot
+        if host_memory_snapshot is None:
+            logging.warning("[RECOVERY_PHASE] >>> No host memory snapshot available for recovery. Retrying startup from scratch... <<<")
+            
+        logging.warning("[RECOVERY_PHASE] >>> Sleeping 30 seconds before retrying... <<<")
+        time.sleep(30)
             
     return host_memory_snapshot
