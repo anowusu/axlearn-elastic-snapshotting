@@ -222,6 +222,8 @@ def handle_preemption_recovery(
             required_slices,
         )
         wait_for_slices(active_count, timeout_seconds=pause_timeout_seconds)
+    if elastic_manager:
+      elastic_manager.new_slice_event.set()
 
     return active_count
 
@@ -451,9 +453,9 @@ def sync_store_class_vars(obj: Any) -> tuple[dict, dict, dict]:
             getattr(obj, "_python_vars", {}),
             getattr(obj, "_immutable_data", {}),
         )
-    
+
     logging.info("[ELASTIC] Storing class variables for snapshot.")
-    
+
     jax_device_state = {}
     python_vars = {}
     immutable_data = {}

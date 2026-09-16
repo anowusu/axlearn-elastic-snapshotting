@@ -141,7 +141,7 @@ flags.DEFINE_string(
 )
 flags.DEFINE_integer(
     "num_elastic_slices",
-    1,
+    2,
     "Minimum number of active slices required to continue training without pausing.",
 )
 
@@ -249,7 +249,7 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                 },
                 f,
             )
-    
+
     if elastic_snapshotting_enabled:
         wait_for_all_devices(timeout_seconds=1800)
 
@@ -301,14 +301,14 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                 if elastic_manager and elastic_manager.new_slice_event.is_set():
                     logging.info("[ELASTIC] Clearing new_slice_event flag before initiating recovery.")
                     elastic_manager.new_slice_event.clear()
-                
+
                 with (recovery_timer.time_subtask("3_snapshot_restore_and_hardware_barrier") if recovery_timer else contextlib.nullcontext()):
                     trainer, prng_key = sync_restore_class_vars(clean_trainer, jax_device_state, python_vars, immutable_data)
-                
+
                 if "_elastic_reinit_start_time" in python_vars:
                     trainer._elastic_reinit_start_time = python_vars["_elastic_reinit_start_time"]
                     del python_vars["_elastic_reinit_start_time"]
-                
+
                 logging.info("[ELASTIC] [RECOVERY PHASE 1 COMPLETE] Successfully restored trainer state from class variables.")
                 if recovery_timer:
                     recovery_timer.log_summary()
@@ -331,7 +331,7 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
             from axlearn.common.utils import ScaleUpSignal
             if isinstance(output, ScaleUpSignal):
                 logging.info("[ELASTIC] Scale-up signal received! Initiating transition to expanded mesh...")
-                
+
                 t_stabilize_start = time.perf_counter()
 
                 python_vars["_recovery_type"] = "scale_up"
@@ -354,22 +354,22 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
 
                 logging.info("[ELASTIC] Waiting for %d slices to be active for scale-up...", target_slices)
                 wait_for_slices(target_slices)
-                
+
 
                 logging.info(
                     "[ELASTIC] [TIMING] TPU Slice stabilization took %.3f seconds",
                     time.perf_counter() - t_stabilize_start
                 )
-                
+
                 t_reinit_start = time.perf_counter()
 
                 python_vars["_elastic_reinit_start_time"] = t_reinit_start
-                
+
                 continue
 
             measurement.record_event(measurement.Event.END_JOB)
             break
-            
+
         except Exception as e:
             logging.exception("[ELASTIC] [EXC_DUMP] Intercepted exception in run_trainer loop: %s (%s)", e, type(e))
             if "jax_device_state" not in locals():
@@ -382,7 +382,7 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                 logging.warning(
                     "[ELASTIC] Caught retryable error: %s. Initiating in-memory state preservation and TPU cleanup...", e
                 )
-                
+
                 t_stabilize_start = time.perf_counter()
 
                 python_vars["_recovery_type"] = "scale_down"
@@ -405,18 +405,19 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                     backoff_delay, consecutive_failures
                 )
                 time.sleep(backoff_delay)
-                
+
+                logging.info("[ELASTIC] Number of Elastic Slices %d ", FLAGS.num_elastic_slices)
                 handle_preemption_recovery(elastic_manager, required_slices=FLAGS.num_elastic_slices)
 
                 logging.info(
                     "[ELASTIC] [TIMING] TPU Slice stabilization took %.3f seconds",
                     time.perf_counter() - t_stabilize_start
                 )
-                
+
                 t_reinit_start = time.perf_counter()
 
                 python_vars["_elastic_reinit_start_time"] = t_reinit_start
-                
+
                 continue
             else:
                 logging.error("[ELASTIC] Caught non-retryable error: %s", e)

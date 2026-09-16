@@ -350,7 +350,7 @@ def get_trainer_kwargs(
             train_batch_size=len(jax.devices()),
             # train_batch_size=len(live_devices()),
             max_step=250_000,  # Most of the evals were done at 100k steps in the paper.
-            save_every_n_steps=20,
+            save_every_n_steps=10,
             mesh_shape=mesh_shape_from_axes(fsdp=-1, expert=16),
             mesh_rules=(
                 (

@@ -89,7 +89,7 @@ from axlearn.common.elastic_utils import (
     sync_store_class_vars,
 )
 
-    
+
 
 class TrainerState(NamedTuple):
     prng_key: Union[Tensor, TensorSpec, jax.sharding.NamedSharding]
@@ -325,7 +325,7 @@ class SpmdTrainer(Module):
                 len(local_devices),
                 [device.platform for device in local_devices],
             )
-        
+
         live_devs = utils.live_devices() if devices is None else devices
         device_platform = live_devs[0].platform
         device_attr = "process_index" if device_platform != "tpu" else "slice_index"
@@ -339,7 +339,7 @@ class SpmdTrainer(Module):
             original_granules = cfg.mesh_shape[0] if len(cfg.mesh_shape) > 0 else 1
         else:
             original_granules = 1
-            
+
         original_granules = max(1, original_granules)
 
         if isinstance(cfg.mesh_shape, Sequence) and not isinstance(cfg.mesh_shape, str):
@@ -371,7 +371,7 @@ class SpmdTrainer(Module):
         elif isinstance(cfg.mesh_shape, HybridMeshShape):
             dcn_shape = list(cfg.mesh_shape.dcn_mesh_shape)
             ici_shape = list(cfg.mesh_shape.ici_mesh_shape)
-            
+
             dcn_prod = math.prod(dcn_shape)
             if dcn_prod != num_granules:
                 ratio = dcn_prod // num_granules
@@ -383,7 +383,7 @@ class SpmdTrainer(Module):
                 else:
                     dcn_shape = [1] * len(dcn_shape)
                     dcn_shape[0] = num_granules
-            
+
             current_ici_prod = math.prod(ici_shape)
             if current_ici_prod != num_devices_per_granule:
                 ratio = current_ici_prod // num_devices_per_granule
@@ -409,14 +409,14 @@ class SpmdTrainer(Module):
                 original_granules,
                 num_granules,
             )
-            
+
             # 3. Simple gradient accumulation
             if hasattr(cfg.learner, "gradient_accumulation_steps") and getattr(cfg.learner, "gradient_accumulation_steps", None) is not None:
                 old_gas = cfg.learner.gradient_accumulation_steps
                 scaled_gas = (old_gas * original_granules + num_granules - 1) // num_granules
                 cfg.learner.gradient_accumulation_steps = max(1, scaled_gas)
                 logging.info("[ELASTIC] Scaled simple gradient_accumulation_steps from %s to %s", old_gas, cfg.learner.gradient_accumulation_steps)
-            
+
             # 4. Production gradient accumulation
             if hasattr(cfg.learner, "forward_fn_transformation") and getattr(cfg.learner, "forward_fn_transformation", None) is not None:
                 fft = cfg.learner.forward_fn_transformation
@@ -547,14 +547,14 @@ class SpmdTrainer(Module):
             gbs = getattr(self.input.config, "global_batch_size", None)
             if gbs is None:
                 gbs = getattr(self.input.config, "batch_size", -1)
-            
+
             p_dev_bs = gbs / mesh_size if (gbs is not None and gbs > 0 and mesh_size > 0) else -1
-            
+
             grad_accum_steps = getattr(cfg.learner, "gradient_accumulation_steps", 1)
             if grad_accum_steps is None:
                 fft = getattr(cfg.learner, "forward_fn_transformation", None)
                 grad_accum_steps = getattr(fft, "steps", 1) if fft is not None else 1
-            
+
             logging.info(
                 "[ELASTIC] [SCALE] devices=%d global_batch_size=%d per_device_batch_size=%d grad_accum_steps=%d",
                 mesh_size, gbs or -1, p_dev_bs, grad_accum_steps or 1
@@ -562,7 +562,7 @@ class SpmdTrainer(Module):
         except Exception as scale_err:
             logging.warning("[ELASTIC] Failed to compute and log scale details: %s", scale_err)
 
-        
+
 
     @property
     def step(self):
@@ -807,11 +807,11 @@ class SpmdTrainer(Module):
                 logging.info("[ELASTIC] Snapshot manager instantiated.")
             else:
                 logging.info("[ELASTIC] Snapshot manager carried over from previous run.")
-            
+
 
             with self.checkpointer:
                 logging.info("[ELASTIC] Starting loop...")
-                
+
                 if hasattr(self, "_elastic_reinit_start_time"):
                     self._maybe_record_event(
                         measurement.Event.END_CUSTOM_BADPUT_EVENT,
@@ -844,18 +844,18 @@ class SpmdTrainer(Module):
                     input_iterator = self.input.batches(self._input_iter)
                 while True:
                         self._maybe_record_event(measurement.Event.START_DATA_LOADING)
-                        
+
                         try:
-                                
+
                                 input_batch = next(input_iterator)
                                 self._maybe_record_event(measurement.Event.END_DATA_LOADING)
                                 logging.log_first_n(
                                     logging.INFO, "host_input_batch=%s", 3, utils.shapes(input_batch)
                                 )
-        
+
                                 # Stop or start tracing if necessary.
                                 stop_trace_step = self._maybe_stop_or_start_tracing(stop_trace_step, output)
-        
+
                                 self._step = int(self._step) + 1
                                 self._step_log("[ELASTIC] Start step")
                                 logging.info("[ELASTIC] Start step %s", self.step)
@@ -887,9 +887,9 @@ class SpmdTrainer(Module):
                                     self._step_log("[ELASTIC] Scale-up event detected! Cleanly exiting run loop for scale-up expansion...")
                                     return ScaleUpSignal()
 
-                                if self.step % 5 == 0:
-                                    self._jax_device_state, self._python_vars, self._immutable_data = sync_store_class_vars(self)
-        
+                                # if self.step % 5 == 0:
+                                #     self._jax_device_state, self._python_vars, self._immutable_data = sync_store_class_vars(self)
+
                                 num_steps += 1
                                 if num_steps % 100 == 0:
                                     now = time.perf_counter()
@@ -1424,7 +1424,7 @@ class SpmdTrainer(Module):
             self._trainer_state, outputs = compiled_train_step_fn(self.trainer_state, input_batch)
 
         n = self._config.log_every_n_steps or 100
-        
+
         if self.step % n == 0 or 0 <= self.step <= 5:
             loss_val = outputs["loss"].item() if hasattr(outputs["loss"], "item") else outputs["loss"]
             self._step_log(
