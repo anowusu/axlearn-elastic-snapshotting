@@ -232,6 +232,67 @@ class Snapshotter:
     jax.block_until_ready(restored_state)
     return restored_state
 
+  def _healthy_shards_by_region(self, x: jax.Array) -> dict:
+    """Returns one live shard per global-array region, skipping preempted slices.
+
+    On a 2 -> 2 pause-and-resume recovery `x.addressable_shards` still contains
+    handles for the slice that was preempted. Touching one of those raises
+    JaxRuntimeError (UNAVAILABLE / DATA_LOSS), so shards must be health checked
+    before being rebound onto the new mesh.
+
+    Probes a whole replica at a time where possible (one block_until_ready per
+    replica rather than per shard) and falls back to per-shard probing if the
+    mesh cannot be split along the replica axis.
+    """
+    by_region = {}
+    shards = getattr(x, "addressable_shards", [])
+
+    mesh = getattr(x.sharding, "mesh", None)
+    mesh_axis_name = mesh.axis_names[self.replica_axis_index] if mesh is not None else None
+    source_replicas = mesh.shape.get(mesh_axis_name, 1) if mesh is not None else 1
+
+    if source_replicas <= 1:
+      # Only one replica exists, so every shard is on the surviving slice.
+      # Skip probing entirely to keep the common 1 -> 2 scale-up path fast.
+      for shard in shards:
+        by_region.setdefault(_shard_index_key(shard.index), shard.data)
+      return by_region
+
+    try:
+      for replica in split_by_mesh_axis.split_by_mesh_axis(x, mesh_axis_name):
+        try:
+          jax.block_until_ready(replica)
+        except jax.errors.JaxRuntimeError:
+          continue
+        for shard in replica.addressable_shards:
+          by_region.setdefault(_shard_index_key(shard.index), shard.data)
+        if by_region:
+          _logger.info(
+              "[ELASTIC] Sourced %d shard region(s) from a healthy replica along '%s'.",
+              len(by_region),
+              mesh_axis_name,
+          )
+          return by_region
+    except Exception as e:  # pylint: disable=broad-except
+      _logger.warning(
+          "[ELASTIC] Replica-level health probe failed (%s); probing shards individually.", e
+      )
+
+    skipped = 0
+    for shard in shards:
+      key = _shard_index_key(shard.index)
+      if key in by_region:
+        continue
+      try:
+        jax.block_until_ready(shard.data)
+      except jax.errors.JaxRuntimeError:
+        skipped += 1
+        continue
+      by_region[key] = shard.data
+    if skipped:
+      _logger.info("[ELASTIC] Skipped %d shard handle(s) on preempted slice(s).", skipped)
+    return by_region
+
   def _restore_scale_up(
       self,
       pinned_state: tree_types.PyTree,
@@ -270,11 +331,9 @@ class Snapshotter:
       # Key each source shard by the region of the global array it holds rather than
       # by its position in `addressable_shards`. Replica copies of the same region
       # collapse onto a single key, which is exactly what we want: any one of them
-      # can feed every target device that covers that region.
-      src_by_region = {}
-      if hasattr(x, "addressable_shards"):
-        for shard in x.addressable_shards:
-          src_by_region.setdefault(_shard_index_key(shard.index), shard.data)
+      # can feed every target device that covers that region. Shards belonging to a
+      # preempted slice are filtered out first.
+      src_by_region = self._healthy_shards_by_region(x)
 
       if not src_by_region:
         return x
