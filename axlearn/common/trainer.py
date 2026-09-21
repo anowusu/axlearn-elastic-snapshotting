@@ -913,6 +913,18 @@ class SpmdTrainer(Module):
                                 em = get_elastic_manager()
                                 if em and em.new_slice_event.is_set():
                                     self._step_log("[ELASTIC] Scale-up event detected! Cleanly exiting run loop for scale-up expansion...")
+                                    # Snapshot the current step before handing control back.
+                                    # Returning without saving resumes from the last
+                                    # step % 5 == 0 snapshot and silently discards up to 4
+                                    # steps, even though every slice is healthy and the
+                                    # current weights are live in HBM.
+                                    self._is_restored = False
+                                    self._jax_device_state, self._python_vars, self._immutable_data = sync_store_class_vars(self)
+                                    if getattr(self, "snapshot_mgr", None) is not None:
+                                        self.snapshot_mgr.join()
+                                    logging.info(
+                                        "[ELASTIC] Forced pre-scale-up snapshot at step %s.", self.step
+                                    )
                                     return ScaleUpSignal()
 
                                 if self.step % 5 == 0:
