@@ -287,7 +287,6 @@ JAX_STATE_KEYS = frozenset({
 EXCLUDED_KEYS = frozenset({
     "_jax_device_state", "_python_vars", "_immutable_data"
 })
-RETRYABLE_KEYWORDS = ("data_loss", "unavailable", "unplaced", "slice down", "died")
 
 
 def safe_delete_arrays(pytree: Any) -> int:
@@ -575,9 +574,6 @@ def _slice_monitor_context(elastic_manager: Any, original_slices: int):
     finally:
         if monitor_thread is not None:
             logging.info("[ELASTIC] Stopping slice monitor thread...")
-            stop_monitor_event.set()
-            monitor_thread.join(timeout=5)
-            logging.info("[ELASTIC] Slice monitor thread stopped.")
             stop_monitor_event.set()
             monitor_thread.join(timeout=5)
             logging.info("[ELASTIC] Slice monitor thread stopped.")
