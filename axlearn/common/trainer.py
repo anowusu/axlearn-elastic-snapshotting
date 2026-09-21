@@ -44,10 +44,13 @@ from axlearn.common.config import (
     maybe_instantiate,
     maybe_set_config,
     config_for_class,
+    config_for_function,
 )
 from axlearn.common.evaler import SpmdEvaler
+from axlearn.common.gradient_accumulation import with_minibatch_steps
 from axlearn.common.input_base import Input
 from axlearn.common.learner import Learner
+from axlearn.common.metrics import MetricAccumulator
 from axlearn.common.module import (
     InvocationContext,
     Module,
@@ -410,12 +413,15 @@ class SpmdTrainer(Module):
                 num_granules,
             )
             
+            scaled_accumulation = False
+
             # 3. Simple gradient accumulation
             if hasattr(cfg.learner, "gradient_accumulation_steps") and getattr(cfg.learner, "gradient_accumulation_steps", None) is not None:
                 old_gas = cfg.learner.gradient_accumulation_steps
                 scaled_gas = (old_gas * original_granules + num_granules - 1) // num_granules
                 cfg.learner.gradient_accumulation_steps = max(1, scaled_gas)
                 logging.info("[ELASTIC] Scaled simple gradient_accumulation_steps from %s to %s", old_gas, cfg.learner.gradient_accumulation_steps)
+                scaled_accumulation = True
             
             # 4. Production gradient accumulation
             if hasattr(cfg.learner, "forward_fn_transformation") and getattr(cfg.learner, "forward_fn_transformation", None) is not None:
@@ -425,6 +431,28 @@ class SpmdTrainer(Module):
                     scaled_steps = (old_steps * original_granules + num_granules - 1) // num_granules
                     fft.steps = max(1, scaled_steps)
                     logging.info("[ELASTIC] Scaled production forward_fn_transformation steps from %s to %s", old_steps, fft.steps)
+                    scaled_accumulation = True
+
+            # 5. Neither accumulation mechanism is configured on this recipe, so
+            # there was nothing to scale. Inject one; otherwise the surviving slice
+            # silently absorbs the full global batch and OOMs.
+            if not scaled_accumulation:
+                scaled_steps = max(1, (original_granules + num_granules - 1) // num_granules)
+                if scaled_steps > 1:
+                    cfg.learner.forward_fn_transformation = config_for_function(
+                        with_minibatch_steps
+                    ).set(
+                        steps=scaled_steps,
+                        metric_accumulator=MetricAccumulator.default_config(),
+                    )
+                    logging.info(
+                        "[ELASTIC] No gradient accumulation configured; injected "
+                        "forward_fn_transformation with_minibatch_steps(steps=%d) for the "
+                        "degraded %d -> %d slice mesh.",
+                        scaled_steps,
+                        original_granules,
+                        num_granules,
+                    )
 
         self._step_log("Mesh shape: %s", cfg.mesh_shape)
         devices = (
