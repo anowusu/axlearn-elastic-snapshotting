@@ -171,26 +171,112 @@ def wait_for_all_devices(timeout_seconds: int = 300):
     wait_for_slices(slice_count=expected_slices, timeout_seconds=timeout_seconds)
 
 
+# Default budget for the pause-and-resume window. The clock starts the moment the
+# preemption is detected rather than when the wait begins, so teardown and backoff
+# are charged against it and the worst-case stall stays bounded at roughly this
+# value regardless of how long the preceding cleanup took.
+DEFAULT_PAUSE_RESUME_TIMEOUT_SECONDS = 120
+
+
+def _wait_for_full_scale(desired_slices: int, budget_seconds: float) -> bool:
+    """Waits up to `budget_seconds` for the cluster to return to `desired_slices`.
+
+    Returns True when full scale is reached inside the window, meaning the caller can
+    resume on the original mesh and skip the scale-down/scale-up round trip entirely.
+    """
+    logging.info(
+        "[ELASTIC] [PAUSE-AND-RESUME] Holding state in host-pinned memory and waiting up "
+        "to %.1fs for the cluster to return to %d slice(s) before degrading...",
+        budget_seconds,
+        desired_slices,
+    )
+    t0 = time.perf_counter()
+    try:
+        wait_for_slices(desired_slices, timeout_seconds=max(1, int(budget_seconds)))
+    except Exception as wait_err:  # pylint: disable=broad-except
+        logging.info(
+            "[ELASTIC] [TIMING] Pause-and-resume wait took %.3f seconds (unsuccessful: %s)",
+            time.perf_counter() - t0,
+            wait_err,
+        )
+        return False
+    logging.info(
+        "[ELASTIC] [TIMING] Pause-and-resume wait took %.3f seconds", time.perf_counter() - t0
+    )
+    return True
+
+
 def handle_preemption_recovery(
     elastic_manager: Any,
     required_slices: int = 1,
-    pause_timeout_seconds: int = 300,
+    desired_slices: Optional[int] = None,
+    pause_timeout_seconds: int = DEFAULT_PAUSE_RESUME_TIMEOUT_SECONDS,
+    restart_timeout_seconds: int = 300,
+    detected_at: Optional[float] = None,
 ) -> int:
-    """Handles slice reconciliation after preemption: executes pause-and-resume or degraded continuation.
+    """Handles slice reconciliation after preemption: pause-and-resume or degraded continuation.
+
+    Three outcomes are possible, and each logs an explicit `[PAUSE-AND-RESUME] OUTCOME:` line:
+
+      * **resumed** - the missing slices came back inside the window, so training continues
+        on the original mesh with no scale-down and no later scale-up.
+      * **degraded** - the window expired with enough slices to form a smaller mesh, so
+        training continues at reduced scale (the pre-existing behaviour).
+      * **restart** - fewer than `required_slices` survived, so a `RuntimeError` is raised
+        and the job falls back to the persistent GCS checkpoint.
 
     Args:
         elastic_manager: The active Pathways Elastic Manager.
-        required_slices: Minimum slices required to run (defaults to 1).
-        pause_timeout_seconds: Timeout for pause-and-resume when live slices < required.
+        required_slices: Minimum slices required to run at all (defaults to 1).
+        desired_slices: Full-scale slice count to try to recover before degrading. When
+            None, the pause-and-resume window is skipped and behaviour is unchanged.
+        pause_timeout_seconds: Length of the pause-and-resume window.
+        restart_timeout_seconds: Timeout for the last-resort wait when live slices are
+            below `required_slices`.
+        detected_at: `time.perf_counter()` reading taken when the preemption was first
+            observed. Teardown and backoff performed since then are charged against the
+            pause-and-resume budget, which keeps the total stall bounded.
 
     Returns:
         The number of active slices ready for training.
 
     Raises:
-        RuntimeError: If pause-and-resume times out waiting for required slices.
+        RuntimeError: If fewer than `required_slices` slices return in time.
     """
     active_indices = live_slice_indices()
     active_count = len(active_indices)
+
+    # Pause-and-resume. The cluster is short of full scale but the survivors could still
+    # form a valid degraded mesh. Degrading is not free: it costs a scale-down now and a
+    # scale-up later, both of which re-shard the whole trainer state. If the missing
+    # slices are merely restarting, waiting is strictly cheaper, so give them a bounded
+    # window before committing to the smaller mesh.
+    if desired_slices is not None and required_slices <= active_count < desired_slices:
+        budget = float(pause_timeout_seconds)
+        # Fall back to "now" so the elapsed time reported below is always real, even
+        # when the caller did not record when the preemption surfaced.
+        window_start = detected_at if detected_at is not None else time.perf_counter()
+        remaining = budget - (time.perf_counter() - window_start)
+        if remaining <= 0:
+            logging.info(
+                "[ELASTIC] [PAUSE-AND-RESUME] %.1fs budget already consumed by teardown; "
+                "not waiting.",
+                budget,
+            )
+        elif _wait_for_full_scale(desired_slices, remaining):
+            logging.info(
+                "[ELASTIC] [PAUSE-AND-RESUME] OUTCOME: resumed at %d slice(s) without scale-down.",
+                desired_slices,
+            )
+            return desired_slices
+
+        active_count = len(live_slice_indices())
+        logging.info(
+            "[ELASTIC] [PAUSE-AND-RESUME] OUTCOME: degraded to %d slice(s) after %.1fs.",
+            active_count,
+            time.perf_counter() - window_start,
+        )
+        return active_count
 
     if active_count < required_slices:
         logging.info(
@@ -198,10 +284,10 @@ def handle_preemption_recovery(
             "Pausing in-memory and waiting up to %ds for slices to return...",
             active_count,
             required_slices,
-            pause_timeout_seconds,
+            restart_timeout_seconds,
         )
         try:
-            wait_for_slices(required_slices, timeout_seconds=pause_timeout_seconds)
+            wait_for_slices(required_slices, timeout_seconds=restart_timeout_seconds)
             logging.info("[ELASTIC] Slices recovered to %d! Resuming training from in-memory snapshot.", required_slices)
             active_count = required_slices
         except Exception as timeout_err:
@@ -209,7 +295,7 @@ def handle_preemption_recovery(
                 "[ELASTIC] Preempted slices did not reach required threshold (%d) within %ds timeout. "
                 "Failing over to persistent checkpoint restart.",
                 required_slices,
-                pause_timeout_seconds,
+                restart_timeout_seconds,
             )
             raise RuntimeError(
                 f"Elastic pause-and-resume timed out waiting for {required_slices} slices. "
@@ -221,7 +307,7 @@ def handle_preemption_recovery(
             active_count,
             required_slices,
         )
-        wait_for_slices(active_count, timeout_seconds=pause_timeout_seconds)
+        wait_for_slices(active_count, timeout_seconds=restart_timeout_seconds)
 
     return active_count
 

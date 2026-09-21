@@ -22,6 +22,7 @@ from axlearn.common.trainer import SpmdTrainer, select_mesh_config, sync_restore
 from axlearn.common import elastic_utils
 from axlearn.common import utils
 from axlearn.common.elastic_utils import (
+    DEFAULT_PAUSE_RESUME_TIMEOUT_SECONDS,
     ElasticRecoveryTimer,
     _slice_monitor_context,
     _teardown_and_preserve_state,
@@ -144,6 +145,15 @@ flags.DEFINE_integer(
     "num_elastic_slices",
     1,
     "Minimum number of active slices required to continue training without pausing.",
+)
+
+flags.DEFINE_integer(
+    "elastic_pause_timeout_seconds",
+    DEFAULT_PAUSE_RESUME_TIMEOUT_SECONDS,
+    "How long to hold the in-memory snapshot waiting for preempted slices to return "
+    "before degrading to a smaller mesh. The clock starts when the preemption is "
+    "detected, so teardown and backoff count against it. Set to 0 to degrade "
+    "immediately, which restores the pre-pause-and-resume behaviour.",
 )
 
 FLAGS = flags.FLAGS
@@ -372,6 +382,10 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
             break
             
         except Exception as e:
+            # Anchor for the pause-and-resume budget. Taken before any teardown so the
+            # cleanup and backoff below are charged against the window rather than
+            # extending it, which bounds the total stall at the configured timeout.
+            t_preempt_detected = time.perf_counter()
             logging.exception("[ELASTIC] [EXC_DUMP] Intercepted exception in run_trainer loop: %s (%s)", e, type(e))
             if "jax_device_state" not in locals():
                 jax_device_state = {}
@@ -407,7 +421,13 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                 )
                 time.sleep(backoff_delay)
                 
-                handle_preemption_recovery(elastic_manager, required_slices=FLAGS.num_elastic_slices)
+                handle_preemption_recovery(
+                    elastic_manager,
+                    required_slices=FLAGS.num_elastic_slices,
+                    desired_slices=original_slices,
+                    pause_timeout_seconds=FLAGS.elastic_pause_timeout_seconds,
+                    detected_at=t_preempt_detected,
+                )
 
                 # The manager caches slice_to_devices at construction time, so after a
                 # preemption it still describes the pre-failure topology. The ScaleUpSignal
