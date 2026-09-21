@@ -1258,8 +1258,15 @@ class SpmdTrainer(Module):
             for path, spec in utils.flatten_items(self._trainer_state_specs):
                 self.vlog(1, "restore spec: %s=%s", path, spec)
             ckpt_state_spec = self._trainer_state_specs._asdict()
+            # Mirror whichever iterator save_checkpoint would have written.
+            if getattr(self, "_unbatched_input_iter", None) is not None and hasattr(
+                self.input, "unbatched_dataset"
+            ):
+                input_iter_spec = iter(self.input.unbatched_dataset())
+            else:
+                input_iter_spec = iter(self.input.dataset())
             ckpt_state_spec_with_input_iter = dict(
-                **ckpt_state_spec, input_iter=iter(self.input.dataset())
+                **ckpt_state_spec, input_iter=input_iter_spec
             )
             restore_input_iter = cfg.save_input_iterator
             try:
@@ -1318,7 +1325,14 @@ class SpmdTrainer(Module):
                     **{k: v for k, v in ckpt_state.items() if k in TrainerState._fields}
                 )
                 if cfg.save_input_iterator and "input_iter" in ckpt_state:
-                    self._input_iter = ckpt_state["input_iter"]
+                    restored_iter = ckpt_state["input_iter"]
+                    if getattr(self, "_unbatched_input_iter", None) is not None:
+                        self._unbatched_input_iter = restored_iter
+                        # Keep the process-wide iterator in sync; a later trainer
+                        # re-instantiation would otherwise pick the stale one back up.
+                        SpmdTrainer._persistent_unbatched_input_iter = restored_iter
+                    else:
+                        self._input_iter = restored_iter
             return step
 
     def save_checkpoint(self, evaler_summaries: Optional[dict[str, Any]]) -> Optional[int]:
@@ -1327,7 +1341,14 @@ class SpmdTrainer(Module):
         with self.mesh():
             ckpt_state = self._trainer_state._asdict()
             if cfg.save_input_iterator:
-                ckpt_state["input_iter"] = self._input_iter
+                # When the input exposes an unbatched dataset, `_input_iter` stays None
+                # and `_unbatched_input_iter` holds the live iterator. Writing
+                # `_input_iter` unconditionally persists None into the checkpoint.
+                ckpt_state["input_iter"] = (
+                    self._unbatched_input_iter
+                    if getattr(self, "_unbatched_input_iter", None) is not None
+                    else self._input_iter
+                )
             try:
                 t_sync_save = time.perf_counter()
                 self.checkpointer.save(
