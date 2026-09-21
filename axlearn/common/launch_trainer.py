@@ -29,6 +29,7 @@ from axlearn.common.elastic_utils import (
     handle_preemption_recovery,
     is_retryable_error,
     live_devices,
+    live_slice_indices,
     set_elastic_manager,
     spmd_trainer_scope,
     total_cluster_slices,
@@ -407,6 +408,23 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                 time.sleep(backoff_delay)
                 
                 handle_preemption_recovery(elastic_manager, required_slices=FLAGS.num_elastic_slices)
+
+                # The manager caches slice_to_devices at construction time, so after a
+                # preemption it still describes the pre-failure topology. The ScaleUpSignal
+                # path above handles this by rebuilding the manager on the next iteration;
+                # do the same here rather than carrying stale state into recovery, where it
+                # can surface as a spurious scale-up on the first step back.
+                if elastic_manager and elastic_manager.new_slice_event.is_set():
+                    logging.info("[ELASTIC] Clearing stale new_slice_event after preemption recovery.")
+                    elastic_manager.new_slice_event.clear()
+                elastic_manager_initialized = False
+                try:
+                    logging.info(
+                        "[ELASTIC] Elastic manager will be rebuilt; %d slice(s) currently live.",
+                        len(live_slice_indices()),
+                    )
+                except Exception as live_err:  # pylint: disable=broad-except
+                    logging.warning("[ELASTIC] Could not enumerate live slices: %s", live_err)
 
                 logging.info(
                     "[ELASTIC] [TIMING] TPU Slice stabilization took %.3f seconds",
