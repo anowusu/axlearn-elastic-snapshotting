@@ -22,6 +22,22 @@ from axlearn.common.utils import Nested, TensorSpec, get_current_abstract_or_phy
 _logger = logging
 
 
+def _shard_index_key(index: Any) -> tuple:
+  """Normalizes a sharding index into a hashable key identifying a global-array region.
+
+  Both `jax.Array.addressable_shards[i].index` and the values of
+  `Sharding.addressable_devices_indices_map()` are tuples of `slice` objects
+  describing which region of the global array a shard holds. `slice` only became
+  hashable in Python 3.12, so normalize to plain tuples of ints so the keys can be
+  used in a dict on any supported interpreter.
+  """
+  if not isinstance(index, tuple):
+    index = (index,)
+  return tuple(
+      (i.start, i.stop, i.step) if isinstance(i, slice) else i for i in index
+  )
+
+
 class Snapshotter:
   """Manages asynchronous backups of JAX array states to pinned host memory."""
 
@@ -175,8 +191,8 @@ class Snapshotter:
     target_replicas = target_mesh.shape.get(mesh_axis_name, 1)
     _logger.info(
         "[ELASTIC][SCALE] _is_scale_down decision: target_total (%d) < source_total (%d)",
-        source_replicas,
         target_replicas,
+        source_replicas,
     )
     return target_replicas < source_replicas
 
@@ -251,28 +267,42 @@ class Snapshotter:
       if target_sharding is not None and hasattr(target_sharding, "with_memory_kind"):
         target_sharding = target_sharding.with_memory_kind("device")
 
-      healthy_shards = []
+      # Key each source shard by the region of the global array it holds rather than
+      # by its position in `addressable_shards`. Replica copies of the same region
+      # collapse onto a single key, which is exactly what we want: any one of them
+      # can feed every target device that covers that region.
+      src_by_region = {}
       if hasattr(x, "addressable_shards"):
         for shard in x.addressable_shards:
-          healthy_shards.append(shard.data)
+          src_by_region.setdefault(_shard_index_key(shard.index), shard.data)
 
-      if not healthy_shards:
+      if not src_by_region:
         return x
 
-      num_healthy = len(healthy_shards)
+      target_regions = target_sharding.addressable_devices_indices_map(tuple(spec.shape))
+      missing = {_shard_index_key(r) for r in target_regions.values()} - set(src_by_region)
+      if missing:
+        # Guessing a mapping here is what silently scrambled weights previously.
+        # Failing loudly falls back to the GCS checkpoint, which is slow but correct.
+        raise RuntimeError(
+            "[ELASTIC] Cannot rebind snapshot shards: %d target region(s) have no "
+            "counterpart in the snapshot (source regions: %d, target regions: %d). "
+            "Example missing region: %s"
+            % (len(missing), len(src_by_region), len(target_regions), sorted(missing)[0])
+        )
+
       device_shards = []
       dev_shard_cache = {}
-      for i, dev in enumerate(target_sharding.addressable_devices):
-        shard_idx = i % num_healthy
+      for dev in target_sharding.addressable_devices:
+        region_key = _shard_index_key(target_regions[dev])
         single_sharding = jax.sharding.SingleDeviceSharding(dev).with_memory_kind("device")
 
-        if shard_idx not in dev_shard_cache:
-          src_shard_data = healthy_shards[shard_idx]
-          dev_shard = jax.device_put(src_shard_data, single_sharding)
-          dev_shard_cache[shard_idx] = dev_shard
+        if region_key not in dev_shard_cache:
+          dev_shard = jax.device_put(src_by_region[region_key], single_sharding)
+          dev_shard_cache[region_key] = dev_shard
         else:
           # Prevents Pathways from cloning the host-pinned buffer across slices over DCN
-          dev_shard = jax.device_put(dev_shard_cache[shard_idx], single_sharding)
+          dev_shard = jax.device_put(dev_shard_cache[region_key], single_sharding)
         device_shards.append(dev_shard)
 
       return jax.make_array_from_single_device_arrays(spec.shape, target_sharding, device_shards)
