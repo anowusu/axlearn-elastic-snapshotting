@@ -76,7 +76,7 @@ ARG EXTRAS=
 # Ensure we install the TPU version, even if building locally.
 # Jax will fallback to CPU when run on a machine without TPU.
 COPY pyproject.toml README.md /root/
-RUN uv pip install -qq --prerelease=allow .[core,tpu] && uv cache clean
+RUN uv pip install -qq --prerelease=allow .[core,tpu,orbax] && uv cache clean
 RUN if [ -n "$EXTRAS" ]; then uv pip install -qq .[$EXTRAS] && uv cache clean; fi
 COPY . .
 
@@ -95,7 +95,7 @@ RUN \
     # 1. Install user-provided dependencies with modified constraints
     grep -v "^numpy" /opt/venv/server_constraints.txt | grep -v "^scipy" > /tmp/modified_constraints.txt && \
     echo "--> Installing user-provided dependencies..." && \
-    uv pip install ".[core,gcp]" -c /tmp/modified_constraints.txt && \
+    uv pip install ".[core,gcp,orbax]" -c /tmp/modified_constraints.txt && \
     \
     # 2. Override numpy and scipy with specific versions
     uv pip install numpy==2.1.1 scipy==1.15.3 && \

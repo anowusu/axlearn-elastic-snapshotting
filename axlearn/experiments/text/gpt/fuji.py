@@ -405,6 +405,7 @@ def get_trainer_kwargs(
             max_sequence_length=max_sequence_length,
             train_batch_size=len(jax.devices()),#train_batch_size,
             max_step=max_step,
+            save_every_n_steps=20,
             mesh_shape=mesh_shape_from_axes(data=-1, fsdp=8),
             mesh_rules=(
                 # Step time:
@@ -791,6 +792,7 @@ def get_trainer_kwargs(
             max_sequence_length=max_sequence_length,
             train_batch_size=len(jax.devices()),#train_batch_size,
             max_step=max_step,
+            save_every_n_steps=20,
             mesh_shape=mesh_shape_from_axes(fsdp=-1),
             mesh_rules=(
                 # TPU V5e maximum per device batch is 1.
@@ -802,7 +804,10 @@ def get_trainer_kwargs(
                     ChainConfigModifier.default_config().set(
                         config_modifiers=[
                             MeshShapeModifier.default_config().set(
-                                mesh_shape=mesh_shape_from_axes(data=-1, fsdp=256)
+                                mesh_shape=HybridMeshShape(
+                                    ici_mesh_shape=mesh_shape_from_axes(fsdp=256),
+                                    dcn_mesh_shape=mesh_shape_from_axes(pipeline=1, data=4),
+                                )
                             ),
                             RematSpecModifier.default_config().set(
                                 remat_policies={
@@ -812,6 +817,28 @@ def get_trainer_kwargs(
                                     ),
                                 }
                             ),
+                        ],
+                    ),
+                ),
+                (
+                    "tpu-v5litepod-32",
+                    ChainConfigModifier.default_config().set(
+                        config_modifiers=[
+                            MeshShapeModifier.default_config().set(
+                                mesh_shape=HybridMeshShape(
+                                    ici_mesh_shape=mesh_shape_from_axes(fsdp=32),
+                                    dcn_mesh_shape=mesh_shape_from_axes(pipeline=1, data=2),
+                                )
+                            ),
+                            RematSpecModifier.default_config().set(
+                                remat_policies={
+                                    "model.decoder.transformer.layer": RematSpec(
+                                        prevent_cse=True,
+                                        policy=jax_remat_policies.nothing_saveable,
+                                    ),
+                                }
+                            ),
+                            FlashBlockSizeModifier.default_config().set(tpu_block_size=256),
                         ],
                     ),
                 ),
@@ -959,7 +986,10 @@ def get_trainer_kwargs(
                     ChainConfigModifier.default_config().set(
                         config_modifiers=[
                             MeshShapeModifier.default_config().set(
-                                mesh_shape=mesh_shape_from_axes(data=-1, fsdp=256)
+                                mesh_shape=HybridMeshShape(
+                                    ici_mesh_shape=mesh_shape_from_axes(fsdp=256),
+                                    dcn_mesh_shape=mesh_shape_from_axes(pipeline=1, data=2),
+                                )
                             ),
                             RematSpecModifier.default_config().set(
                                 remat_policies={
@@ -1016,7 +1046,10 @@ def get_trainer_kwargs(
                     ChainConfigModifier.default_config().set(
                         config_modifiers=[
                             MeshShapeModifier.default_config().set(
-                                mesh_shape=mesh_shape_from_axes(data=-1, fsdp=64)
+                                mesh_shape=HybridMeshShape(
+                                    ici_mesh_shape=mesh_shape_from_axes(fsdp=64),
+                                    dcn_mesh_shape=mesh_shape_from_axes(pipeline=1, data=2),
+                                )
                             ),
                             RematSpecModifier.default_config().set(
                                 remat_policies={
@@ -1043,7 +1076,10 @@ def get_trainer_kwargs(
                     ChainConfigModifier.default_config().set(
                         config_modifiers=[
                             MeshShapeModifier.default_config().set(
-                                mesh_shape=mesh_shape_from_axes(data=-1, fsdp=16)
+                                mesh_shape=HybridMeshShape(
+                                    ici_mesh_shape=mesh_shape_from_axes(fsdp=16),
+                                    dcn_mesh_shape=mesh_shape_from_axes(pipeline=1, data=2),
+                                )
                             ),
                             RematSpecModifier.default_config().set(
                                 remat_policies={
