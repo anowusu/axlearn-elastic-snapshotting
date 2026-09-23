@@ -331,7 +331,12 @@ class SpmdTrainer(Module):
                 "input", maybe_set_config(cfg.input, is_training=True)
             )
             # Start from the beginning of the input dataset by default.
+            t_iter_start = time.perf_counter()
             self._input_iter = iter(self.input.dataset())
+            logging.info(
+                "[ELASTIC] [TIMING] Iterator cold instantiation took %.3f seconds",
+                time.perf_counter() - t_iter_start,
+            )
             cfg.summary_writer.dir = cfg.summary_writer.dir or os.path.join(
                 cfg.dir, "summaries", "train_train"
             )
@@ -379,6 +384,26 @@ class SpmdTrainer(Module):
                     model_param_partition_specs=model_param_partition_specs,
                 )
         self._maybe_record_event(measurement.Event.END_ACCELERATOR_INIT)
+
+        try:
+            mesh_size = self._mesh.size
+            gbs = getattr(self.input.config, "global_batch_size", None)
+            if gbs is None:
+                gbs = getattr(self.input.config, "batch_size", -1)
+            p_dev_bs = gbs / mesh_size if (gbs is not None and gbs > 0 and mesh_size > 0) else -1
+            grad_accum_steps = getattr(cfg.learner, "gradient_accumulation_steps", 1)
+            if grad_accum_steps is None:
+                fft = getattr(cfg.learner, "forward_fn_transformation", None)
+                grad_accum_steps = getattr(fft, "steps", 1) if fft is not None else 1
+            logging.info(
+                "[ELASTIC] [SCALE] devices=%d global_batch_size=%d per_device_batch_size=%d grad_accum_steps=%d",
+                mesh_size,
+                gbs or -1,
+                p_dev_bs,
+                grad_accum_steps or 1,
+            )
+        except Exception as scale_err:  # pylint: disable=broad-except
+            logging.warning("[ELASTIC] Failed to compute and log scale details: %s", scale_err)
 
     @property
     def step(self):
@@ -618,6 +643,23 @@ class SpmdTrainer(Module):
 
             with self.checkpointer:
                 logging.info("Starting loop...")
+                num_slices = max(
+                    1,
+                    len({getattr(d, "slice_index", 0) for d in jax.devices() if d is not None}),
+                )
+                self._maybe_record_event(
+                    measurement.Event.RECORD_SLICE_COUNTS,
+                    active_slices=num_slices,
+                    total_slices=num_slices,
+                    available_slices=num_slices,
+                )
+                if hasattr(self, "_elastic_reinit_start_time"):
+                    logging.info(
+                        "[ELASTIC] [TIMING] Time to resume took %.3f seconds",
+                        time.perf_counter() - self._elastic_reinit_start_time,
+                    )
+                    del self._elastic_reinit_start_time
+
                 start_time = time.perf_counter()
                 num_steps = 0
                 output = None
@@ -638,7 +680,9 @@ class SpmdTrainer(Module):
 
                         self._step = self._step + 1
                         self.vlog(3, "Start step %s", self.step)
+                        logging.info("[ELASTIC] Start step %s", self.step)
                         self._maybe_record_event(measurement.Event.START_STEP, self._step)
+                        step_start_time = time.perf_counter()
                         output = self._run_step(
                             utils.host_to_global_array(
                                 input_batch,
@@ -650,7 +694,14 @@ class SpmdTrainer(Module):
                                 else None
                             ),
                         )
+                        step_duration = time.perf_counter() - step_start_time
+                        logging.info(
+                            "[ELASTIC] [TIMING] step=%s step_time_sec=%.4f",
+                            self.step,
+                            step_duration,
+                        )
                         self.vlog(3, "Done step %s", self.step)
+                        logging.info("[ELASTIC] Done step %s", self.step)
                         num_steps += 1
                         if num_steps % 100 == 0:
                             now = time.perf_counter()
@@ -909,7 +960,12 @@ class SpmdTrainer(Module):
         cfg = self.config
 
         # Attempt to restore the latest checkpoint, which may contain a saved `_input_iter`.
+        t_restore_start = time.perf_counter()
         self.restore_checkpoint(restore_step=None)
+        logging.info(
+            "[ELASTIC] [TIMING] GCS checkpoint restore took %.3f seconds",
+            time.perf_counter() - t_restore_start,
+        )
 
         if self.step is None:
             # If we didn't restore from checkpoint, attempt to build initial state according

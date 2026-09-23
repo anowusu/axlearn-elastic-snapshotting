@@ -189,8 +189,70 @@ def get_trainer_config(
     return trainer_config
 
 
+def _get_cluster_slice_count() -> int:
+    """Returns the total number of TPU slices in the cluster topology."""
+    try:
+        devs = jax.devices()
+        return max(1, len({getattr(d, "slice_index", 0) for d in devs if d is not None}))
+    except Exception:  # pylint: disable=broad-except
+        return 1
+
+
+def _record_baseline_slice_counts(
+    active_slices: int, available_slices: int, total_slices: int
+) -> None:
+    """Records (active_slices, total_slices, available_slices) for Goodput slice efficiency."""
+    if total_slices > 0:
+        measurement.record_event(
+            measurement.Event.RECORD_SLICE_COUNTS,
+            active_slices=active_slices,
+            total_slices=total_slices,
+            available_slices=available_slices,
+        )
+
+
 def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
+    import contextlib
+    import signal
+    import sys
+    import time
+
+    num_slices = _get_cluster_slice_count()
+    original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+    def sigterm_handler(signum, frame):
+        logging.info(
+            "[ELASTIC] [SIGTERM] SIGTERM signal received at Unix timestamp: %f", time.time()
+        )
+        _record_baseline_slice_counts(
+            active_slices=0, available_slices=0, total_slices=num_slices
+        )
+        measurement.flush()
+        if callable(original_sigterm_handler):
+            original_sigterm_handler(signum, frame)
+        else:
+            sys.exit(143)
+
+    signal.signal(signal.SIGTERM, sigterm_handler)
+
+    t_reinit_start = time.perf_counter()
     measurement.record_event(measurement.Event.START_JOB)
+    # Record 0 stepping slices during startup/mesh init/GCS checkpoint restore.
+    _record_baseline_slice_counts(
+        active_slices=0, available_slices=num_slices, total_slices=num_slices
+    )
+
+    is_recovery = False
+    try:
+        ckpt_dir = os.path.join(trainer_config.dir, "checkpoints")
+        if fs.isdir(ckpt_dir) and fs.listdir(ckpt_dir):
+            is_recovery = True
+            logging.info(
+                "[ELASTIC] Detected existing checkpoints. Marking this run as a recovery run."
+            )
+    except Exception as e:  # pylint: disable=broad-except
+        logging.debug("Failed to check if checkpoints exist: %s", e)
+
     trainer_config_debug_string = trainer_config.debug_string()
     logging.info("Trainer config:\n%s", trainer_config_debug_string)
     if jax.process_index() == 0:
@@ -208,8 +270,28 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                 f,
             )
 
-    trainer: SpmdTrainer = trainer_config.instantiate(parent=None)
-    prng_key = jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
-    output = trainer.run(prng_key)
-    measurement.record_event(measurement.Event.END_JOB)
-    return output
+    _job_completed_gracefully = False
+    monitor_ctx = (
+        measurement.global_recorder.maybe_monitor_all()
+        if measurement.global_recorder is not None
+        else contextlib.nullcontext()
+    )
+    with monitor_ctx:
+        try:
+            trainer: SpmdTrainer = trainer_config.instantiate(parent=None)
+            if is_recovery:
+                trainer._elastic_reinit_start_time = t_reinit_start
+            prng_key = jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
+            output = trainer.run(prng_key)
+            _job_completed_gracefully = True
+            return output
+        except Exception:
+            _record_baseline_slice_counts(
+                active_slices=0, available_slices=0, total_slices=num_slices
+            )
+            measurement.flush()
+            raise
+        finally:
+            if _job_completed_gracefully:
+                measurement.record_event(measurement.Event.END_JOB)
+                measurement.flush()

@@ -123,9 +123,9 @@ OTEL_COLLECTOR_CONFIG_MOUNT_PATH = "/conf"
 
 
 def get_colocated_python_image(image_id: str) -> str:
-    path, _ = image_id.rsplit(":", maxsplit=1)
+    path, tag = image_id.rsplit(":", maxsplit=1)
     repo, _ = path.rsplit("/", maxsplit=1)
-    return f"{repo}/{_COLOCATED_PYTHON_SIDECAR_NAME}:{_COLOCATED_SIDECAR_IMAGE_TAG}"
+    return f"{repo}/{_COLOCATED_PYTHON_SIDECAR_NAME}:{tag or _COLOCATED_SIDECAR_IMAGE_TAG}"
 
 
 def parse_xla_flag_value(value: str) -> Union[int, bool, str]:
@@ -539,7 +539,11 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         )
         self._update_env_list(env_list, "XCLOUD_ENVIRONMENT", "GCP")
         self._update_env_list(env_list, "JAX_PLATFORMS", "proxy")
-        self._update_env_list(env_list, "ENABLE_PATHWAYS_PERSISTENCE", "1")
+        self._update_env_list(
+            env_list,
+            "ENABLE_PATHWAYS_PERSISTENCE",
+            "0" if self._colocated_python.is_colocated_python_enabled else "1",
+        )
         self._update_env_list(env_list, "TPU_SKIP_MDS_QUERY", "true")
         # Prevents missing logs when there is crash.
         self._update_env_list(env_list, "PYTHONUNBUFFERED", "1")
@@ -830,6 +834,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         # Use default value - OnFailure.
         pod_spec.pop("restartPolicy")
         # Only set dnsPolicy if it's not already set
+        pod_spec["hostNetwork"] = True
         pod_spec["dnsPolicy"] = "ClusterFirstWithHostNet"
         pod_spec["containers"] = [
             self._build_pathways_worker_container(pathways_worker_replicated_job_index)
