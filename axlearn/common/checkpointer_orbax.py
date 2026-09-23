@@ -385,7 +385,23 @@ class OrbaxCheckpointer(BaseCheckpointer):
         cfg: OrbaxCheckpointer.Config = self.config
         save_policy = cfg.save_policy.instantiate()
 
-        if cfg.enable_single_replica_ckpt_restoring:
+        if "proxy" in (jax.config.jax_platforms or ""):
+            from orbax.checkpoint import pathways  # pylint: disable=import-outside-toplevel
+
+            extra_kwargs = {}
+            if cfg.enable_single_replica_ckpt_restoring:
+                extra_kwargs["replica_axis_index"] = cfg.replica_axis_index
+                extra_kwargs["primary_replica_id"] = 0
+            pathways.register_type_handlers(
+                use_single_replica_array_handler=cfg.enable_single_replica_ckpt_restoring,
+                checkpointing_impl=pathways.CheckpointingImpl.from_options(
+                    use_colocated_python=True,
+                ),
+                use_replica_parallel=False,
+                enable_write_sharding_file=False,
+                **extra_kwargs,
+            )
+        elif cfg.enable_single_replica_ckpt_restoring:
             array_handler = ocp.type_handlers.SingleReplicaArrayHandler(
                 replica_axis_index=cfg.replica_axis_index,
                 primary_replica_id=0,
