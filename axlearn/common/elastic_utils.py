@@ -35,7 +35,16 @@ except (ImportError, ModuleNotFoundError):
     manager = None
 
 _elastic_manager: Optional[Any] = None
-RETRYABLE_KEYWORDS = ("data_loss", "unavailable", "unplaced", "slice down", "died", "resource_exhausted")
+RETRYABLE_KEYWORDS = (
+    "data_loss",
+    "unavailable",
+    "unplaced",
+    "slice down",
+    "died",
+    "resource_exhausted",
+    "_cp_wrapper_pop_result",
+    "singleton_result_store",
+)
 _max_slices: int = 0
 _in_elastic_wait: bool = False
 _in_elastic_reinit: bool = False
@@ -157,11 +166,18 @@ def is_error_due_to_slice_down(e: Exception) -> bool:
 
 
 def is_retryable_error(e: Exception) -> bool:
-    """Returns True if the exception e is considered a retryable elastic error."""
-    if is_error_due_to_slice_down(e):
-        return True
-    err_str = str(e).lower()
-    return any(keyword in err_str for keyword in RETRYABLE_KEYWORDS)
+    """Returns True if the exception e (or any chained cause/context) is a retryable elastic error."""
+    curr: Optional[BaseException] = e
+    seen: set[int] = set()
+    while curr is not None and id(curr) not in seen:
+        seen.add(id(curr))
+        if isinstance(curr, Exception) and is_error_due_to_slice_down(curr):
+            return True
+        err_str = str(curr).lower()
+        if any(keyword in err_str for keyword in RETRYABLE_KEYWORDS):
+            return True
+        curr = curr.__cause__ or curr.__context__
+    return False
 
 
 def live_devices():

@@ -625,7 +625,15 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
     def stop(self, *, has_exception: bool = False):
         """See `BaseCheckpointer.stop` for details."""
-        self._manager.close()
+        if has_exception:
+            try:
+                self._manager.close()
+            except Exception as e:  # pylint: disable=broad-except
+                logging.warning(
+                    "Ignoring error in OrbaxCheckpointer.stop during exception cleanup: %s", e
+                )
+        else:
+            self._manager.close()
 
 
 # Below are adapted from:

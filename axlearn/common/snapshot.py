@@ -468,6 +468,5 @@ class Snapshotter:
       _, step = self._latest_snapshot
     return training.CheckpointMetadata(
         step=step,
-        path=epath.Path(),
         metadata=None,
     )
