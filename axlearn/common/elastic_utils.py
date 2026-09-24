@@ -21,6 +21,7 @@ import time
 from typing import Any, Optional, Set, Tuple
 
 from absl import logging
+from axlearn.common import measurement
 import jax
 import numpy as np
 
@@ -35,6 +36,77 @@ except (ImportError, ModuleNotFoundError):
 
 _elastic_manager: Optional[Any] = None
 RETRYABLE_KEYWORDS = ("data_loss", "unavailable", "unplaced", "slice down", "died", "resource_exhausted")
+_max_slices: int = 0
+_in_elastic_wait: bool = False
+_in_elastic_reinit: bool = False
+_active_elastic_event_type: str = "elastic_wait"
+
+
+def get_slice_counts() -> tuple[int, int, int]:
+    """Returns (active_slices, available_slices, total_slices)."""
+    global _max_slices
+    try:
+        available_slices = len(live_slice_indices())
+    except Exception:  # pylint: disable=broad-except
+        available_slices = len({getattr(d, "slice_index", 0) for d in jax.devices() if d is not None})
+    total_slices = max(total_cluster_slices(), available_slices, _max_slices)
+    _max_slices = max(_max_slices, total_slices)
+    return available_slices, available_slices, total_slices
+
+
+def record_slice_state(
+    active_slices_override: Optional[int] = None,
+    available_slices_override: Optional[int] = None,
+) -> None:
+    """Records active, available, and total slice counts to the Goodput recorder."""
+    active_slices, available_slices, total_slices = get_slice_counts()
+    if active_slices_override is not None:
+        active_slices = active_slices_override
+    if available_slices_override is not None:
+        available_slices = available_slices_override
+    if total_slices > 0:
+        measurement.record_event(
+            measurement.Event.RECORD_SLICE_COUNTS,
+            active_slices=active_slices,
+            total_slices=total_slices,
+            available_slices=available_slices,
+        )
+
+
+def record_elastic_event_start(event_type: str) -> None:
+    """Records the start of an elastic wait event (scale-down or scale-up) and sets active slices to 0."""
+    global _active_elastic_event_type, _in_elastic_wait
+    _active_elastic_event_type = event_type
+    _in_elastic_wait = True
+    measurement.record_event(
+        measurement.Event.START_ELASTIC_WAIT,
+        event_type=event_type,
+    )
+    record_slice_state(active_slices_override=0)
+
+
+def record_elastic_wait_end_and_reinit_start() -> None:
+    """Ends the elastic wait event and starts the elastic reinitialization event."""
+    global _in_elastic_wait, _in_elastic_reinit
+    if _in_elastic_wait:
+        measurement.record_event(
+            measurement.Event.END_ELASTIC_WAIT,
+            event_type=_active_elastic_event_type,
+        )
+        _in_elastic_wait = False
+    if not _in_elastic_reinit:
+        measurement.record_event(measurement.Event.START_ELASTIC_REINIT)
+        _in_elastic_reinit = True
+    record_slice_state(active_slices_override=0)
+
+
+def record_elastic_reinit_end() -> None:
+    """Ends the elastic reinitialization event (if active) and updates active slice counts."""
+    global _in_elastic_reinit
+    if _in_elastic_reinit:
+        measurement.record_event(measurement.Event.END_ELASTIC_REINIT)
+        _in_elastic_reinit = False
+    record_slice_state()
 
 
 def set_elastic_manager(manager_inst: Any):
@@ -268,6 +340,7 @@ def handle_preemption_recovery(
                 "[ELASTIC] [PAUSE-AND-RESUME] OUTCOME: resumed at %d slice(s) without scale-down.",
                 desired_slices,
             )
+            record_elastic_wait_end_and_reinit_start()
             return desired_slices
 
         active_count = len(live_slice_indices())
@@ -276,6 +349,7 @@ def handle_preemption_recovery(
             active_count,
             time.perf_counter() - window_start,
         )
+        record_elastic_wait_end_and_reinit_start()
         return active_count
 
     if active_count < required_slices:
@@ -309,6 +383,7 @@ def handle_preemption_recovery(
         )
         wait_for_slices(active_count, timeout_seconds=restart_timeout_seconds)
 
+    record_elastic_wait_end_and_reinit_start()
     return active_count
 
 
@@ -510,7 +585,7 @@ def sync_restore_class_vars(
     fresh_trainer._watchdog_thread = None
     fresh_trainer._watchdog_stopping = None
     fresh_trainer._device_monitor = None
-    fresh_trainer._recorder = None
+    # fresh_trainer._recorder = None
 
     fresh_trainer._jax_device_state = jax_device_state
     fresh_trainer._python_vars = python_vars

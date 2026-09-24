@@ -29,6 +29,13 @@ from absl import flags, logging
 from ml_goodput_measurement import goodput
 from ml_goodput_measurement import monitoring as goodput_monitoring
 
+try:
+    from ml_goodput_measurement.src import goodput_elastic
+    from ml_goodput_measurement.src import monitoring_elastic
+except ImportError:
+    goodput_elastic = None
+    monitoring_elastic = None
+
 from axlearn.cloud.common.utils import parse_kv_flags, to_bool
 from axlearn.common import measurement_base
 from axlearn.common.config import REQUIRED, Required, config_class, maybe_set_config
@@ -53,6 +60,7 @@ class GoodputRecorder(measurement_base.Recorder):
                 docs/05-Goodput-Monitoring.md for more details.
             jax_backend: Jax backend type to infer Pathways environment.
             enable_monitoring: Whether to enable goodput monitoring/uploading.
+            step_deviation_interval_seconds: Interval in seconds for step deviation uploads.
         """
 
         upload_dir: Required[str] = REQUIRED
@@ -61,26 +69,26 @@ class GoodputRecorder(measurement_base.Recorder):
         jax_backend: Optional[str] = None
         # Enable or disable monitoring. Recording is always enabled.
         enable_monitoring: bool = True
+        step_deviation_interval_seconds: int = 10
 
     @classmethod
     def from_flags(cls, fv: flags.FlagValues) -> "GoodputRecorder":
-        """Converts flags to a recorder.
-
-        `fv.recorder_spec` will be interpreted as a list of `key=value` pairs; config names
-        corresponding to keys will be set to the corresponding values. A GoodputRecorder can
-        additionally take in following Tensorboard configs in the recorder_spec:
-        - upload_dir: The directory to write Tensorboard data to.
-        - upload_interval: The time interval in seconds at which to query and upload data
-            to Tensorboard.
-        - rolling_window_size: Comma-separated list of integers representing rolling window
-            sizes in seconds.
-        - jax_backend: The type of jax backend.
-        - enable_monitoring: Boolean to enable/disable goodput monitoring (default: true).
-        """
+        """Converts flags to a recorder."""
         cfg: measurement_base.Recorder.Config = cls.default_config()
-        parsed_flags = parse_kv_flags(fv.recorder_spec, delimiter="=")
+        expanded_specs = []
+        for spec in fv.recorder_spec:
+            for part in spec.split(","):
+                if "=" in part or not expanded_specs:
+                    expanded_specs.append(part)
+                else:
+                    expanded_specs[-1] = f"{expanded_specs[-1]},{part}"
+        parsed_flags = parse_kv_flags(expanded_specs, delimiter="=")
         if "upload_interval" in parsed_flags:
             parsed_flags["upload_interval"] = int(parsed_flags["upload_interval"])
+        if "step_deviation_interval_seconds" in parsed_flags:
+            parsed_flags["step_deviation_interval_seconds"] = int(
+                parsed_flags["step_deviation_interval_seconds"]
+            )
         if "rolling_window_size" in parsed_flags and isinstance(
             parsed_flags["rolling_window_size"], str
         ):
@@ -89,6 +97,22 @@ class GoodputRecorder(measurement_base.Recorder):
             ]
         if "enable_monitoring" in parsed_flags:
             parsed_flags["enable_monitoring"] = to_bool(parsed_flags["enable_monitoring"])
+        rec_name = parsed_flags.get("name", "")
+        if not rec_name or rec_name.endswith("_"):
+            trainer_dir = getattr(fv, "trainer_dir", None) if fv is not None else None
+            fallback_suffix = (
+                os.path.basename(trainer_dir.rstrip("/"))
+                if isinstance(trainer_dir, str) and trainer_dir.strip("/")
+                else os.environ.get("HOSTNAME", "default")
+            )
+            new_name = f"{rec_name or 'goodput_'}{fallback_suffix}"
+            logging.warning(
+                "Goodput recorder name %r appears incomplete (e.g. unset $RUN); "
+                "auto-resolving to %r to prevent cross-run log collisions.",
+                rec_name,
+                new_name,
+            )
+            parsed_flags["name"] = new_name
         return maybe_set_config(cfg, **parsed_flags).instantiate()
 
     def __init__(self, cfg):
@@ -96,27 +120,41 @@ class GoodputRecorder(measurement_base.Recorder):
         self._recorder: Optional[goodput.GoodputRecorder] = None
         self._monitor: Optional[goodput_monitoring.GoodputMonitor] = None
         self._rolling_window_monitor: Optional[goodput_monitoring.GoodputMonitor] = None
+        self._monitoring_active: bool = False
         self._job_name = cfg.name
         self._logger_name = f"goodput_logger_{cfg.name}"
 
-    @contextlib.contextmanager
-    def record_event(self, event: measurement_base.EventType, *args, **kwargs):
-        """Records a goodput event using a context manager."""
-        # Lazily instantiate the recorder if it hasn't been already.
+    def _get_or_create_recorder(self):
         if self._recorder is None:
             if jax.process_index() == 0:
                 logging.info("Lazily instantiating goodput recorder.")
-            self._recorder = goodput.GoodputRecorder(
+            recorder_cls = (
+                goodput_elastic.ElasticGoodputRecorder
+                if goodput_elastic is not None
+                else goodput.GoodputRecorder
+            )
+            self._recorder = recorder_cls(
                 job_name=self._job_name,
                 logger_name=self._logger_name,
                 logging_enabled=(jax.process_index() == 0),
             )
+        return self._recorder
+
+    def flush(self):
+        """Flushes buffered Cloud Logging entries if a recorder is instantiated."""
+        if self._recorder is not None and hasattr(self._recorder, "flush"):
+            self._recorder.flush()
+
+    @contextlib.contextmanager
+    def record_event(self, event: measurement_base.EventType, *args, **kwargs):
+        """Records a goodput event using a context manager."""
+        recorder = self._get_or_create_recorder()
 
         start_method_name = f"record_{event.value}_start_time"
         end_method_name = f"record_{event.value}_end_time"
 
-        record_event_start = getattr(self._recorder, start_method_name, None)
-        record_event_end = getattr(self._recorder, end_method_name, None)
+        record_event_start = getattr(recorder, start_method_name, None)
+        record_event_end = getattr(recorder, end_method_name, None)
 
         if record_event_start:
             try:
@@ -142,33 +180,38 @@ class GoodputRecorder(measurement_base.Recorder):
 
     @contextlib.contextmanager
     def _maybe_monitor_goodput(self, *args, **kwargs):
-        """Monitor cumulative goodput if enabled.
-
-        Instantiate ml-goodput-measurement's GoodputMonitor to asynchronously calculate
-        Goodput, Badput, Step & Disruption Information at the upload_interval to the
-        specified TensorBoard directory and Google Cloud Monitoring.
-        Note: This function requires initialization of distributed JAX before it is called.
-        If there are internal GCP errors from querying and uploading data, these will be
-        logged without affecting the workload. GoodputMonitor logs will provide further
-        information if data is not being uploaded correctly.
-
-        Default behavior is to push metrics to Google Cloud Monitoring.
-        This behavior can be overridden by configuring `goodput_monitoring.GCPOptions`
-        """
+        """Monitor cumulative goodput if enabled."""
         if not self.config.enable_monitoring or jax.process_index() != 0:
             yield
             return
         try:
             if self._monitor is None:
-                self._monitor = goodput_monitoring.GoodputMonitor(
-                    job_name=self._job_name,
-                    logger_name=self._logger_name,
-                    tensorboard_dir=self.config.upload_dir,
-                    upload_interval=self.config.upload_interval,
-                    monitoring_enabled=True,
-                    pathway_enabled=self.config.jax_backend == "proxy",
-                    include_badput_breakdown=True,
-                )
+                if monitoring_elastic is not None:
+                    self._monitor = monitoring_elastic.ElasticGoodputMonitor(
+                        job_name=self._job_name,
+                        logger_name=self._logger_name,
+                        tensorboard_dir=self.config.upload_dir,
+                        upload_interval=self.config.upload_interval,
+                        monitoring_enabled=True,
+                        include_badput_breakdown=True,
+                        include_step_deviation=True,
+                        include_slice_efficiency=True,
+                        step_deviation_interval_seconds=self.config.step_deviation_interval_seconds,
+                        gcp_options=monitoring_elastic.GCPOptions(
+                            enable_gcp_goodput_metrics=True,
+                            enable_gcp_step_deviation_metrics=True,
+                        ),
+                    )
+                else:
+                    self._monitor = goodput_monitoring.GoodputMonitor(
+                        job_name=self._job_name,
+                        logger_name=self._logger_name,
+                        tensorboard_dir=self.config.upload_dir,
+                        upload_interval=self.config.upload_interval,
+                        monitoring_enabled=True,
+                        pathway_enabled=self.config.jax_backend == "proxy",
+                        include_badput_breakdown=True,
+                    )
 
             self._monitor.start_goodput_uploader(*args, **kwargs)
             logging.info("Started Goodput upload to Tensorboard & GCM in the background!")
@@ -214,52 +257,64 @@ class GoodputRecorder(measurement_base.Recorder):
                     "Flushed final metrics and safe exited from Rolling Window Goodput monitoring."
                 )
 
+    @contextlib.contextmanager
     def maybe_monitor_all(self):
-        goodput_monitor_manager = self._maybe_monitor_goodput()
-        rolling_goodput_monitor_manager = self._maybe_monitor_rolling_window_goodput()
-
-        @contextlib.contextmanager
-        def monitor_goodput():
-            with goodput_monitor_manager, rolling_goodput_monitor_manager:
+        if self._monitoring_active:
+            yield
+            return
+        self._monitoring_active = True
+        try:
+            with self._maybe_monitor_goodput(), self._maybe_monitor_rolling_window_goodput():
                 yield
-
-        return monitor_goodput()
+        finally:
+            self._monitoring_active = False
 
     def record(self, event: measurement_base.Event, *args, **kwargs):
-        """Deprecated: `record()` is not used in GoodputRecorder.
-        Use the record_event context manager instead.
-        """
-        # Lazily instantiate the recorder. This avoids invoking jax before setup is complete.
-        if self._recorder is None:
-            cfg: GoodputRecorder.Config = self.config
-            self._recorder = goodput.GoodputRecorder(
-                job_name=cfg.name,
-                logger_name=f"goodput_logger_{cfg.name}",
-                logging_enabled=(jax.process_index() == 0),
-            )
+        """Records a goodput event."""
+        recorder = self._get_or_create_recorder()
 
         if event == measurement_base.Event.START_JOB:
-            self._recorder.record_job_start_time(*args, **kwargs)
+            recorder.record_job_start_time(*args, **kwargs)
         elif event == measurement_base.Event.END_JOB:
-            self._recorder.record_job_end_time(*args, **kwargs)
+            recorder.record_job_end_time(*args, **kwargs)
         elif event == measurement_base.Event.START_STEP:
-            self._recorder.record_step_start_time(*args, **kwargs)
+            recorder.record_step_start_time(*args, **kwargs)
         elif event == measurement_base.Event.START_ACCELERATOR_INIT:
-            self._recorder.record_tpu_init_start_time(*args, **kwargs)
+            recorder.record_tpu_init_start_time(*args, **kwargs)
         elif event == measurement_base.Event.END_ACCELERATOR_INIT:
-            self._recorder.record_tpu_init_end_time(*args, **kwargs)
+            recorder.record_tpu_init_end_time(*args, **kwargs)
         elif event == measurement_base.Event.START_TRAINING_PREPARATION:
-            self._recorder.record_training_preparation_start_time(*args, **kwargs)
+            recorder.record_training_preparation_start_time(*args, **kwargs)
         elif event == measurement_base.Event.END_TRAINING_PREPARATION:
-            self._recorder.record_training_preparation_end_time(*args, **kwargs)
+            recorder.record_training_preparation_end_time(*args, **kwargs)
         elif event == measurement_base.Event.START_DATA_LOADING:
-            self._recorder.record_data_loading_start_time(*args, **kwargs)
+            recorder.record_data_loading_start_time(*args, **kwargs)
         elif event == measurement_base.Event.END_DATA_LOADING:
-            self._recorder.record_data_loading_end_time(*args, **kwargs)
+            recorder.record_data_loading_end_time(*args, **kwargs)
         elif event == measurement_base.Event.START_CUSTOM_BADPUT_EVENT:
-            self._recorder.record_custom_badput_event_start_time(*args, **kwargs)
+            recorder.record_custom_badput_event_start_time(*args, **kwargs)
         elif event == measurement_base.Event.END_CUSTOM_BADPUT_EVENT:
-            self._recorder.record_custom_badput_event_end_time(*args, **kwargs)
+            recorder.record_custom_badput_event_end_time(*args, **kwargs)
+        elif event == measurement_base.Event.START_ELASTIC_WAIT and hasattr(
+            recorder, "record_elastic_wait_start_time"
+        ):
+            recorder.record_elastic_wait_start_time(*args, **kwargs)
+        elif event == measurement_base.Event.END_ELASTIC_WAIT and hasattr(
+            recorder, "record_elastic_wait_end_time"
+        ):
+            recorder.record_elastic_wait_end_time(*args, **kwargs)
+        elif event == measurement_base.Event.START_ELASTIC_REINIT and hasattr(
+            recorder, "record_elastic_reinit_start_time"
+        ):
+            recorder.record_elastic_reinit_start_time(*args, **kwargs)
+        elif event == measurement_base.Event.END_ELASTIC_REINIT and hasattr(
+            recorder, "record_elastic_reinit_end_time"
+        ):
+            recorder.record_elastic_reinit_end_time(*args, **kwargs)
+        elif event == measurement_base.Event.RECORD_SLICE_COUNTS and hasattr(
+            recorder, "record_elastic_slice_counts"
+        ):
+            recorder.record_elastic_slice_counts(*args, **kwargs)
         else:
             logging.log_first_n(
                 logging.WARNING,

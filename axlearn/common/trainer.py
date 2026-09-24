@@ -836,6 +836,8 @@ class SpmdTrainer(Module):
             else:
                 logging.info("[ELASTIC] Snapshot manager carried over from previous run.")
             
+            from axlearn.common import elastic_utils
+            elastic_utils.record_elastic_reinit_end()
 
             with self.checkpointer:
                 logging.info("[ELASTIC] Starting loop...")

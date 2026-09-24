@@ -60,7 +60,7 @@ def initialize(fv: flags.FlagValues):
         )
 
 
-def record_event(event: Event):
+def record_event(event: Event, *args, **kwargs):
     """A global utility to record an event via the `global_recorder`.
 
     Note:
@@ -71,7 +71,16 @@ def record_event(event: Event):
     if global_recorder is None:
         logging.log_first_n(logging.INFO, "No recorder configured, ignoring events.", 1)
     else:
-        global_recorder.record(event)
+        global_recorder.record(event, *args, **kwargs)
+
+
+def flush():
+    """Flushes buffered events in `global_recorder` if supported."""
+    if global_recorder is not None and hasattr(global_recorder, "flush"):
+        try:
+            global_recorder.flush()
+        except Exception as e:  # pylint: disable=broad-except
+            logging.warning("Failed to flush global recorder: %s", e)
 
 
 def start_monitoring():
