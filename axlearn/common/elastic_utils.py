@@ -45,7 +45,7 @@ RETRYABLE_KEYWORDS = (
     "_cp_wrapper_pop_result",
     "singleton_result_store",
 )
-DEFAULT_PAUSE_RESUME_TIMEOUT_SECONDS = 300
+DEFAULT_PAUSE_RESUME_TIMEOUT_SECONDS = 0
 _max_slices: int = 0
 _in_elastic_reinit: bool = False
 _active_elastic_event_type: str = "elastic_wait"
