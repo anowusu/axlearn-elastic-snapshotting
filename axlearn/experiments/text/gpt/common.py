@@ -776,7 +776,10 @@ def get_trainer_config_fn(
         # because checkpointer_orbax.py forcibly overrides the jax.Array handler internally.
         from orbax.checkpoint import pathways
         pathways.register_type_handlers(
-            checkpointing_impl=pathways.CheckpointingImpl.COLOCATED_PYTHON
+            checkpointing_impl=pathways.CheckpointingImpl.COLOCATED_PYTHON,
+            primary_host=None,
+            array_metadata_store=None,
+            enable_write_sharding_file=False,
         )
         
         cfg.checkpointer = OrbaxCheckpointer.default_config()

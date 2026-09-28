@@ -388,7 +388,11 @@ class OrbaxCheckpointer(BaseCheckpointer):
         if jax.config.jax_platforms and "proxy" in jax.config.jax_platforms:
             from orbax.checkpoint import pathways
 
-            handler_kwargs = {}
+            handler_kwargs = {
+                "primary_host": None,
+                "array_metadata_store": None,
+                "enable_write_sharding_file": False,
+            }
             if cfg.enable_single_replica_ckpt_restoring:
                 handler_kwargs["replica_axis_index"] = cfg.replica_axis_index
                 handler_kwargs["primary_replica_id"] = 0
@@ -626,12 +630,16 @@ class OrbaxCheckpointer(BaseCheckpointer):
     def stop(self, *, has_exception: bool = False):
         """See `BaseCheckpointer.stop` for details."""
         if has_exception:
-            try:
-                self._manager.close()
-            except Exception as e:  # pylint: disable=broad-except
-                logging.warning(
-                    "Ignoring error in OrbaxCheckpointer.stop during exception cleanup: %s", e
-                )
+            logging.warning(
+                "Skipping wait_until_finished in OrbaxCheckpointer.stop due to active exception."
+            )
+            for attr in ("_non_blocking_metadata_store", "_blocking_metadata_store", "_checkpoint_deleter"):
+                obj = getattr(self._manager, attr, None)
+                if obj is not None and hasattr(obj, "close"):
+                    try:
+                        obj.close()
+                    except Exception as e:  # pylint: disable=broad-except
+                        logging.warning("Ignoring error closing %s during exception cleanup: %s", attr, e)
         else:
             self._manager.close()
 

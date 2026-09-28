@@ -152,6 +152,13 @@ flags.DEFINE_integer(
     "Maximum time in seconds to pause in-memory waiting for preempted slices to return before "
     "falling back to degraded slice training (if >= num_elastic_slices) or persistent checkpoint.",
 )
+flags.DEFINE_enum(
+    "elastic_restore_mode",
+    "snapshot",
+    ["snapshot", "checkpoint"],
+    "Recovery state source after slice preemption or scale-up: 'snapshot' restores from "
+    "in-memory pinned-host snapshots; 'checkpoint' restores from persistent GCS checkpoints.",
+)
 flags.DEFINE_integer(
     "elastic_snapshot_every_n_steps",
     None,
@@ -222,6 +229,8 @@ def get_trainer_config(
         )
     if trainer_config.log_every_n_steps is None:
         trainer_config.log_every_n_steps = flag_values.trainer_log_every_n_steps
+    if flag_values.elastic_restore_mode is not None:
+        trainer_config.elastic_restore_mode = flag_values.elastic_restore_mode
     if flag_values.elastic_snapshot_every_n_steps is not None:
         trainer_config.elastic_snapshot_every_n_steps = int(
             flag_values.elastic_snapshot_every_n_steps
@@ -369,14 +378,16 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                             logging.info("[ELASTIC] Elastic snapshotting disabled or not supported (no slice_index).")
                         elastic_manager_initialized = True
 
+                    restore_mode = getattr(FLAGS, "elastic_restore_mode", "snapshot")
                     has_preserved_state = bool(
                         python_vars.get("_latest_snapshot") is not None
                         or immutable_data
                         or jax_device_state
                     )
+                    is_elastic_recovery = has_preserved_state or ("_recovery_type" in python_vars)
 
                     recovery_timer = None
-                    if has_preserved_state:
+                    if is_elastic_recovery:
                         rec_type = python_vars.pop("_recovery_type", "scale_down")
                         recovery_timer = ElasticRecoveryTimer(recovery_type=rec_type)
 
@@ -385,9 +396,9 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                     logging.info("[ELASTIC] Instantiated clean trainer.")
 
                     # Check whether recovery should be triggered.
-                    if has_preserved_state:
+                    if is_elastic_recovery and restore_mode == "snapshot" and has_preserved_state:
                         logging.info(
-                            "[ELASTIC] [RECOVERY PHASE 1] Preserved state detected after preemption/rescaling. "
+                            "[ELASTIC] [RECOVERY PHASE 1] Preserved state detected after preemption/rescaling (restore_mode=snapshot). "
                             "Initiating class variable and snapshot restoration onto clean trainer..."
                         )
                         if elastic_manager and elastic_manager.new_slice_event.is_set():
@@ -398,12 +409,29 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                             trainer, prng_key = sync_restore_class_vars(clean_trainer, jax_device_state, python_vars, immutable_data)
                         
                         if "_elastic_reinit_start_time" in python_vars:
-                            trainer._elastic_reinit_start_time = python_vars["_elastic_reinit_start_time"]
-                            del python_vars["_elastic_reinit_start_time"]
+                            trainer._elastic_reinit_start_time = python_vars.pop("_elastic_reinit_start_time")
                         
                         logging.info("[ELASTIC] [RECOVERY PHASE 1 COMPLETE] Successfully restored trainer state from class variables.")
                         if recovery_timer:
                             recovery_timer.log_summary()
+                    elif is_elastic_recovery:
+                        logging.info(
+                            "[ELASTIC] [RECOVERY PHASE 1] Elastic recovery triggered with restore_mode=%s (has_preserved_state=%s). "
+                            "Deferring state restoration to persistent GCS checkpoint in trainer.run()...",
+                            restore_mode,
+                            has_preserved_state,
+                        )
+                        if elastic_manager and elastic_manager.new_slice_event.is_set():
+                            logging.info("[ELASTIC] Clearing new_slice_event flag before initiating recovery.")
+                            elastic_manager.new_slice_event.clear()
+                        trainer = clean_trainer
+                        prng_key = jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
+                        if "_unbatched_input_iter" in python_vars:
+                            trainer._unbatched_input_iter = python_vars["_unbatched_input_iter"]
+                            SpmdTrainer._persistent_unbatched_input_iter = python_vars["_unbatched_input_iter"]
+                        if "_elastic_reinit_start_time" in python_vars:
+                            trainer._elastic_reinit_start_time = python_vars.pop("_elastic_reinit_start_time")
+                        trainer._recovery_timer = recovery_timer
                     else:
                         logging.info("[ELASTIC] Starting fresh trainer initialization (no elastic recovery triggered).")
                         trainer = clean_trainer

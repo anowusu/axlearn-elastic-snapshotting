@@ -623,6 +623,10 @@ def _teardown_and_preserve_state(
         jax_device_state.update(getattr(trainer, "_jax_device_state", {}))
         python_vars.update(getattr(trainer, "_python_vars", {}))
         immutable_data.update(getattr(trainer, "_immutable_data", {}))
+        if getattr(trainer, "_step", None) is not None:
+            python_vars["_step"] = int(trainer._step)
+        if getattr(trainer, "_unbatched_input_iter", None) is not None:
+            python_vars["_unbatched_input_iter"] = trainer._unbatched_input_iter
 
         snapshot_mgr = getattr(trainer, "snapshot_mgr", None)
         if snapshot_mgr is not None:

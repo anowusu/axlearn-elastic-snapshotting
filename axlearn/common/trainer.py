@@ -268,6 +268,9 @@ class SpmdTrainer(Module):
         # Frequency (in steps) for saving in-memory host snapshots for elastic recovery.
         elastic_snapshot_every_n_steps: int = 5
 
+        # Recovery state source after slice preemption or scale-up ('snapshot' or 'checkpoint').
+        elastic_restore_mode: str = "snapshot"
+
     _persistent_unbatched_input_iter: Optional[Any] = None
 
     def __init__(
@@ -830,15 +833,20 @@ class SpmdTrainer(Module):
                 return None
 
             self._is_initialized = True
+            restore_mode = getattr(cfg, "elastic_restore_mode", "snapshot")
             #### Stores the initial state of all variables ####
-            if not hasattr(self, "snapshot_mgr") or self.snapshot_mgr is None:
-                replica_axis_idx = cfg.mesh_axis_names.index("data") if "data" in cfg.mesh_axis_names else 0
-                snapshot_cfg = config_for_class(Snapshotter).set(replica_axis_index=replica_axis_idx, trainer_state_specs=self.trainer_state_specs)
-                self.snapshot_mgr = snapshot_cfg.instantiate()
-                logging.info("[ELASTIC] Snapshot manager instantiated.")
-                #elastic_utils.record_elastic_reinit_end()
+            if restore_mode == "snapshot":
+                if not hasattr(self, "snapshot_mgr") or self.snapshot_mgr is None:
+                    replica_axis_idx = cfg.mesh_axis_names.index("data") if "data" in cfg.mesh_axis_names else 0
+                    snapshot_cfg = config_for_class(Snapshotter).set(replica_axis_index=replica_axis_idx, trainer_state_specs=self.trainer_state_specs)
+                    self.snapshot_mgr = snapshot_cfg.instantiate()
+                    logging.info("[ELASTIC] Snapshot manager instantiated.")
+                    #elastic_utils.record_elastic_reinit_end()
+                else:
+                    logging.info("[ELASTIC] Snapshot manager carried over from previous run.")
             else:
-                logging.info("[ELASTIC] Snapshot manager carried over from previous run.")
+                self.snapshot_mgr = None
+                logging.info("[ELASTIC] In-memory snapshot manager disabled (elastic_restore_mode=%s).", restore_mode)
             
 
             with self.checkpointer:
@@ -918,12 +926,20 @@ class SpmdTrainer(Module):
                                 from axlearn.common.utils import get_elastic_manager, ScaleUpSignal
                                 em = get_elastic_manager()
                                 if em and em.new_slice_event.is_set():
-                                    self._step_log("[ELASTIC] Scale-up event detected! Capturing pre-scale-up snapshot and cleanly exiting run loop for scale-up expansion...")
-                                    self._jax_device_state, self._python_vars, self._immutable_data = sync_store_class_vars(self)
+                                    if restore_mode == "snapshot":
+                                        self._step_log("[ELASTIC] Scale-up event detected! Capturing pre-scale-up snapshot and cleanly exiting run loop for scale-up expansion...")
+                                        self._jax_device_state, self._python_vars, self._immutable_data = sync_store_class_vars(self)
+                                    else:
+                                        self._step_log(
+                                            "[ELASTIC] Scale-up event detected (elastic_restore_mode=%s)! "
+                                            "Flushing any in-flight GCS checkpoint before exiting run loop for scale-up expansion...",
+                                            restore_mode,
+                                        )
+                                        self.checkpointer.wait_until_finished()
                                     return ScaleUpSignal()
 
                                 snapshot_interval = getattr(cfg, "elastic_snapshot_every_n_steps", 5)
-                                if snapshot_interval and snapshot_interval > 0 and self.step % snapshot_interval == 0:
+                                if restore_mode == "snapshot" and snapshot_interval and snapshot_interval > 0 and self.step % snapshot_interval == 0:
                                     self._jax_device_state, self._python_vars, self._immutable_data = sync_store_class_vars(self)
         
                                 num_steps += 1
@@ -1191,7 +1207,13 @@ class SpmdTrainer(Module):
                 measurement.Event.START_CUSTOM_BADPUT_EVENT,
                 custom_badput_event_type="checkpoint_restore"
             )
-            self.restore_checkpoint(restore_step=None)
+            recovery_timer = getattr(self, "_recovery_timer", None)
+            with (
+                recovery_timer.time_subtask("3_gcs_checkpoint_restore")
+                if recovery_timer
+                else contextlib.nullcontext()
+            ):
+                self.restore_checkpoint(restore_step=None)
             self._maybe_record_event(
                 measurement.Event.END_CUSTOM_BADPUT_EVENT,
                 custom_badput_event_type="checkpoint_restore"
@@ -1200,6 +1222,9 @@ class SpmdTrainer(Module):
                 "[ELASTIC] [TIMING] GCS checkpoint restore took %.3f seconds",
                 time.perf_counter() - t_restore_start
             )
+            if recovery_timer is not None:
+                recovery_timer.log_summary()
+                self._recovery_timer = None
         else:
             logging.info("Skipping checkpoint restoration because state was already restored from snapshot.")
             self._is_restored = False

@@ -1,0 +1,318 @@
+# ==============================================================================
+# WORKLOAD B: Replica Resize (RR) + Host-Memory Snapshot (WITHOUT Pause & Resume)
+# Branch: elastic-rr-snapshot-cp-orbax-goodput (d064a0fc)
+# Behavior:
+#   - Saves host-memory snapshot every 10 steps (--elastic_snapshot_every_n_steps=10)
+#   - Saves Orbax + Colocated Python GCS checkpoint every 100 steps (--save_every_n_steps=100)
+#   - Pause & Resume is disabled (--elastic_pause_timeout_seconds=0): on slice preemption,
+#     immediately reshards the surviving slice's host-memory snapshot onto 1 slice (2 -> 1)
+#     via split_by_mesh_axis, continues training on 1 slice, and scales back up (1 -> 2)
+#     via concatenate_by_mesh_axis when the preempted slice returns.
+# ==============================================================================
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: tpu7x-2k-rr-fuji405b
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: default
+    xpk.google.com/workload: tpu7x-2k-rr-fuji405b
+spec:
+  coordinator:
+    jobIndex: 0
+    podIndex: 0
+    replicatedJob: pathways-head
+  failurePolicy:
+    maxRestarts: 15
+    restartStrategy: Recreate
+  network:
+    enableDNSHostnames: true
+    publishNotReadyAddresses: true
+  replicatedJobs:
+  - name: pathways-head
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 1
+        parallelism: 1
+        template:
+          metadata:
+            annotations:
+              alpha.jobset.sigs.k8s.io/exclusive-topology: kubernetes.io/hostname
+          spec:
+            dnsPolicy: ClusterFirstWithHostNet
+            hostNetwork: true
+            restartPolicy: Never
+            serviceAccountName: default
+            terminationGracePeriodSeconds: 60
+            containers:
+            - name: jax-tpu
+              image: us-docker.pkg.dev/cloud-tpu-multipod-dev/axlearn/tpu:pr18-elastic-rr-cp-orbax
+              imagePullPolicy: Always
+              securityContext:
+                privileged: true
+              command:
+              - python3
+              - -m
+              - axlearn.common.launch_trainer_main
+              args:
+              - --module=text.gpt.c4_trainer
+              - --config=fuji-405B-v2-flash
+              - --trainer_dir=gs://tpu-prod-env-multipod-axlearn/axlearn/jobs/tpu7x-2k-rr-fuji405b
+              - --data_dir=gs://axlearn-public/tensorflow_datasets
+              - --jax_backend=proxy
+              - --mesh_selector=tpu-v7x-2048
+              - --num_elastic_slices=1
+              - --elastic_restore_mode=snapshot
+              - --elastic_pause_timeout_seconds=0
+              - --elastic_snapshot_every_n_steps=10
+              - --save_every_n_steps=100
+              - --recorder_type=axlearn.cloud.gcp.measurement:goodput
+              - --recorder_spec=name=goodput_tpu7x_2k_rr_fuji405b
+              - --recorder_spec=upload_dir=gs://tpu-prod-env-multipod-axlearn/axlearn/jobs/tpu7x-2k-rr-fuji405b/summaries
+              - --recorder_spec=upload_interval=15
+              - --recorder_spec=rolling_window_size=60
+              - --trainer_log_every_n_steps=1
+              resources:
+                requests:
+                  cpu: '32'
+                  memory: 120Gi
+                limits:
+                  cpu: '32'
+                  memory: 160Gi
+              env:
+              - name: PATHWAYS_HEAD
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/coordinator']
+              - name: TPU_TYPE
+                value: tpu7x-1024
+              - name: NUM_TPU_SLICES
+                value: '2'
+              - name: NUM_REPLICAS
+                value: '2'
+              - name: REPLICA_ID
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.annotations['jobset.sigs.k8s.io/job-index']
+              - name: JAX_BACKEND_TARGET
+                value: grpc://$(PATHWAYS_HEAD):29000
+              - name: JAX_PLATFORMS
+                value: proxy
+              - name: XCLOUD_ENVIRONMENT
+                value: GCP
+              - name: ENABLE_PATHWAYS_PERSISTENCE
+                value: '0'
+              - name: TPU_SKIP_MDS_QUERY
+                value: 'true'
+              - name: PYTHONUNBUFFERED
+                value: '1'
+              - name: LD_PRELOAD
+                value: /usr/lib/x86_64-linux-gnu/libtcmalloc.so.4
+              - name: PATHWAYS_MAX_INLINE_BUFFER_SIZE_BYTES
+                value: '262144'
+              - name: IFRT_PROXY_LARGE_TRANSFER_THRESHOLD
+                value: '1'
+              - name: IFRT_PROXY_LARGE_TRANSFER_OPTIMIZATION_DIRECTORY
+                value: /tmp/ifrt_proxy
+              volumeMounts:
+              - mountPath: /tmp/ifrt_proxy
+                name: shared-memory
+              - mountPath: /tmp
+                name: shared-tmp
+            initContainers:
+            - name: pathways-proxy
+              image: us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server:20260702-jax_0.8.3
+              restartPolicy: Always
+              args:
+              - --server_port=29000
+              - --num_elastic_slices=1
+              - --sidecar_name=external
+              - --resource_manager_address=$(PATHWAYS_HEAD):29001
+              - --gcs_scratch_location=gs://tpu-prod-env-multipod-axlearn/axlearn/jobs/tpu7x-2k-rr-fuji405b/pathways-staging
+              - --xla_tpu_use_enhanced_launch_barrier=true
+              - --xla_tpu_enable_megascale_barrier=true
+              - --xla_tpu_enable_sunk_dcn_allreduce_done_with_host_reduction=true
+              - --xla_tpu_host_dcn_reduce_max_sinking_limit=67108864
+              env:
+              - name: PATHWAYS_HEAD
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/coordinator']
+              - name: IFRT_PROXY_USE_INSECURE_GRPC_CREDENTIALS
+                value: 'true'
+              - name: IFRT_PROXY_LARGE_TRANSFER_OPTIMIZATION_DIRECTORY
+                value: /tmp/ifrt_proxy
+              ports:
+              - containerPort: 29000
+                protocol: TCP
+              resources:
+                limits:
+                  cpu: '8'
+                  memory: 32G
+              volumeMounts:
+              - mountPath: /tmp/ifrt_proxy
+                name: shared-memory
+            - name: pathways-rm
+              image: us-docker.pkg.dev/cloud-tpu-v2-images/pathways/server:20260702-jax_0.8.3
+              imagePullPolicy: Always
+              restartPolicy: Always
+              args:
+              - --server_port=29001
+              - --node_type=resource_manager
+              - --instance_count=2
+              - --instance_type=tpu7x:4x4x16
+              - --xla_tpu_use_enhanced_launch_barrier=true
+              - --gcs_scratch_location=gs://tpu-prod-env-multipod-axlearn/axlearn/jobs/tpu7x-2k-rr-fuji405b/pathways-staging
+              env:
+              - name: TPU_SKIP_MDS_QUERY
+                value: 'true'
+              ports:
+              - containerPort: 29001
+                protocol: TCP
+              - containerPort: 29002
+                protocol: TCP
+              resources:
+                limits:
+                  cpu: '8'
+                  memory: 32G
+            volumes:
+            - name: shared-memory
+              emptyDir:
+                medium: Memory
+            - name: shared-tmp
+              hostPath:
+                path: /tmp
+                type: DirectoryOrCreate
+  - name: worker
+    replicas: 2
+    template:
+      metadata:
+        annotations:
+          alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+      spec:
+        backoffLimitPerIndex: 20
+        maxFailedIndexes: 256
+        completionMode: Indexed
+        completions: 256
+        parallelism: 256
+        template:
+          metadata:
+            annotations:
+              alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+          spec:
+            dnsPolicy: ClusterFirstWithHostNet
+            hostNetwork: true
+            restartPolicy: OnFailure
+            serviceAccountName: default
+            terminationGracePeriodSeconds: 60
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 4x4x16
+            containers:
+            - name: pathways-worker
+              image: us-docker.pkg.dev/cloud-tpu-v2-images/pathways/server:20260702-jax_0.8.3
+              imagePullPolicy: Always
+              securityContext:
+                privileged: true
+              args:
+              - --server_port=29001
+              - --resource_manager_address=$(PATHWAYS_HEAD):29001
+              - --gcs_scratch_location=gs://tpu-prod-env-multipod-axlearn/axlearn/jobs/tpu7x-2k-rr-fuji405b/pathways-staging
+              - --tpu_pinned_host_allocation_recycle=true
+              - --xla_tpu_use_enhanced_launch_barrier=true
+              - --tpu_premapped_buffer_size=34359738368
+              - --cloud_pathways_sidecar_shm_directory=/tmp/sidecar
+              env:
+              - name: PATHWAYS_HEAD
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/coordinator']
+              - name: MEGASCALE_COORDINATOR_ADDRESS
+                value: $(PATHWAYS_HEAD)
+              - name: MEGASCALE_NUM_SLICES
+                value: '2'
+              - name: MEGASCALE_SLICE_ID
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+              - name: MEGASCALE_PORT
+                value: '60081'
+              - name: LD_PRELOAD
+                value: /usr/lib/x86_64-linux-gnu/libtcmalloc.so.4
+              resources:
+                requests:
+                  cpu: '24'
+                  memory: 120Gi
+                limits:
+                  google.com/tpu: '4'
+              volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+              - mountPath: /tmp/sidecar
+                name: sidecar-shared-memory
+              - mountPath: /tmp
+                name: shared-tmp
+            initContainers:
+            - name: colocated-python-sidecar
+              image: us-docker.pkg.dev/cloud-tpu-multipod-dev/axlearn/colocated-python:pr18-orbax-0.11.6
+              imagePullPolicy: Always
+              restartPolicy: Always
+              env:
+              - name: PATHWAYS_HEAD
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/coordinator']
+              - name: MEGASCALE_COORDINATOR_ADDRESS
+                value: $(PATHWAYS_HEAD)
+              - name: MEGASCALE_NUM_SLICES
+                value: '2'
+              - name: MEGASCALE_SLICE_ID
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+              - name: MEGASCALE_PORT
+                value: '60081'
+              - name: LD_PRELOAD
+                value: /usr/lib/x86_64-linux-gnu/libtcmalloc.so.4
+              - name: TCMALLOC_RELEASE_RATE
+                value: '10'
+              - name: GRPC_SERVER_ADDRESS
+                value: '0.0.0.0:50051'
+              - name: CLOUD_PATHWAYS_SIDECAR_SHM_DIRECTORY
+                value: /tmp/sidecar
+              - name: PYTHONUNBUFFERED
+                value: '1'
+              ports:
+              - containerPort: 50051
+                protocol: TCP
+              resources:
+                requests:
+                  cpu: '16'
+                  memory: 64Gi
+              volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+              - mountPath: /tmp/sidecar
+                name: sidecar-shared-memory
+              - mountPath: /tmp
+                name: shared-tmp
+            volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+            - name: sidecar-shared-memory
+              emptyDir:
+                medium: Memory
+            - name: shared-tmp
+              hostPath:
+                path: /tmp
+                type: DirectoryOrCreate
+  startupPolicy:
+    startupPolicyOrder: AnyOrder
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+    - pathways-head
