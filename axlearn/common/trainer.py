@@ -940,7 +940,15 @@ class SpmdTrainer(Module):
 
                                 snapshot_interval = getattr(cfg, "elastic_snapshot_every_n_steps", 5)
                                 if restore_mode == "snapshot" and snapshot_interval and snapshot_interval > 0 and self.step % snapshot_interval == 0:
-                                    self._jax_device_state, self._python_vars, self._immutable_data = sync_store_class_vars(self)
+                                    ckpt_every_n = getattr(getattr(cfg.checkpointer, "save_policy", None), "n", None)
+                                    if ckpt_every_n and self.step % ckpt_every_n == 0:
+                                        logging.info(
+                                            "[ELASTIC] Step %s is a checkpoint step (every %s). Skipping snapshot to bound host memory.",
+                                            self.step,
+                                            ckpt_every_n,
+                                        )
+                                    else:
+                                        self._jax_device_state, self._python_vars, self._immutable_data = sync_store_class_vars(self)
         
                                 num_steps += 1
                                 if num_steps % 100 == 0:
