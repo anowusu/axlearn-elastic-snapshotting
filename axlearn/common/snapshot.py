@@ -119,9 +119,15 @@ class Snapshotter:
     t0_async = time.perf_counter()
     _logger.info("[ELASTIC] Starting snapshot process for step %d", step)
     with self._lock:
-      if self._queue.full() or self._worker_busy:
-        _logger.warning("[ELASTIC] Snapshotter busy. Skipping snapshot for step %d", step)
-        return
+      is_busy = self._queue.full() or self._worker_busy
+    if is_busy:
+      _logger.info("[ELASTIC] Waiting for previous snapshot to complete before saving step %d...", step)
+      self.join()
+    with self._lock:
+      if self._last_worker_error is not None:
+        err = self._last_worker_error
+        self._last_worker_error = None
+        raise err
 
     _logger.info("[ELASTIC] Moving snapshot state to host-pinned memory for step %d...", step)
     pinned_shardings = jax.tree.map(

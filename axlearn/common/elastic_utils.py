@@ -178,8 +178,9 @@ def live_devices():
         _elastic_manager.active_slice_indices = active_slice_indices
         if active_slice_indices and hasattr(_elastic_manager, "default_device"):
             default_device = _elastic_manager.default_device
-            jax.config.update("jax_default_device", default_device)
-            logging.info("[ELASTIC] Updated jax_default_device to: %s", default_device)
+            if getattr(jax.config, "jax_default_device", None) != default_device:
+                jax.config.update("jax_default_device", default_device)
+                logging.info("[ELASTIC] Updated jax_default_device to: %s", default_device)
     except Exception as e:
         logging.warning(
             "[ELASTIC] Failed to get active slice indices: %s. Falling back to cached values.", e
