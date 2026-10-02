@@ -20,7 +20,7 @@ from jax.experimental import multihost_utils
 from jax.experimental.pjit import pjit
 
 from axlearn.common import file_system as fs
-from axlearn.common import measurement, utils
+from axlearn.common import elastic_utils, measurement, utils
 from axlearn.common.base_layer import ParameterSpec
 from axlearn.common.base_model import BaseModel
 from axlearn.common.checkpointer import BaseCheckpointer, Checkpointer
@@ -69,18 +69,6 @@ from axlearn.common.utils import (
     match_regex_rules,
     thread_stack_traces,
 )
-
-
-try:
-    from pathwaysutils.elastic import elastic
-    from pathwaysutils.elastic import manager as elastic_manager
-
-    _orig_slice_down = elastic.is_error_due_to_slice_down
-    elastic.is_error_due_to_slice_down = lambda e: _orig_slice_down(e) or any(
-        c in repr(e) for c in ("UNAVAILABLE", "ABORTED", "DATA_LOSS", "INTERNAL", "DEADLINE_EXCEEDED", "NOT_FOUND", "CANCELLED")
-    )
-except ImportError:
-    elastic_manager = None
 
 
 class TrainerState(NamedTuple):
@@ -162,9 +150,16 @@ class SpmdTrainer(Module):
         learner: Required[Learner.Config] = REQUIRED
         # The checkpointer config.
         checkpointer: BaseCheckpointer.Config = Checkpointer.default_config()
+        # In-memory snapshotter for fast recovery from elastic events. See `snapshot.Snapshotter`.
         snapshotter: Optional[BaseCheckpointer.Config] = None
-        enable_elastic_training: bool = False
-        minimum_slice_count: Optional[int] = None
+        # Elastic training on Pathways (a no-op on McJAX). Names follow MaxText; see `elastic_utils`.
+        elastic_enabled: bool = False
+        # Minimum number of active slices to keep training on; -1 waits for all slices (pause and
+        # resume). With fewer slices the global batch is kept by gradient accumulation.
+        elastic_min_slice_count: int = -1
+        # Max seconds to wait for slices before each retry, and max retries (None: unlimited).
+        elastic_timeout_seconds: Optional[float] = None
+        elastic_max_retries: Optional[int] = None
         # A dict of evaler names to configs, each name must be non-empty.
         evalers: dict[str, SpmdEvaler.Config] = {}
 
@@ -285,24 +280,7 @@ class SpmdTrainer(Module):
         self._is_initialized: bool = False
         self._init_prng_key: Optional[Tensor] = None
         self._base_grad_accum_steps: int = getattr(getattr(cfg.learner, "forward_fn_transformation", None), "steps", 0) or 0
-        self._elastic_manager = None
-        if cfg.enable_elastic_training and elastic_manager is not None:
-            self._elastic_manager = utils.elastic_manager = elastic_manager.Manager()
-
-            def _safe_elastic_event_cleanup():
-                self._trainer_state = None
-                self._maybe_record_event(measurement.Event.START_ELASTIC_WAIT, "elastic_wait")
-                if hasattr(self.checkpointer, "begin_elastic_drain"):
-                    self.checkpointer.begin_elastic_drain()
-                for a in jax.live_arrays():
-                    s = getattr(a, "sharding", None)
-                    if getattr(s, "memory_kind", None) != "pinned_host" and not any(
-                        getattr(d, "platform", None) == "cpu" for d in (getattr(s, "device_set", None) or ())
-                    ):
-                        with contextlib.suppress(Exception):
-                            a.delete()
-
-            elastic_manager._elastic_event_cleanup = _safe_elastic_event_cleanup  # pylint: disable=protected-access
+        elastic_utils.ensure_elastic_manager_initialized(cfg.elastic_enabled)
         self._maybe_record_event(measurement.Event.START_ACCELERATOR_INIT)
 
         if cfg.model.dtype is None:
@@ -320,14 +298,9 @@ class SpmdTrainer(Module):
 
         # Create the device mesh.
         if devices is None:
-            if self._elastic_manager is not None:
-                self._elastic_manager.active_slice_indices = elastic.wait_for_slices(
-                    slice_count=self._elastic_manager.total_slice_count,
-                    slice_to_devices=self._elastic_manager.slice_to_devices,
-                    poll_interval=5,
-                )
-                self._sync_elastic_devices()
-            live_devs = utils.live_devices()
+            elastic_utils.wait_for_slices()  # All slices must be active at startup.
+            self._sync_elastic_devices()
+            live_devs = elastic_utils.live_devices()
             self._step_log(
                 "[ELASTIC][SCALE] devices=%s global=%s local=%s %s",
                 len(live_devs),
@@ -475,16 +448,30 @@ class SpmdTrainer(Module):
         return getattr(getattr(self.checkpointer, "_manager", None), "is_saving_in_progress", lambda: False)()
 
     def _sync_elastic_devices(self):
-        jax.config.update("jax_default_device", self._elastic_manager.default_device)
+        if (mgr := elastic_utils.elastic_manager) is None:
+            return
+        jax.config.update("jax_default_device", mgr.default_device)
         self._maybe_record_event(
             measurement.Event.RECORD_SLICE_COUNTS,
-            active_slices=self._elastic_manager.active_slice_count,
-            total_slices=self._elastic_manager.total_slice_count,
-            available_slices=self._elastic_manager.active_slice_count,
+            active_slices=mgr.active_slice_count,
+            total_slices=mgr.total_slice_count,
+            available_slices=mgr.active_slice_count,
         )
 
+    def _on_elastic_event(self):
+        """Called by `elastic_utils.elastic_retry` right after a slice-down or scale-up event."""
+        self._trainer_state = None
+        self._maybe_record_event(measurement.Event.START_ELASTIC_WAIT, "elastic_wait")
+        if hasattr(self.checkpointer, "begin_elastic_drain"):
+            self.checkpointer.begin_elastic_drain()
+
     def _restore_after_elastic_event(self):
-        live_devs = utils.live_devices()
+        """Called by `elastic_utils.elastic_retry` before each attempt, once slices are active.
+
+        Rebuilds the mesh on the live devices (keeping the global batch via gradient accumulation)
+        and restores the trainer state from the latest snapshot or checkpoint.
+        """
+        live_devs = elastic_utils.live_devices()
         devices_changed = self._mesh is not None and {d.id for d in live_devs} != {d.id for d in self._mesh.devices.flat}
         if self._trainer_state is not None and not devices_changed:
             return
@@ -495,8 +482,7 @@ class SpmdTrainer(Module):
             # pylint: disable-next=import-outside-toplevel
             from axlearn.common import gradient_accumulation as ga
 
-            active, total = self._elastic_manager.active_slice_count, self._elastic_manager.total_slice_count
-            steps = self._base_grad_accum_steps if active >= total else max(1, self._base_grad_accum_steps) * ((total + active - 1) // active)
+            steps = elastic_utils.grad_accumulation_steps(self._base_grad_accum_steps)
             fwd_cfg = config_for_function(ga.with_minibatch_steps).set(steps=steps, metric_accumulator=ga.MetricAccumulator.default_config()) if steps > 0 else None
             self.learner._forward_fn_transformation = maybe_instantiate(fwd_cfg) if fwd_cfg else (lambda fn: fn)  # pylint: disable=protected-access
             self._mesh = jax.sharding.Mesh(utils.create_device_mesh(mesh_shape=self._config.mesh_shape, devices=live_devs), self._config.mesh_axis_names)
@@ -521,7 +507,7 @@ class SpmdTrainer(Module):
             if restored_step is None:
                 self.init(jnp.asarray(self._init_prng_key))
                 self._step = 0
-            if devices_changed and self._elastic_manager.active_slice_count > 1:
+            if devices_changed and elastic_utils.elastic_manager.active_slice_count > 1:
                 self.save_snapshot(force=True)
         self._maybe_record_event(measurement.Event.END_ELASTIC_REINIT)
 
@@ -775,13 +761,13 @@ class SpmdTrainer(Module):
                 self.checkpointer,
                 self.snapshotter if "snapshotter" in self.children else contextlib.nullcontext(),
             ):
-                if self._elastic_manager is not None:
-                    _step_loop = self._elastic_manager.elastic_retry(
-                        minimum_slice_count=cfg.minimum_slice_count,
-                        poll_interval=5,
-                        pre_callback=self._restore_after_elastic_event,
-                    )(_step_loop)
-                _step_loop()
+                elastic_utils.elastic_retry(
+                    min_slice_count=cfg.elastic_min_slice_count,
+                    timeout_seconds=cfg.elastic_timeout_seconds,
+                    max_retries=cfg.elastic_max_retries,
+                    pre_callback=self._restore_after_elastic_event,
+                    on_elastic_event_callback=self._on_elastic_event,
+                )(_step_loop)()
                 if self.step < cfg.max_step:
                     self._step_log("Reached end of inputs. Stopping")
             self._step_log("Checkpointer flushed.")
@@ -1278,14 +1264,17 @@ class SpmdTrainer(Module):
             train_summaries=outputs["summaries"], force_runs=force_run_evals
         )
 
-        # Checkpointer policy will decide if we should save.
-        if not (self._elastic_manager and self._elastic_manager.new_slice_event.is_set()):
-            self.save_checkpoint(evaler_summaries=evaler_summaries)
-            self.save_snapshot(evaler_summaries=evaler_summaries)
-        elif self.step < self._config.max_step and not self._is_checkpoint_saving_in_progress():
+        if (
+            elastic_utils.is_scale_up_event()
+            and self.step < self._config.max_step
+            and not self._is_checkpoint_saving_in_progress()
+        ):
             self.save_snapshot(evaler_summaries=evaler_summaries, force=True)
             self._step_log("[ELASTIC] New slice ready at step=%s; triggering scale-up", self.step)
-            raise elastic_manager.ScaleUpSignalError(f"Scale-up at step {self.step}")
+            raise elastic_utils.ScaleUpSignalError(f"Scale-up at step {self.step}")
+        # Checkpointer policy will decide if we should save.
+        self.save_checkpoint(evaler_summaries=evaler_summaries)
+        self.save_snapshot(evaler_summaries=evaler_summaries)
 
         return_dict = {"loss": outputs["loss"], "aux": outputs["aux"]}
         # Returns evaler_summaries if force_run_evals is not None or empty set.

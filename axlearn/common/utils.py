@@ -66,6 +66,7 @@ from axlearn.common.config import (
     maybe_instantiate,
     register_validator,
 )
+from axlearn.common.elastic_utils import live_devices
 
 # New code should use Nested[XX] instead of NestedXX.
 # Old definitions are provided for backwards compatibility.
@@ -2171,10 +2172,3 @@ def get_tpu_dot_precision(dtype) -> jax.lax.Precision:
         return jax.lax.Precision.DEFAULT
     raise ValueError(f"Unsupported dtype {dtype}")
 
-
-elastic_manager: Any = None
-
-
-def live_devices() -> list[jax.Device]:
-    active = getattr(elastic_manager, "active_slice_indices", None)
-    return [d for d in jax.devices() if not active or getattr(d, "slice_index", 0) in active]

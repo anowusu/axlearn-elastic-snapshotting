@@ -113,11 +113,21 @@ flags.DEFINE_string(
     None,
     "The mesh selector string. See `SpmdTrainer.Config.mesh_rules` for details.",
 )
+# Elastic training flags (Pathways only, a no-op on McJAX). Names follow MaxText's `elastic_*`
+# config; see `axlearn.common.elastic_utils`.
+flags.DEFINE_bool("elastic_enabled", False, "Enables elastic training on the Pathways backend.")
 flags.DEFINE_integer(
-    "num_elastic_slices", 1, "Enables elastic training; the minimum number of active slices."
+    "elastic_min_slice_count", -1, "Minimum active slices to train on; -1 waits for all slices."
 )
-flags.DEFINE_enum("elastic_restore_mode", "snapshot", ["snapshot", "checkpoint"], "Restore mode.")
-flags.DEFINE_integer("elastic_snapshot_every_n_steps", None, "Snapshot frequency in steps.")
+flags.DEFINE_float("elastic_timeout_seconds", None, "Max seconds to wait for slices per retry.")
+flags.DEFINE_integer("elastic_max_retries", None, "Max retries after elastic events.")
+flags.DEFINE_enum(
+    "elastic_backup_kind",
+    "snapshot",
+    ["snapshot", "checkpoint"],
+    "Recover elastic events from an in-memory snapshot or from the last checkpoint.",
+)
+flags.DEFINE_integer("elastic_snapshot_every_n_steps", 5, "Snapshot frequency in steps.")
 flags.DEFINE_integer("save_every_n_steps", None, "Checkpoint frequency in steps.")
 
 FLAGS = flags.FLAGS
@@ -176,14 +186,16 @@ def get_trainer_config(
         )
     if trainer_config.log_every_n_steps is None:
         trainer_config.log_every_n_steps = flag_values.trainer_log_every_n_steps
-    if flag_values["num_elastic_slices"].present:
+    if flag_values.elastic_enabled:
         from axlearn.common.checkpointer import Checkpointer, every_n_steps_policy  # pylint: disable=import-outside-toplevel
         from axlearn.common.checkpointer_orbax import OrbaxCheckpointer  # pylint: disable=import-outside-toplevel
         from axlearn.common.snapshot import Snapshotter  # pylint: disable=import-outside-toplevel
 
         trainer_config.set(
-            enable_elastic_training=True,
-            minimum_slice_count=int(flag_values.num_elastic_slices),
+            elastic_enabled=True,
+            elastic_min_slice_count=flag_values.elastic_min_slice_count,
+            elastic_timeout_seconds=flag_values.elastic_timeout_seconds,
+            elastic_max_retries=flag_values.elastic_max_retries,
         )
         if getattr(trainer_config.checkpointer, "klass", None) is Checkpointer:
             trainer_config.checkpointer = OrbaxCheckpointer.default_config().set(
@@ -192,9 +204,9 @@ def get_trainer_config(
                 keep_period=trainer_config.checkpointer.keep_every_n_steps,
                 max_concurrent_save_gb=16,
             )
-        if flag_values.elastic_restore_mode == "snapshot":
+        if flag_values.elastic_backup_kind == "snapshot":
             trainer_config.snapshotter = Snapshotter.default_config().set(
-                save_policy=every_n_steps_policy(int(flag_values.elastic_snapshot_every_n_steps or 5))
+                save_policy=every_n_steps_policy(flag_values.elastic_snapshot_every_n_steps)
             )
     if flag_values.save_every_n_steps is not None:
         n = int(flag_values.save_every_n_steps)
