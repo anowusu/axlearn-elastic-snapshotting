@@ -61,6 +61,24 @@ class ElasticUtilsTest(absltest.TestCase):
         elastic_utils.elastic_manager = _FakeManager(total=4, active=[1, 2, 3])
         self.assertEqual(elastic_utils.grad_accumulation_steps(0), 2)
 
+    def test_total_slice_count(self):
+        self.assertIsNone(elastic_utils.total_slice_count())
+        elastic_utils.elastic_manager = _FakeManager(total=4, active=[0, 1])
+        self.assertEqual(elastic_utils.total_slice_count(), 4)
+
+    def test_grad_accumulation_steps_with_device_batch_sizes(self):
+        elastic_utils.elastic_manager = _FakeManager(total=2, active=[0])
+        # The per-device batch grows from 8 to 16: 2 minibatches of 8.
+        self.assertEqual(elastic_utils.grad_accumulation_steps(0, device_batch_sizes=(8, 16)), 2)
+        self.assertEqual(elastic_utils.grad_accumulation_steps(2, device_batch_sizes=(8, 16)), 4)
+        # 8 -> 12 (3 -> 2 slices): 2 minibatches of 6.
+        self.assertEqual(elastic_utils.grad_accumulation_steps(0, device_batch_sizes=(8, 12)), 2)
+        # The steps must divide the live per-device batch: 5 minibatches of 1.
+        self.assertEqual(elastic_utils.grad_accumulation_steps(0, device_batch_sizes=(3, 5)), 5)
+        # An unchanged per-device batch keeps the configured steps.
+        self.assertEqual(elastic_utils.grad_accumulation_steps(0, device_batch_sizes=(8, 8)), 0)
+        self.assertEqual(elastic_utils.grad_accumulation_steps(2, device_batch_sizes=(8, 8)), 2)
+
     def test_live_devices_filters_inactive_slices(self):
         elastic_utils.elastic_manager = _FakeManager(total=2, active=[1])
         devices = [mock.Mock(slice_index=0), mock.Mock(slice_index=1)]

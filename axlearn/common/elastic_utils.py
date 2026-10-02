@@ -2,8 +2,8 @@
 
 """Elastic training utilities for the Pathways backend.
 
-This module mirrors `maxtext.utils.elastic_utils` (same concepts, config names and
-`pathwaysutils` entry points) so that AXLearn and MaxText elastic training behave alike:
+This module wraps the `pathwaysutils` elastic entry points (the parameter names follow MaxText's
+`elastic_*` flags, so that both trainers are operated alike):
 
 * `elastic_manager`: a module-level `pathwaysutils.elastic.manager.Manager`.
 * `live_devices()`: the devices of the currently active slices (`jax.devices()` when not elastic).
@@ -15,10 +15,10 @@ Elastic training is Pathways-specific. On McJAX, or when `pathwaysutils` is not 
 be launched on either backend (on McJAX a slice loss is handled by the usual job restart and
 checkpoint restore).
 
-Batch size: MaxText keeps the per-device batch fixed, so its global batch shrinks with the number
-of live slices. AXLearn keeps the global batch fixed and instead scales the number of gradient
-accumulation steps by `total_slices / active_slices` (`grad_accumulation_steps()`), so the
-optimizer sees identical batches regardless of how many slices are active.
+Batch size: the global batch stays constant across elastic events. `elastic_input.ElasticInput`
+grows (and pads) the per-device batch on the live slices, on Pathways exactly as on McJAX, and
+`grad_accumulation_steps()` processes the larger per-device batch in minibatches of the configured
+size, so that the optimizer sees identical batches and per-device memory does not grow.
 """
 
 from typing import Any, Callable, Optional
@@ -87,6 +87,11 @@ def live_devices() -> list[jax.Device]:
     return [d for d in jax.devices() if getattr(d, "slice_index", 0) in active]
 
 
+def total_slice_count() -> Optional[int]:
+    """Returns the number of slices of the job, or None when not elastic."""
+    return None if elastic_manager is None else elastic_manager.total_slice_count
+
+
 def wait_for_slices(slice_count: Optional[int] = None, *, poll_interval: float = 5):
     """Blocks until at least `slice_count` (default: all) slices are active."""
     if elastic_manager is not None:
@@ -97,16 +102,34 @@ def wait_for_slices(slice_count: Optional[int] = None, *, poll_interval: float =
         )
 
 
-def grad_accumulation_steps(base_steps: int) -> int:
-    """Returns the gradient accumulation steps keeping the global batch fixed on the active slices.
+def grad_accumulation_steps(
+    base_steps: int, *, device_batch_sizes: Optional[tuple[int, int]] = None
+) -> int:
+    """Returns the minibatch steps that keep each per-device microbatch at its configured size.
+
+    The global batch stays constant across elastic events, so the per-device batch grows on fewer
+    slices (see `elastic_input.ElasticInput`). Processing it in more minibatches keeps per-device
+    memory as configured. The returned steps divide the live per-device batch.
 
     Args:
         base_steps: The configured number of minibatch steps (0 if gradient accumulation is off).
+        device_batch_sizes: The per-device batch sizes (with all slices, on the live slices), e.g.
+            `ElasticInput.device_batch_sizes`. If None, the per-device batch is assumed to grow by
+            `total_slices / active_slices`.
     """
     if elastic_manager is None:
         return base_steps
-    total, active = elastic_manager.total_slice_count, elastic_manager.active_slice_count
-    return base_steps if active >= total else max(1, base_steps) * -(-total // active)
+    if device_batch_sizes is None:
+        device_batch_sizes = tuple(
+            n * max(1, base_steps)
+            for n in (elastic_manager.active_slice_count, elastic_manager.total_slice_count)
+        )
+    full, live = device_batch_sizes
+    microbatch_size = max(1, full // max(1, base_steps))
+    steps = -(-live // microbatch_size)
+    while live % steps:
+        steps += 1
+    return base_steps if steps <= max(1, base_steps) else steps
 
 
 def is_scale_up_event() -> bool:

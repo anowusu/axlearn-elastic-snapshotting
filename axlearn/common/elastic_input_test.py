@@ -187,5 +187,144 @@ class ElasticInputTest(parameterized.TestCase):
                     assert np.all(first_batch["target_labels"][-4:] == -1)
 
 
+class ElasticInputSingleControllerTest(parameterized.TestCase):
+    """Tests ElasticInput on a single-controller backend such as Pathways."""
+
+    def _write_fake_dataset(self, data_dir: str, *, num_examples: int, seq_length: int):
+        def data_gen():
+            for i in range(num_examples):
+                yield {
+                    "input_ids": tf.repeat(i, seq_length),
+                    "target_labels": tf.repeat(i + 1, seq_length),
+                }
+
+        tfds.dataset_builders.store_as_tfds_dataset(
+            name="fake_dataset",
+            version="1.0.0",
+            features=tfds.features.FeaturesDict(
+                {
+                    "input_ids": tfds.features.Tensor(shape=(seq_length,), dtype=tf.int32),
+                    "target_labels": tfds.features.Tensor(shape=(seq_length,), dtype=tf.int32),
+                },
+            ),
+            split_datasets={
+                "train": tf.data.Dataset.from_generator(
+                    data_gen,
+                    output_signature={
+                        "input_ids": tf.TensorSpec(shape=(seq_length,), dtype=tf.int32),
+                        "target_labels": tf.TensorSpec(shape=(seq_length,), dtype=tf.int32),
+                    },
+                )
+            },
+            data_dir=data_dir,
+            download_config=tfds.download.DownloadConfig(num_shards=1),
+            disable_shuffling=True,
+        )
+
+    def test_pads_global_batch_to_live_slices(self):
+        seq_length, num_max_slices, devices_per_slice = 4, 3, 2
+        # One example per device with all slices.
+        global_batch_size = num_max_slices * devices_per_slice
+        with tempfile.TemporaryDirectory() as tmp_data_dir:
+            self._write_fake_dataset(
+                tmp_data_dir, num_examples=4 * global_batch_size, seq_length=seq_length
+            )
+            input_cfg = ElasticInput.default_config().set(
+                input=Input.default_config().set(
+                    source=config_for_function(tfds_dataset).set(
+                        dataset_name="fake_dataset",
+                        split="train",
+                        is_training=True,
+                        data_dir=tmp_data_dir,
+                        train_shuffle_buffer_size=0,
+                        train_shuffle_files=False,
+                    ),
+                    input_dispatcher=ElasticSpmdInputDispatcher.default_config().set(
+                        num_max_slices=num_max_slices,
+                        global_logical_batch_size=global_batch_size,
+                    ),
+                    processor=config_for_function(identity),
+                    batcher=config_for_function(per_feed_batch).set(
+                        feed_batch_size=global_batch_size,
+                        is_training=True,
+                        pad_example_fn=default_pad_example_fn,
+                    ),
+                    is_training=True,
+                ),
+                # The trainer sets the partition spec on the wrapper.
+                partition_spec=PartitionSpec(("data",)),
+                name="test_elastic_input",
+            )
+            live_slices = [num_max_slices]
+            with (
+                Mesh([jax.local_devices()[0]] * global_batch_size, "data"),
+                mock.patch(
+                    "axlearn.common.elastic_input.slice_count", side_effect=lambda: live_slices[0]
+                ),
+            ):
+                inp = input_cfg.instantiate(parent=None)
+                dispatcher = inp.primary_input.input_dispatcher
+                self.assertTrue(dispatcher.is_single_controller)
+                # The single feed reads the whole global batch; there is no elastic feed.
+                self.assertNotIn("elastic_input", inp.children)
+                self.assertEqual(dispatcher.feed_read_config(), dict(num_shards=1, shard_index=0))
+                self.assertEqual(inp.partition_spec, PartitionSpec(("data",)))
+
+                batches = inp.batches(iter(inp.dataset()))
+                # All slices are live: no padding.
+                batch = next(batches)
+                self.assertFalse(inp.is_in_elastic_mode)
+                self.assertEqual(inp.device_batch_sizes, (1, 1))
+                self.assertEqual(batch["input_ids"].shape, (global_batch_size, seq_length))
+
+                # One slice is lost: the per-device batch grows from 1 to ceil(1 * 3 / 2) = 2 on
+                # the 4 live devices, so the 6 examples are padded to 8. The same iterator
+                # continues with the next examples.
+                live_slices[0] = 2
+                batch = next(batches)
+                self.assertTrue(inp.is_in_elastic_mode)
+                self.assertEqual(inp.device_batch_sizes, (1, 2))
+                self.assertEqual(dispatcher.elastic_padding_size(), 2)
+                self.assertEqual(batch["input_ids"].shape, (8, seq_length))
+                np.testing.assert_array_equal(batch["input_ids"][:6, 0], np.arange(6, 12))
+                np.testing.assert_array_equal(
+                    batch["target_labels"][:6], batch["input_ids"][:6] + 1
+                )
+                # Padding repeats the last example and is ignored by the loss.
+                np.testing.assert_array_equal(batch["input_ids"][6:], [batch["input_ids"][5]] * 2)
+                np.testing.assert_array_equal(batch["target_labels"][6:], -1)
+
+                # The slice is back: no padding again.
+                live_slices[0] = 3
+                batch = next(batches)
+                self.assertFalse(inp.is_in_elastic_mode)
+                self.assertEqual(batch["input_ids"].shape, (global_batch_size, seq_length))
+                np.testing.assert_array_equal(batch["input_ids"][:, 0], np.arange(12, 18))
+
+    @parameterized.parameters(dict(total_slice_count=None), dict(total_slice_count=2))
+    def test_num_max_slices_from_elastic_manager(self, total_slice_count):
+        cfg = ElasticSpmdInputDispatcher.default_config().set(
+            global_logical_batch_size=8, partition_spec=PartitionSpec("data"), name="dispatcher"
+        )
+        with (
+            Mesh([jax.local_devices()[0]] * 4, "data"),
+            mock.patch(
+                "axlearn.common.elastic_utils.total_slice_count", return_value=total_slice_count
+            ),
+            mock.patch("axlearn.common.elastic_input.slice_count", return_value=1),
+        ):
+            dispatcher = cfg.instantiate(parent=None)
+            if total_slice_count is None:
+                # Not elastic when the number of slices is unknown.
+                self.assertFalse(dispatcher.is_in_elastic_mode)
+                self.assertEqual(dispatcher.elastic_padding_size(), 0)
+            else:
+                # Constructed on 1 of 2 slices: the 4 partitions stand for 8 at full scale.
+                self.assertTrue(dispatcher.is_in_elastic_mode)
+                self.assertEqual(dispatcher.device_physical_batch_size, 1)
+                self.assertEqual(dispatcher.adjusted_device_physical_batch_size, 2)
+                self.assertEqual(dispatcher.elastic_padding_size(), 0)
+
+
 if __name__ == "__main__":
     absltest.main()

@@ -32,6 +32,13 @@ An example usage is:
 
 Note the loss might be changed slightly (within numerical tolerance) because the
 order of the global input batch is changed.
+
+On a single-controller backend such as Pathways, the one process already reads
+the whole global batch, so nothing has to be re-dispatched from the lost slices:
+`ElasticInput` only pads each batch so that it divides evenly over the devices
+of the live slices. The padding follows elastic events (see `elastic_utils`)
+without rebuilding the input, so the same input iterator keeps running across
+them.
 """
 
 import collections
@@ -45,7 +52,7 @@ from jax._src import sharding as jsharding
 from jax._src.mesh import thread_resources
 from jax.sharding import PartitionSpec
 
-from axlearn.common import input_base
+from axlearn.common import elastic_utils, input_base
 from axlearn.common.config import REQUIRED, Required, config_class, maybe_set_config
 from axlearn.common.input_dispatch import BaseInputDispatcher, _validate_logical_feed_shapes
 from axlearn.common.module import Module
@@ -63,7 +70,9 @@ class ElasticSpmdInputDispatcher(BaseInputDispatcher):
 
         # Currently we only support scaling down. So the value is the maximum
         # number of slices that the job will use during the whole life circle.
-        num_max_slices: Required[int] = REQUIRED
+        # If None, it is taken from the Pathways elastic manager (see
+        # `elastic_utils`); elastic mode is disabled when it is unknown.
+        num_max_slices: Optional[int] = None
 
         # If `False`, `feed_read_config` will return the feed index of current
         # process, otherwise the corresponding elastic feed index of current
@@ -72,24 +81,25 @@ class ElasticSpmdInputDispatcher(BaseInputDispatcher):
 
     @property
     def is_in_elastic_mode(self) -> bool:
-        cfg = self.config
-        if cfg.num_max_slices is None:
+        if self._num_max_slices is None:
             return False
         else:
-            if slice_count() < cfg.num_max_slices:
+            if slice_count() < self._num_max_slices:
                 return True
-            elif slice_count() == cfg.num_max_slices:
+            elif slice_count() == self._num_max_slices:
                 return False
             else:
                 # TODO (jtian22): consider supporting scaling up in the future.
                 raise ValueError(
                     f"The number of slices at runtime[{slice_count()}] is larger"
-                    f"than the configured num_max_slices[{cfg.num_max_slices}]!"
+                    f"than the configured num_max_slices[{self._num_max_slices}]!"
                 )
 
     def __init__(self, cfg: Config, *, parent: Optional[Module]):
         super().__init__(cfg, parent=parent)
         cfg: ElasticSpmdInputDispatcher.Config = self.config
+        # On Pathways, the elastic manager knows the number of slices of the job.
+        self._num_max_slices = cfg.num_max_slices or elastic_utils.total_slice_count()
 
         mesh = thread_resources.env.physical_mesh
         if mesh.empty:
@@ -116,7 +126,7 @@ class ElasticSpmdInputDispatcher(BaseInputDispatcher):
             mesh.shape[axis] for axis in jax.tree.leaves(logical_sharding.spec[0])
         )
         if self.is_in_elastic_mode:
-            num_partitions = num_partitions // slice_count() * cfg.num_max_slices
+            num_partitions = num_partitions // slice_count() * self._num_max_slices
 
         if cfg.global_logical_batch_size % num_partitions != 0:
             raise ValueError(
@@ -124,6 +134,7 @@ class ElasticSpmdInputDispatcher(BaseInputDispatcher):
                 f"which is incompatible with {cfg.global_logical_batch_size=}."
             )
 
+        self._num_partitions = num_partitions
         self._device_physical_batch_size = cfg.global_logical_batch_size // num_partitions
 
         # Infer the physical feeds and feed index along dim=0.
@@ -154,18 +165,25 @@ class ElasticSpmdInputDispatcher(BaseInputDispatcher):
 
             return inferred_pids
 
-        self.feed_count = len(set(pid2fid.values())) // slice_count() * cfg.num_max_slices
+        # A single process (e.g. the Pathways controller) feeds all slices from one feed, so no
+        # feed of a lost slice has to be picked up: `ElasticInput` only pads the global batch.
+        self.is_single_controller = jax.process_count() == 1
         self.feed_index = pid2fid[jax.process_index()]
+        self.feed_count = (
+            1
+            if self.is_single_controller
+            else len(set(pid2fid.values())) // slice_count() * self._num_max_slices
+        )
+        self.elastic_feed_index = None
+        self.elastic_process_ids = None
+        self.is_primary = True
 
         assert cfg.global_logical_batch_size % self.feed_count == 0
         self._feed_logical_batch_size = cfg.global_logical_batch_size // self.feed_count
 
-        if self.is_in_elastic_mode:
-            adjusted_device_physical_batch_size = math.ceil(
-                self._device_physical_batch_size * (cfg.num_max_slices / slice_count())
-            )
+        if self.is_in_elastic_mode and not self.is_single_controller:
             padding_per_device = (
-                adjusted_device_physical_batch_size - self._device_physical_batch_size
+                self.adjusted_device_physical_batch_size - self._device_physical_batch_size
             )
             num_mini_batches = math.ceil(self._device_physical_batch_size / padding_per_device)
             self.elastic_feed_mini_batch_index = self.feed_index % num_mini_batches
@@ -180,7 +198,7 @@ class ElasticSpmdInputDispatcher(BaseInputDispatcher):
                 // self._device_physical_batch_size
             )
 
-            elastic_feed_start = self.feed_count // cfg.num_max_slices * slice_count()
+            elastic_feed_start = self.feed_count // self._num_max_slices * slice_count()
             elastic_feed_shift = self.feed_index // num_mini_batches
 
             # Even in elastic mode, some processes may not be assigned the
@@ -221,6 +239,31 @@ class ElasticSpmdInputDispatcher(BaseInputDispatcher):
     def device_physical_batch_size(self) -> int:
         return self._device_physical_batch_size
 
+    @property
+    def adjusted_device_physical_batch_size(self) -> int:
+        """The per-device physical batch size on the live slices.
+
+        Equal to `device_physical_batch_size` with all slices and larger in elastic mode so that
+        the global batch stays constant. Computed from the live slices on every call.
+        """
+        if not self.is_in_elastic_mode:
+            return self._device_physical_batch_size
+        return math.ceil(self._device_physical_batch_size * (self._num_max_slices / slice_count()))
+
+    def elastic_padding_size(self) -> int:
+        """Returns how many padding examples a single controller appends to each global batch.
+
+        With `adjusted_device_physical_batch_size` examples per live device, the padded batch
+        divides evenly over the live slices.
+        """
+        if not self.is_in_elastic_mode:
+            return 0
+        live_partitions = self._num_partitions * slice_count() // self._num_max_slices
+        return (
+            self.adjusted_device_physical_batch_size * live_partitions
+            - self.config.global_logical_batch_size
+        )
+
     def feed_read_config(self) -> dict[str, int]:
         cfg: ElasticSpmdInputDispatcher.Config = self.config
         if cfg.is_read_elastic_feed:
@@ -246,6 +289,20 @@ class ElasticSpmdInputDispatcher(BaseInputDispatcher):
         _validate_logical_feed_shapes(logical_feed_shapes)
         # Ensure that we always return ShapeDtypeStructs.
         return jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), logical_feed_shapes)
+
+
+def _pad_examples(path, x: np.ndarray, n_pad: int) -> np.ndarray:
+    """Appends `n_pad` padding examples along the batch dim.
+
+    `target_labels` are padded with -1 so that the padding does not contribute to the loss;
+    other fields repeat their last example.
+    """
+    if n_pad <= 0:
+        return x
+    pad_width = [(0, n_pad)] + [(0, 0)] * (x.ndim - 1)
+    if jax.tree_util.keystr(path, simple=True) == "target_labels":
+        return np.pad(x, pad_width, "constant", constant_values=-1)
+    return np.pad(x, pad_width, "edge")
 
 
 @dataclass
@@ -301,6 +358,9 @@ class ElasticInput(input_base.Input):
         """Configures ElasticInput."""
 
         input: Required[input_base.Input.Config] = REQUIRED
+        # Forwarded to `input` when set, so that the trainer / evaler configure the wrapped
+        # input through the wrapper (like `partition_spec`).
+        is_training: Optional[bool] = None
 
     def __init__(self, cfg: Config, *, parent: Optional[Module]):
         super().__init__(cfg, parent=parent)
@@ -310,9 +370,14 @@ class ElasticInput(input_base.Input):
             and cfg.input.input_dispatcher.is_read_elastic_feed is False
         )
 
+        # Forward what the trainer (or evaler) sets on the wrapper to the wrapped input.
+        if cfg.is_training is not None:
+            maybe_set_config(cfg.input, is_training=cfg.is_training)
+        if cfg.partition_spec is not None:
+            cfg.input.partition_spec = cfg.partition_spec
         self.primary_input = self._add_child("primary_input", cfg.input)
 
-        if self.is_in_elastic_mode:
+        if self.is_in_elastic_mode and not self.primary_input.input_dispatcher.is_single_controller:
             self.elastic_input = self._add_child(
                 "elastic_input",
                 maybe_set_config(
@@ -327,8 +392,27 @@ class ElasticInput(input_base.Input):
     def is_in_elastic_mode(self) -> bool:
         return self.primary_input.input_dispatcher.is_in_elastic_mode
 
+    @property
+    def device_batch_sizes(self) -> tuple[int, int]:
+        """The per-device physical batch sizes with all slices and on the live slices."""
+        dispatcher: ElasticSpmdInputDispatcher = self.primary_input.input_dispatcher
+        return (
+            dispatcher.device_physical_batch_size,
+            dispatcher.adjusted_device_physical_batch_size,
+        )
+
+    @property
+    def partition_spec(self) -> PartitionSpec:
+        return self.primary_input.partition_spec
+
+    def dispatch_global_batch(self, global_physical_batch: Nested[Tensor]) -> Nested[Tensor]:
+        global_logical_batch = self.primary_input.dispatch_global_batch(global_physical_batch)
+        if self._input_partitioner is not None:
+            global_logical_batch = self._input_partitioner(global_logical_batch)
+        return global_logical_batch
+
     def dataset(self):
-        if self.is_in_elastic_mode:
+        if "elastic_input" in self.children:
             return ElasticDataset(
                 primary_dataset=self.primary_input.dataset(),
                 elastic_dataset=(
@@ -349,7 +433,17 @@ class ElasticInput(input_base.Input):
 
     def batches(self, it: Iterator[Nested[Tensor]]) -> Iterator[Nested[Tensor]]:
         assert isinstance(it, ElasticDatasetIterator)
-        if self.is_in_elastic_mode:
+        if self.primary_input.input_dispatcher.is_single_controller:
+            # The single process reads the whole global batch, which is only padded to the
+            # per-device batch size of the live slices (recomputed for every batch, so that it
+            # follows elastic events without rebuilding the input).
+            dispatcher: ElasticSpmdInputDispatcher = self.primary_input.input_dispatcher
+            for input_batch in self.primary_input.batches(it.primary_iterator):
+                n_pad = dispatcher.elastic_padding_size()
+                yield jax.tree.map_with_path(
+                    lambda path, x: _pad_examples(path, x, n_pad), input_batch
+                )
+        elif self.is_in_elastic_mode:
             dispatcher: ElasticSpmdInputDispatcher = self.elastic_input.input_dispatcher
 
             def _padded_select(path, x, y):
@@ -359,26 +453,12 @@ class ElasticInput(input_base.Input):
                 )
                 stop = start + dispatcher.elastic_feed_mini_batch_size
 
-                n_pad = stop - y.shape[0]
-                if n_pad > 0:
-                    # Note that the batch size might not be dividable of the
-                    # padding size For example, a batch size of 5 might be split
-                    # into 3 groups each of size 2, 2, 1. To ensure that each
-                    # padding share the same size, we need to expand the batch
-                    # from 5 to 6.
-                    if jax.tree_util.keystr(path, simple=True) == "target_labels":
-                        y = np.pad(
-                            y,
-                            [(0, n_pad)] + [(0, 0)] * (y.ndim - 1),
-                            "constant",
-                            constant_values=-1,
-                        )
-                    else:
-                        y = np.pad(
-                            y,
-                            [(0, n_pad)] + [(0, 0)] * (y.ndim - 1),
-                            "edge",
-                        )
+                # Note that the batch size might not be dividable of the
+                # padding size For example, a batch size of 5 might be split
+                # into 3 groups each of size 2, 2, 1. To ensure that each
+                # padding share the same size, we need to expand the batch
+                # from 5 to 6.
+                y = _pad_examples(path, y, stop - y.shape[0])
                 return np.concatenate([x, y[start:stop]], axis=0)
 
             elastic_batch_iter = (
@@ -401,8 +481,11 @@ class ElasticInput(input_base.Input):
 
 
 def slice_count() -> int:
-    """Returns the number of slices."""
-    return len(set(d.slice_index for d in jax.devices() if hasattr(d, "slice_index"))) or 1
+    """Returns the number of (live) slices."""
+    return (
+        len(set(d.slice_index for d in elastic_utils.live_devices() if hasattr(d, "slice_index")))
+        or 1
+    )
 
 
 def process_count_per_slice() -> int:
@@ -411,7 +494,7 @@ def process_count_per_slice() -> int:
         len(
             set(
                 d.process_index
-                for d in jax.devices()
+                for d in elastic_utils.live_devices()
                 if hasattr(d, "slice_index") and d.slice_index == 0
             )
         )

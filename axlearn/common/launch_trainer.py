@@ -187,9 +187,15 @@ def get_trainer_config(
     if trainer_config.log_every_n_steps is None:
         trainer_config.log_every_n_steps = flag_values.trainer_log_every_n_steps
     if flag_values.elastic_enabled:
-        from axlearn.common.checkpointer import Checkpointer, every_n_steps_policy  # pylint: disable=import-outside-toplevel
-        from axlearn.common.checkpointer_orbax import OrbaxCheckpointer  # pylint: disable=import-outside-toplevel
-        from axlearn.common.snapshot import Snapshotter  # pylint: disable=import-outside-toplevel
+        # pylint: disable=import-outside-toplevel
+        from axlearn.common import elastic_utils
+        from axlearn.common.checkpointer import Checkpointer, every_n_steps_policy
+        from axlearn.common.checkpointer_orbax import OrbaxCheckpointer
+        from axlearn.common.elastic_input import ElasticInput, ElasticSpmdInputDispatcher
+        from axlearn.common.input_dispatch import SpmdInputDispatcher
+        from axlearn.common.snapshot import Snapshotter
+
+        # pylint: enable=import-outside-toplevel
 
         trainer_config.set(
             elastic_enabled=True,
@@ -197,6 +203,17 @@ def get_trainer_config(
             elastic_timeout_seconds=flag_values.elastic_timeout_seconds,
             elastic_max_retries=flag_values.elastic_max_retries,
         )
+        # On Pathways, keep the global batch constant across elastic events with `ElasticInput`
+        # (McJAX configs set it up explicitly, with `num_max_slices`).
+        dispatcher = getattr(trainer_config.input, "input_dispatcher", None)
+        if elastic_utils.ensure_elastic_manager_initialized(True) is not None and isinstance(
+            dispatcher, SpmdInputDispatcher.Config
+        ):
+            trainer_config.input.input_dispatcher = ElasticSpmdInputDispatcher.default_config().set(
+                global_logical_batch_size=dispatcher.global_logical_batch_size,
+                partition_spec=dispatcher.partition_spec,
+            )
+            trainer_config.input = ElasticInput.default_config().set(input=trainer_config.input)
         if getattr(trainer_config.checkpointer, "klass", None) is Checkpointer:
             trainer_config.checkpointer = OrbaxCheckpointer.default_config().set(
                 save_policy=trainer_config.checkpointer.save_policy,

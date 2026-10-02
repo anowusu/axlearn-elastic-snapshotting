@@ -19,8 +19,8 @@ from jax import numpy as jnp
 from jax.experimental import multihost_utils
 from jax.experimental.pjit import pjit
 
-from axlearn.common import file_system as fs
 from axlearn.common import elastic_utils, measurement, utils
+from axlearn.common import file_system as fs
 from axlearn.common.base_layer import ParameterSpec
 from axlearn.common.base_model import BaseModel
 from axlearn.common.checkpointer import BaseCheckpointer, Checkpointer
@@ -35,6 +35,7 @@ from axlearn.common.config import (
     maybe_instantiate,
     maybe_set_config,
 )
+from axlearn.common.elastic_input import ElasticInput
 from axlearn.common.evaler import SpmdEvaler
 from axlearn.common.input_base import Input
 from axlearn.common.learner import Learner
@@ -482,12 +483,18 @@ class SpmdTrainer(Module):
             # pylint: disable-next=import-outside-toplevel
             from axlearn.common import gradient_accumulation as ga
 
-            steps = elastic_utils.grad_accumulation_steps(self._base_grad_accum_steps)
+            # `ElasticInput` keeps the global batch constant by growing the per-device batch.
+            steps = elastic_utils.grad_accumulation_steps(
+                self._base_grad_accum_steps,
+                device_batch_sizes=(
+                    self.input.device_batch_sizes if isinstance(self.input, ElasticInput) else None
+                ),
+            )
             fwd_cfg = config_for_function(ga.with_minibatch_steps).set(steps=steps, metric_accumulator=ga.MetricAccumulator.default_config()) if steps > 0 else None
             self.learner._forward_fn_transformation = maybe_instantiate(fwd_cfg) if fwd_cfg else (lambda fn: fn)  # pylint: disable=protected-access
             self._mesh = jax.sharding.Mesh(utils.create_device_mesh(mesh_shape=self._config.mesh_shape, devices=live_devs), self._config.mesh_axis_names)
             self._mesh.__enter__()
-            self._step_log("[ELASTIC][SCALE] devices=%s Reconfigured mesh: %s", len(live_devs), self._mesh)
+            self._step_log("[ELASTIC][SCALE] devices=%s minibatch_steps=%s Reconfigured mesh: %s", len(live_devs), steps, self._mesh)
             with self.mesh():
                 self._trainer_state_partition_specs = jax.tree.map(lambda spec: spec.sharding, self._trainer_state_specs)
                 self._compiled_train_step = None
