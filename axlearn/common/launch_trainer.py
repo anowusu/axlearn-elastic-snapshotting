@@ -113,6 +113,14 @@ flags.DEFINE_string(
     None,
     "The mesh selector string. See `SpmdTrainer.Config.mesh_rules` for details.",
 )
+flags.DEFINE_bool("enable_elastic_training", False, "Enable elastic training.")
+flags.DEFINE_integer("minimum_slice_count", None, "Minimum active slices required.")
+flags.DEFINE_integer("maximum_slice_count", None, "Maximum slices configured.")
+flags.DEFINE_integer("num_elastic_slices", 1, "Minimum active slices required.")
+flags.DEFINE_integer("elastic_pause_timeout_seconds", 300, "Elastic pause timeout.")
+flags.DEFINE_enum("elastic_restore_mode", "snapshot", ["snapshot", "checkpoint"], "Restore mode.")
+flags.DEFINE_integer("elastic_snapshot_every_n_steps", None, "Snapshot frequency in steps.")
+flags.DEFINE_integer("save_every_n_steps", None, "Checkpoint frequency in steps.")
 
 FLAGS = flags.FLAGS
 
@@ -170,6 +178,36 @@ def get_trainer_config(
         )
     if trainer_config.log_every_n_steps is None:
         trainer_config.log_every_n_steps = flag_values.trainer_log_every_n_steps
+    if flag_values.enable_elastic_training or any(
+        flag_values[k].present
+        for k in ("num_elastic_slices", "elastic_snapshot_every_n_steps", "minimum_slice_count")
+    ):
+        from axlearn.common.checkpointer import Checkpointer, every_n_steps_policy  # pylint: disable=import-outside-toplevel
+        from axlearn.common.checkpointer_orbax import OrbaxCheckpointer  # pylint: disable=import-outside-toplevel
+        from axlearn.common.snapshot import Snapshotter  # pylint: disable=import-outside-toplevel
+
+        trainer_config.set(
+            enable_elastic_training=True,
+            minimum_slice_count=flag_values.minimum_slice_count or int(flag_values.num_elastic_slices),
+        )
+        if getattr(trainer_config.checkpointer, "klass", None) is Checkpointer:
+            trainer_config.checkpointer = OrbaxCheckpointer.default_config().set(
+                save_policy=trainer_config.checkpointer.save_policy,
+                keep_last_n=trainer_config.checkpointer.keep_last_n,
+                keep_period=trainer_config.checkpointer.keep_every_n_steps,
+                max_concurrent_save_gb=16,
+            )
+        if flag_values.elastic_restore_mode == "snapshot":
+            trainer_config.snapshotter = Snapshotter.default_config().set(
+                save_policy=every_n_steps_policy(int(flag_values.elastic_snapshot_every_n_steps or 5))
+            )
+    if flag_values.save_every_n_steps is not None:
+        n = int(flag_values.save_every_n_steps)
+        if hasattr(trainer_config.checkpointer.save_policy, "n"):
+            trainer_config.checkpointer.save_policy.set(n=n, min_step=n)
+        for k in ("keep_every_n_steps", "keep_period"):
+            if hasattr(trainer_config.checkpointer, k):
+                setattr(trainer_config.checkpointer, k, n)
     for eval_cfg in trainer_config.evalers.values():
         eval_cfg.trace_at_iters = [int(el) for el in flag_values.eval_trace_at_iters]
     if flag_values.device_monitor == "tpu":

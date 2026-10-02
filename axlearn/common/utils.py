@@ -1797,7 +1797,7 @@ def create_device_mesh(
         NotImplementedError: If not all devices have the same platform.
     """
     if devices is None:
-        devices = jax.devices()
+        devices = live_devices()
     devices = np.asarray(devices)
 
     # Check if the devices are part of a multi-granule configuration.
@@ -1809,7 +1809,7 @@ def create_device_mesh(
         raise NotImplementedError(f"Not all devices had platform: {device_platform}.")
 
     num_granules = (
-        max(getattr(el, device_attr) for el in devices.flatten()) + 1 if is_multi_granule_env else 1
+        len({getattr(el, device_attr) for el in devices.flatten()}) if is_multi_granule_env else 1
     )
     num_devices = len(devices)
     assert num_devices % num_granules == 0, (
@@ -1908,7 +1908,7 @@ def infer_mesh_shape(mesh_shape: MeshShape, *, num_devices: Optional[int] = None
     # Handle the case with one -1.
     prod = math.prod(mesh_shape, start=-1)
     if num_devices is None:
-        num_devices = len(jax.devices())
+        num_devices = len(live_devices())
     if num_devices % prod != 0:
         raise ValueError(
             f"Unable to infer -1 in mesh shape {mesh_shape} as num_devices {num_devices} "
@@ -2170,3 +2170,11 @@ def get_tpu_dot_precision(dtype) -> jax.lax.Precision:
     if dtype == jnp.bfloat16:
         return jax.lax.Precision.DEFAULT
     raise ValueError(f"Unsupported dtype {dtype}")
+
+
+elastic_manager: Any = None
+
+
+def live_devices() -> list[jax.Device]:
+    active = getattr(elastic_manager, "active_slice_indices", None)
+    return [d for d in jax.devices() if not active or getattr(d, "slice_index", 0) in active]
