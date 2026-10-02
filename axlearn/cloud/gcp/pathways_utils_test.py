@@ -241,10 +241,10 @@ class PathwaysReplicatedJobTest(TestCase):
                 "test-service-account@test-project.iam.gserviceaccount.com",
                 annotations.get("tpu-provisioner.cloud.google.com/node-service-account", None),
             )
-            self.assertIn("--tpu_pinned_host_allocation_recycle=true", worker_container["args"])
-            # 32GiB or 128GiB
+            self.assertIn("--tpu_pinned_host_allocation_recycle=false", worker_container["args"])
+            # 32GiB or 64GiB
             buffer_size = (
-                34359738368 if _COLOCATED_PYTHON_SIDECAR_NAME in sidecars else 137438953472
+                34359738368 if _COLOCATED_PYTHON_SIDECAR_NAME in sidecars else 68719476736
             )
             self.assertIn(f"--tpu_premapped_buffer_size={buffer_size}", worker_container["args"])
 
@@ -712,7 +712,7 @@ class PathwaysLeaderWorkerTemplateTest(TestCase):
             self.assertEqual(container["image"], server_image)
             num_args = 6 if _COLOCATED_PYTHON_SIDECAR_NAME in sidecars else 5
             self.assertEqual(len(container["args"]), num_args)
-            self.assertIn("--tpu_pinned_host_allocation_recycle=true", container["args"])
+            self.assertIn("--tpu_pinned_host_allocation_recycle=false", container["args"])
             premapped_buffer_args = [
                 a for a in container["args"] if a.startswith("--tpu_premapped_buffer_size=")
             ]

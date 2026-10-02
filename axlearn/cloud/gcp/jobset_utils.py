@@ -1043,6 +1043,11 @@ class TPUJobBuilder(SingleReplicatedJob):
             volumes=volumes,
         )
 
+        # Pathways elastic training on GKE multi-slice TPU clusters requires direct host networking
+        # for cross-slice gRPC health checks (DefaultSliceHealthChecker) and maximum DCN bandwidth.
+        spec["hostNetwork"] = True
+        spec["dnsPolicy"] = "ClusterFirstWithHostNet"
+
         if cfg.priority_class:
             spec["priorityClassName"] = cfg.priority_class
 
