@@ -21,6 +21,7 @@
 """
 
 import contextlib
+import functools
 import os
 from typing import Optional, Sequence
 
@@ -28,12 +29,17 @@ import jax
 from absl import flags, logging
 from ml_goodput_measurement import goodput
 from ml_goodput_measurement import monitoring as goodput_monitoring
+try:
+    from ml_goodput_measurement.src import goodput_elastic, monitoring_elastic
+except ImportError:
+    goodput_elastic = monitoring_elastic = None
 
 from axlearn.cloud.common.utils import parse_kv_flags, to_bool
 from axlearn.common import measurement_base
 from axlearn.common.config import REQUIRED, Required, config_class, maybe_set_config
 
 
+@measurement_base.register_recorder("goodput_elastic")
 @measurement_base.register_recorder("goodput")
 class GoodputRecorder(measurement_base.Recorder):
     """Records overall training goodput."""
@@ -160,13 +166,12 @@ class GoodputRecorder(measurement_base.Recorder):
             return
         try:
             if self._monitor is None:
-                self._monitor = goodput_monitoring.GoodputMonitor(
+                self._monitor = (monitoring_elastic.ElasticGoodputMonitor if self._recorder is not None else functools.partial(goodput_monitoring.GoodputMonitor, pathway_enabled=self.config.jax_backend == "proxy"))(
                     job_name=self._job_name,
                     logger_name=self._logger_name,
                     tensorboard_dir=self.config.upload_dir,
                     upload_interval=self.config.upload_interval,
                     monitoring_enabled=True,
-                    pathway_enabled=self.config.jax_backend == "proxy",
                     include_badput_breakdown=True,
                 )
 
@@ -193,13 +198,12 @@ class GoodputRecorder(measurement_base.Recorder):
                 rolling_window_tensorboard_dir = os.path.join(
                     self.config.upload_dir, f"rolling_window_{self.config.name}"
                 )
-                self._rolling_window_monitor = goodput_monitoring.GoodputMonitor(
+                self._rolling_window_monitor = (monitoring_elastic.ElasticGoodputMonitor if self._recorder is not None else functools.partial(goodput_monitoring.GoodputMonitor, pathway_enabled=self.config.jax_backend == "proxy"))(
                     job_name=self._job_name,
                     logger_name=self._logger_name,
                     tensorboard_dir=rolling_window_tensorboard_dir,
                     upload_interval=self.config.upload_interval,
                     monitoring_enabled=True,
-                    pathway_enabled=self.config.jax_backend == "proxy",
                     include_badput_breakdown=True,
                 )
             self._rolling_window_monitor.start_rolling_window_goodput_uploader(
@@ -232,7 +236,7 @@ class GoodputRecorder(measurement_base.Recorder):
         # Lazily instantiate the recorder. This avoids invoking jax before setup is complete.
         if self._recorder is None:
             cfg: GoodputRecorder.Config = self.config
-            self._recorder = goodput.GoodputRecorder(
+            self._recorder = goodput_elastic.ElasticGoodputRecorder(
                 job_name=cfg.name,
                 logger_name=f"goodput_logger_{cfg.name}",
                 logging_enabled=(jax.process_index() == 0),
@@ -260,6 +264,14 @@ class GoodputRecorder(measurement_base.Recorder):
             self._recorder.record_custom_badput_event_start_time(*args, **kwargs)
         elif event == measurement_base.Event.END_CUSTOM_BADPUT_EVENT:
             self._recorder.record_custom_badput_event_end_time(*args, **kwargs)
+        elif fn := {
+            measurement_base.Event.START_ELASTIC_WAIT: self._recorder.record_elastic_wait_start_time,
+            measurement_base.Event.END_ELASTIC_WAIT: self._recorder.record_elastic_wait_end_time,
+            measurement_base.Event.START_ELASTIC_REINIT: self._recorder.record_elastic_reinit_start_time,
+            measurement_base.Event.END_ELASTIC_REINIT: self._recorder.record_elastic_reinit_end_time,
+            measurement_base.Event.RECORD_SLICE_COUNTS: self._recorder.record_elastic_slice_counts,
+        }.get(event):
+            fn(*args, **kwargs)
         else:
             logging.log_first_n(
                 logging.WARNING,
