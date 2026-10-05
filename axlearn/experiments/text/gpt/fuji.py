@@ -15,6 +15,7 @@ import functools
 import itertools
 from typing import Any, List, NamedTuple, Optional, Union
 
+import jax
 from jax.ad_checkpoint import checkpoint_policies as jax_remat_policies
 
 from axlearn.common import causal_lm, config
@@ -49,6 +50,7 @@ from axlearn.common.trainer_config_modifier import (
     RematSpecModifier,
 )
 from axlearn.common.utils import (
+    HybridMeshShape,
     combine_remat_policies,
     extended_checkpoint_policies,
     save_and_offload_only_these_names_regex,
@@ -282,7 +284,7 @@ def get_trainer_kwargs(
     tokens_per_batch = TOKENS_PER_BATCH[version]
     max_step = TOTAL_TOKENS[version][model_size] // tokens_per_batch
     max_sequence_length = MAX_SEQUENCE_LENGTH[version]
-    train_batch_size = tokens_per_batch // max_sequence_length
+    train_batch_size = len(jax.devices())
 
     # Whether to use grouped query attention.
     num_kv_heads = None
@@ -435,20 +437,24 @@ def get_trainer_kwargs(
                     ),
                 ),
                 (
-                    "tpu-v5litepod-256-2",
+                    "tpu-v5litepod-32",
                     ChainConfigModifier.default_config().set(
                         config_modifiers=[
                             MeshShapeModifier.default_config().set(
-                                mesh_shape=mesh_shape_from_axes(data=-1, fsdp=256)
+                                mesh_shape=HybridMeshShape(
+                                    ici_mesh_shape=mesh_shape_from_axes(fsdp=-1),
+                                    dcn_mesh_shape=mesh_shape_from_axes(data=-1),
+                                )
                             ),
                             RematSpecModifier.default_config().set(
                                 remat_policies={
                                     "model.decoder.transformer.layer": RematSpec(
-                                        prevent_cse=False,
-                                        policy=offload_dots_saveable_policy,
+                                        prevent_cse=True,
+                                        policy=jax_remat_policies.nothing_saveable,
                                     ),
                                 }
                             ),
+                            FlashBlockSizeModifier.default_config().set(tpu_block_size=256),
                         ],
                     ),
                 ),
@@ -702,26 +708,24 @@ def get_trainer_kwargs(
                     ChainConfigModifier.default_config().set(
                         config_modifiers=[
                             MeshShapeModifier.default_config().set(
-                                mesh_shape=mesh_shape_from_axes(fsdp=-1)
+                                mesh_shape=HybridMeshShape(
+                                    ici_mesh_shape=mesh_shape_from_axes(fsdp=-1),
+                                    dcn_mesh_shape=mesh_shape_from_axes(data=-1),
+                                )
                             ),
                             RematSpecModifier.default_config().set(
                                 remat_policies={
                                     "model.decoder.transformer.layer": RematSpec(
                                         prevent_cse=False,
-                                        policy=config_for_function(
-                                            save_and_offload_only_these_names_regex
-                                        ).set(
-                                            names_which_can_be_saved=(
-                                                RematRegexSavePatterns.QKV_PROJ.value
-                                            ),
-                                            names_which_can_be_offloaded=(
-                                                RematRegexSavePatterns.INPUT.value
-                                            ),
-                                            offload_src="device",
-                                            offload_dst="pinned_host",
-                                        ),
+                                        policy=jax_remat_policies.dots_saveable,
                                     ),
                                 }
+                            ),
+                            PartitionSpecModifier.default_config().set(
+                                partition_specs={
+                                    k: {"param_partition_spec": ("model", ("expert", "fsdp", "seq"))}
+                                    for k in ("model.decoder.emb.token_emb", "model.decoder.lm_head")
+                                },
                             ),
                         ],
                     ),
@@ -964,15 +968,24 @@ def get_trainer_kwargs(
                                     ),
                                 }
                             ),
+                            PartitionSpecModifier.default_config().set(
+                                partition_specs={
+                                    k: {"param_partition_spec": ("model", ("expert", "fsdp", "seq"))}
+                                    for k in ("model.decoder.emb.token_emb", "model.decoder.lm_head")
+                                },
+                            ),
                         ],
                     ),
                 ),
                 (
-                    "tpu-7x-.*",
+                    "tpu-v?7x-.*",
                     ChainConfigModifier.default_config().set(
                         config_modifiers=[
                             MeshShapeModifier.default_config().set(
-                                mesh_shape=mesh_shape_from_axes(data=-1, fsdp=256)
+                                mesh_shape=HybridMeshShape(
+                                    ici_mesh_shape=mesh_shape_from_axes(fsdp=-1),
+                                    dcn_mesh_shape=mesh_shape_from_axes(data=-1),
+                                )
                             ),
                             # Use the updated block size for Splash Attention
                             V7xFlashConfigModifier.default_config(),
@@ -1000,6 +1013,12 @@ def get_trainer_kwargs(
                                         ),
                                     ),
                                 }
+                            ),
+                            PartitionSpecModifier.default_config().set(
+                                partition_specs={
+                                    k: {"param_partition_spec": ("model", ("expert", "fsdp", "seq"))}
+                                    for k in ("model.decoder.emb.token_emb", "model.decoder.lm_head")
+                                },
                             ),
                         ],
                     ),
