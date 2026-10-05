@@ -60,7 +60,7 @@ _COLOCATED_CONTAINER_PORT = 50051
 # Pin to specific pathways image version for stable release.
 # There is no guarantee that this image will work with newer Jax releases.
 # Note: This image has been tested with both Jax 0.8.2 and Jax 0.9.0
-_PATHWAYS_IMAGE_TAG = "20260128-jax_0.9.0"
+_PATHWAYS_IMAGE_TAG = "20260702-jax_0.8.3"
 # The docker image used by pathways proxy container.
 _PATHWAYS_PROXY_IMAGE = (
     f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server:{_PATHWAYS_IMAGE_TAG}"
@@ -348,15 +348,16 @@ def _build_base_pathways_worker_container(
         f"--resource_manager_address={resource_manager_address}:"
         + f"{_PATHWAYS_RESOURCE_MANAGER_PORT}",
         f"--gcs_scratch_location={gcs_scratch_location}",
-        # Recycling host memory gives a slight increase in performance.
-        "--tpu_pinned_host_allocation_recycle=true",
+        # Disable recycling so that pinned host memory is allocated on demand and freed
+        # buffers (e.g. superseded elastic snapshots) do not accumulate in host DRAM.
+        "--tpu_pinned_host_allocation_recycle=false",
     ]
     if not colocated_python_plugin.is_colocated_python_enabled:
         args.append(
             # The flag below is needed for better H2D performance.
-            # We use 1/4 of the host memory, rounding up to power of 2 as premapped buffer.
+            # We use 1/8 of the host memory, rounding up to power of 2 as premapped buffer.
             # Note that pathways worker requires this flag to be a power of 2.
-            f"--tpu_premapped_buffer_size={round_up_to_power_of_2(host_memory // 4) * (1 << 30)}",
+            f"--tpu_premapped_buffer_size={round_up_to_power_of_2(host_memory // 8) * (1 << 30)}",
         )
     else:
         # Colocated python uses more host memory.
@@ -608,6 +609,9 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         cmd_args = [
             f"--resource_manager_address=localhost:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
             f"--server_port={_PATHWAYS_PROXY_PORT}",
+            # Allow every slice of this instance to be lost and replaced without failing the
+            # job, so that the trainer can pause and resume.
+            f"--num_elastic_slices={pathways_instance_count}",
         ]
         if self._colocated_python.is_colocated_python_enabled:
             cmd_args.append("--sidecar_name=external")
