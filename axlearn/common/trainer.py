@@ -19,8 +19,8 @@ from jax import numpy as jnp
 from jax.experimental import multihost_utils
 from jax.experimental.pjit import pjit
 
+from axlearn.common import elastic_utils, measurement, utils
 from axlearn.common import file_system as fs
-from axlearn.common import measurement, utils
 from axlearn.common.base_layer import ParameterSpec
 from axlearn.common.base_model import BaseModel
 from axlearn.common.checkpointer import BaseCheckpointer, Checkpointer
@@ -31,9 +31,11 @@ from axlearn.common.config import (
     InstantiableConfig,
     Required,
     config_class,
+    config_for_function,
     maybe_instantiate,
     maybe_set_config,
 )
+from axlearn.common.elastic_input import ElasticInput
 from axlearn.common.evaler import SpmdEvaler
 from axlearn.common.input_base import Input
 from axlearn.common.learner import Learner
@@ -149,6 +151,16 @@ class SpmdTrainer(Module):
         learner: Required[Learner.Config] = REQUIRED
         # The checkpointer config.
         checkpointer: BaseCheckpointer.Config = Checkpointer.default_config()
+        # In-memory snapshotter for fast recovery from elastic events. See `snapshot.Snapshotter`.
+        snapshotter: Optional[BaseCheckpointer.Config] = None
+        # Elastic training on Pathways (a no-op on McJAX). Names follow MaxText; see `elastic_utils`.
+        elastic_enabled: bool = False
+        # Minimum number of active slices to keep training on; -1 waits for all slices (pause and
+        # resume). With fewer slices the global batch is kept by gradient accumulation.
+        elastic_min_slice_count: int = -1
+        # Max seconds to wait for slices before each retry, and max retries (None: unlimited).
+        elastic_timeout_seconds: Optional[float] = None
+        elastic_max_retries: Optional[int] = None
         # A dict of evaler names to configs, each name must be non-empty.
         evalers: dict[str, SpmdEvaler.Config] = {}
 
@@ -267,6 +279,9 @@ class SpmdTrainer(Module):
         self._device_monitor = maybe_instantiate(cfg.device_monitor)
         self._recorder = maybe_instantiate(cfg.recorder)
         self._is_initialized: bool = False
+        self._init_prng_key: Optional[Tensor] = None
+        self._base_grad_accum_steps: int = getattr(getattr(cfg.learner, "forward_fn_transformation", None), "steps", 0) or 0
+        elastic_utils.ensure_elastic_manager_initialized(cfg.elastic_enabled)
         self._maybe_record_event(measurement.Event.START_ACCELERATOR_INIT)
 
         if cfg.model.dtype is None:
@@ -284,8 +299,12 @@ class SpmdTrainer(Module):
 
         # Create the device mesh.
         if devices is None:
+            elastic_utils.wait_for_slices()  # All slices must be active at startup.
+            self._sync_elastic_devices()
+            live_devs = elastic_utils.live_devices()
             self._step_log(
-                "Devices: global=%s local=%s %s",
+                "[ELASTIC][SCALE] devices=%s global=%s local=%s %s",
+                len(live_devs),
                 jax.device_count(),
                 jax.local_device_count(),
                 [device.platform for device in jax.local_devices()],
@@ -340,6 +359,8 @@ class SpmdTrainer(Module):
             self._add_child("learner", cfg.learner)
             cfg.checkpointer.dir = cfg.checkpointer.dir or os.path.join(cfg.dir, "checkpoints")
             self._add_child("checkpointer", cfg.checkpointer)
+            if cfg.snapshotter is not None:
+                self._add_child("snapshotter", cfg.snapshotter)
             if cfg.init_state_builder is not None:
                 self._add_child("init_state_builder", cfg.init_state_builder)
 
@@ -423,6 +444,79 @@ class SpmdTrainer(Module):
 
     def mesh(self):
         return jax.sharding.Mesh(self._mesh.devices, self._mesh.axis_names)
+
+    def _is_checkpoint_saving_in_progress(self) -> bool:
+        return getattr(getattr(self.checkpointer, "_manager", None), "is_saving_in_progress", lambda: False)()
+
+    def _sync_elastic_devices(self):
+        if (mgr := elastic_utils.elastic_manager) is None:
+            return
+        jax.config.update("jax_default_device", mgr.default_device)
+        self._maybe_record_event(
+            measurement.Event.RECORD_SLICE_COUNTS,
+            active_slices=mgr.active_slice_count,
+            total_slices=mgr.total_slice_count,
+            available_slices=mgr.active_slice_count,
+        )
+
+    def _on_elastic_event(self):
+        """Called by `elastic_utils.elastic_retry` right after a slice-down or scale-up event."""
+        self._trainer_state = None
+        self._maybe_record_event(measurement.Event.START_ELASTIC_WAIT, "elastic_wait")
+        if hasattr(self.checkpointer, "begin_elastic_drain"):
+            self.checkpointer.begin_elastic_drain()
+
+    def _restore_after_elastic_event(self):
+        """Called by `elastic_utils.elastic_retry` before each attempt, once slices are active.
+
+        Rebuilds the mesh on the live devices (keeping the global batch via gradient accumulation)
+        and restores the trainer state from the latest snapshot or checkpoint.
+        """
+        live_devs = elastic_utils.live_devices()
+        devices_changed = self._mesh is not None and {d.id for d in live_devs} != {d.id for d in self._mesh.devices.flat}
+        if self._trainer_state is not None and not devices_changed:
+            return
+        self._maybe_record_event(measurement.Event.END_ELASTIC_WAIT, "elastic_wait")
+        self._maybe_record_event(measurement.Event.START_ELASTIC_REINIT)
+        self._sync_elastic_devices()
+        if devices_changed:
+            # pylint: disable-next=import-outside-toplevel
+            from axlearn.common import gradient_accumulation as ga
+
+            # `ElasticInput` keeps the global batch constant by growing the per-device batch.
+            steps = elastic_utils.grad_accumulation_steps(
+                self._base_grad_accum_steps,
+                device_batch_sizes=(
+                    self.input.device_batch_sizes if isinstance(self.input, ElasticInput) else None
+                ),
+            )
+            fwd_cfg = config_for_function(ga.with_minibatch_steps).set(steps=steps, metric_accumulator=ga.MetricAccumulator.default_config()) if steps > 0 else None
+            self.learner._forward_fn_transformation = maybe_instantiate(fwd_cfg) if fwd_cfg else (lambda fn: fn)  # pylint: disable=protected-access
+            self._mesh = jax.sharding.Mesh(utils.create_device_mesh(mesh_shape=self._config.mesh_shape, devices=live_devs), self._config.mesh_axis_names)
+            self._mesh.__enter__()
+            self._step_log("[ELASTIC][SCALE] devices=%s minibatch_steps=%s Reconfigured mesh: %s", len(live_devs), steps, self._mesh)
+            with self.mesh():
+                self._trainer_state_partition_specs = jax.tree.map(lambda spec: spec.sharding, self._trainer_state_specs)
+                self._compiled_train_step = None
+                self._jit_train_step = self._pjit_train_step()
+        else:
+            self._step_log("[ELASTIC][SCALE] devices=%s unchanged; reusing mesh and compiled train step.", len(live_devs))
+        if hasattr(self.checkpointer, "reset_after_elastic_event"):
+            self.checkpointer.reset_after_elastic_event(devices_changed=devices_changed)
+        with self.mesh():
+            snap_step = self.snapshotter.latest_snapshot_step if "snapshotter" in self.children else None
+            ckpt_step = max(self.checkpointer.checkpoint_steps(self.checkpointer.config.dir), default=0) if hasattr(self.checkpointer, "checkpoint_steps") else 0
+            restored_step = (
+                self.restore_checkpoint(checkpointer=self.snapshotter)
+                if snap_step is not None and snap_step >= ckpt_step
+                else None
+            ) or self.restore_checkpoint()
+            if restored_step is None:
+                self.init(jnp.asarray(self._init_prng_key))
+                self._step = 0
+            if elastic_utils.elastic_manager and elastic_utils.elastic_manager.active_slice_count > 1:
+                self.save_snapshot(force=True)
+        self._maybe_record_event(measurement.Event.END_ELASTIC_REINIT)
 
     @contextlib.contextmanager
     def _watchdog(self):
@@ -592,6 +686,7 @@ class SpmdTrainer(Module):
             different types of values such as WeightedSummary, Tensor, or string, depending on
             the specific `metric_calculator` config of the evaler.
         """
+        self._init_prng_key = np.asarray(jax.device_get(prng_key))
         with (
             (
                 self._device_monitor.start_monitoring()
@@ -616,14 +711,15 @@ class SpmdTrainer(Module):
 
             self._is_initialized = True
 
-            with self.checkpointer:
-                logging.info("Starting loop...")
-                start_time = time.perf_counter()
-                num_steps = 0
-                output = None
-                stop_trace_step = None
+            logging.info("Starting loop...")
+            start_time = time.perf_counter()
+            num_steps = 0
+            output = None
+            stop_trace_step = None
+            input_iterator = self.input.batches(self._input_iter)
 
-                input_iterator = self.input.batches(self._input_iter)
+            def _step_loop():
+                nonlocal start_time, num_steps, output, stop_trace_step
                 while True:
                     self._maybe_record_event(measurement.Event.START_DATA_LOADING)
                     try:
@@ -667,6 +763,18 @@ class SpmdTrainer(Module):
                         # event.
                         self._maybe_record_event(measurement.Event.END_DATA_LOADING)
                         break
+
+            with (
+                self.checkpointer,
+                self.snapshotter if "snapshotter" in self.children else contextlib.nullcontext(),
+            ):
+                elastic_utils.elastic_retry(
+                    min_slice_count=cfg.elastic_min_slice_count,
+                    timeout_seconds=cfg.elastic_timeout_seconds,
+                    max_retries=cfg.elastic_max_retries,
+                    pre_callback=self._restore_after_elastic_event,
+                    on_elastic_event_callback=self._on_elastic_event,
+                )(_step_loop)()
                 if self.step < cfg.max_step:
                     self._step_log("Reached end of inputs. Stopping")
             self._step_log("Checkpointer flushed.")
@@ -920,6 +1028,7 @@ class SpmdTrainer(Module):
             # Note the default checkpointer and evaler do nothing at step 0 with min_step=1.
             self.save_checkpoint(self._run_eval())
 
+        self.save_snapshot(force=True)
         model_analysis = self._log_trainer_state_stats()
 
         # Log trainer state tree.
@@ -941,7 +1050,7 @@ class SpmdTrainer(Module):
         self._maybe_record_event(measurement.Event.END_TRAINING_PREPARATION)
         return True
 
-    def restore_checkpoint(self, restore_step: Optional[int] = None) -> Optional[int]:
+    def restore_checkpoint(self, restore_step: Optional[int] = None, *, checkpointer: Optional[BaseCheckpointer] = None) -> Optional[int]:
         """Restores trainer state from checkpoint.
 
         If successful, sets self._step and self._trainer_state to the restored step and state,
@@ -967,7 +1076,7 @@ class SpmdTrainer(Module):
             restore_input_iter = cfg.save_input_iterator
             try:
                 # Try to restore with `input_iter`.
-                step, ckpt_state = self.checkpointer.restore(
+                step, ckpt_state = (checkpointer or self.checkpointer).restore(
                     step=restore_step,
                     state=(
                         ckpt_state_spec_with_input_iter if restore_input_iter else ckpt_state_spec
@@ -985,6 +1094,8 @@ class SpmdTrainer(Module):
             # tensorflow when tensorflow dataset iterator checkpoints are not found
             # pylint: disable-next=broad-exception-caught
             except Exception as e:
+                if checkpointer is not None or isinstance(e, jax.errors.JaxRuntimeError):
+                    raise
                 logging.warning(
                     "Attempt to restore checkpoint with restore_input_iter=%s failed: %s",
                     restore_input_iter,
@@ -1014,16 +1125,20 @@ class SpmdTrainer(Module):
                     self._input_iter = ckpt_state["input_iter"]
             return step
 
-    def save_checkpoint(self, evaler_summaries: Optional[dict[str, Any]]) -> Optional[int]:
+    def save_checkpoint(self, evaler_summaries: Optional[dict[str, Any]] = None, *, checkpointer: Optional[BaseCheckpointer] = None, **kwargs) -> Optional[int]:
         """Saves a checkpoint (subject to checkpointer policy)."""
         cfg: SpmdTrainer.Config = self.config
         with self.mesh():
             ckpt_state = self._trainer_state._asdict()
             if cfg.save_input_iterator:
                 ckpt_state["input_iter"] = self._input_iter
-            self.checkpointer.save(
-                step=self.step, state=ckpt_state, evaler_summaries=evaler_summaries
+            (checkpointer or self.checkpointer).save(
+                step=self.step, state=ckpt_state, evaler_summaries=evaler_summaries, **kwargs
             )
+
+    def save_snapshot(self, evaler_summaries: Optional[dict[str, Any]] = None, *, force: bool = False):
+        if "snapshotter" in self.children and (force or not self._is_checkpoint_saving_in_progress()):
+            self.save_checkpoint(evaler_summaries, checkpointer=self.snapshotter, force=force)
 
     def _restore_from_builder(self) -> Optional[TrainerStateBuilder.State]:
         """Restores trainer state by building it with init_state_builder."""
@@ -1074,19 +1189,11 @@ class SpmdTrainer(Module):
             return self._compiled_train_step
         cfg: SpmdTrainer.Config = self.config
         # Get device kinds and assert that they are homogenous.
-        # TODO(markblee): Get devices from self._mesh.devices.
-        device_kinds = set(d.device_kind for d in jax.devices())
+        device_kinds = set(d.device_kind for d in self._mesh.devices.flat)
         if len(device_kinds) != 1:
             raise RuntimeError(f"Heterogenous device kinds ({device_kinds}) are not supported.")
         device_kind = device_kinds.pop()
-
-        mesh_shape = cfg.mesh_shape
-        if isinstance(mesh_shape, HybridMeshShape):
-            # Combine dcn_mesh_shape and ici_mesh_shape.
-            dcn_mesh_shape = mesh_shape.dcn_mesh_shape
-            ici_mesh_shape = mesh_shape.ici_mesh_shape
-            assert len(dcn_mesh_shape) == len(ici_mesh_shape)
-            mesh_shape = tuple(x * y for x, y in zip(dcn_mesh_shape, ici_mesh_shape))
+        mesh_shape = self._mesh.devices.shape
 
         options = infer_xla_performance_flags(
             mesh_shape=mesh_shape, mesh_axis_names=cfg.mesh_axis_names, device_kind=device_kind
@@ -1154,7 +1261,7 @@ class SpmdTrainer(Module):
         if self.step % n == 0 or 0 <= self.step <= 5:
             self._step_log(
                 "loss=%s aux=%s",
-                outputs["loss"],
+                outputs["loss"].item() if hasattr(outputs["loss"], "item") else outputs["loss"],
                 jax.tree.map(lambda x: x.item() if x.ndim == 0 else f"T{x.shape}", outputs["aux"]),
             )
 
@@ -1164,8 +1271,17 @@ class SpmdTrainer(Module):
             train_summaries=outputs["summaries"], force_runs=force_run_evals
         )
 
+        if (
+            elastic_utils.is_scale_up_event()
+            and self.step < self._config.max_step
+            and not self._is_checkpoint_saving_in_progress()
+        ):
+            self.save_snapshot(evaler_summaries=evaler_summaries, force=True)
+            self._step_log("[ELASTIC] New slice ready at step=%s; triggering scale-up", self.step)
+            raise elastic_utils.ScaleUpSignalError(f"Scale-up at step {self.step}")
         # Checkpointer policy will decide if we should save.
         self.save_checkpoint(evaler_summaries=evaler_summaries)
+        self.save_snapshot(evaler_summaries=evaler_summaries)
 
         return_dict = {"loss": outputs["loss"], "aux": outputs["aux"]}
         # Returns evaler_summaries if force_run_evals is not None or empty set.

@@ -113,6 +113,22 @@ flags.DEFINE_string(
     None,
     "The mesh selector string. See `SpmdTrainer.Config.mesh_rules` for details.",
 )
+# Elastic training flags (Pathways only, a no-op on McJAX). Names follow MaxText's `elastic_*`
+# config; see `axlearn.common.elastic_utils`.
+flags.DEFINE_bool("elastic_enabled", False, "Enables elastic training on the Pathways backend.")
+flags.DEFINE_integer(
+    "elastic_min_slice_count", -1, "Minimum active slices to train on; -1 waits for all slices."
+)
+flags.DEFINE_float("elastic_timeout_seconds", None, "Max seconds to wait for slices per retry.")
+flags.DEFINE_integer("elastic_max_retries", None, "Max retries after elastic events.")
+flags.DEFINE_enum(
+    "elastic_backup_kind",
+    "snapshot",
+    ["snapshot", "checkpoint"],
+    "Recover elastic events from an in-memory snapshot or from the last checkpoint.",
+)
+flags.DEFINE_integer("elastic_snapshot_every_n_steps", 5, "Snapshot frequency in steps.")
+flags.DEFINE_integer("save_every_n_steps", None, "Checkpoint frequency in steps.")
 
 FLAGS = flags.FLAGS
 
@@ -170,6 +186,52 @@ def get_trainer_config(
         )
     if trainer_config.log_every_n_steps is None:
         trainer_config.log_every_n_steps = flag_values.trainer_log_every_n_steps
+    if flag_values.elastic_enabled:
+        # pylint: disable=import-outside-toplevel
+        from axlearn.common import elastic_utils
+        from axlearn.common.checkpointer import Checkpointer, every_n_steps_policy
+        from axlearn.common.checkpointer_orbax import OrbaxCheckpointer
+        from axlearn.common.elastic_input import ElasticInput, ElasticSpmdInputDispatcher
+        from axlearn.common.input_dispatch import SpmdInputDispatcher
+        from axlearn.common.snapshot import Snapshotter
+
+        # pylint: enable=import-outside-toplevel
+
+        trainer_config.set(
+            elastic_enabled=True,
+            elastic_min_slice_count=flag_values.elastic_min_slice_count,
+            elastic_timeout_seconds=flag_values.elastic_timeout_seconds,
+            elastic_max_retries=flag_values.elastic_max_retries,
+        )
+        # On Pathways, keep the global batch constant across elastic events with `ElasticInput`
+        # (McJAX configs set it up explicitly, with `num_max_slices`).
+        dispatcher = getattr(trainer_config.input, "input_dispatcher", None)
+        if elastic_utils.ensure_elastic_manager_initialized(True) is not None and isinstance(
+            dispatcher, SpmdInputDispatcher.Config
+        ):
+            trainer_config.input.input_dispatcher = ElasticSpmdInputDispatcher.default_config().set(
+                global_logical_batch_size=dispatcher.global_logical_batch_size,
+                partition_spec=dispatcher.partition_spec,
+            )
+            trainer_config.input = ElasticInput.default_config().set(input=trainer_config.input)
+        if getattr(trainer_config.checkpointer, "klass", None) is Checkpointer:
+            trainer_config.checkpointer = OrbaxCheckpointer.default_config().set(
+                save_policy=trainer_config.checkpointer.save_policy,
+                keep_last_n=trainer_config.checkpointer.keep_last_n,
+                keep_period=trainer_config.checkpointer.keep_every_n_steps,
+                max_concurrent_save_gb=16,
+            )
+        if flag_values.elastic_backup_kind == "snapshot":
+            trainer_config.snapshotter = Snapshotter.default_config().set(
+                save_policy=every_n_steps_policy(flag_values.elastic_snapshot_every_n_steps)
+            )
+    if flag_values.save_every_n_steps is not None:
+        n = int(flag_values.save_every_n_steps)
+        if hasattr(trainer_config.checkpointer.save_policy, "n"):
+            trainer_config.checkpointer.save_policy.set(n=n, min_step=n)
+        for k in ("keep_every_n_steps", "keep_period"):
+            if hasattr(trainer_config.checkpointer, k):
+                setattr(trainer_config.checkpointer, k, n)
     for eval_cfg in trainer_config.evalers.values():
         eval_cfg.trace_at_iters = [int(el) for el in flag_values.eval_trace_at_iters]
     if flag_values.device_monitor == "tpu":
