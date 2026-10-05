@@ -482,9 +482,17 @@ def sync_restore_class_vars(
         with mesh:
             try:
                 t_load_pytree_start = time.perf_counter()
+                measurement.record_event(
+                    measurement.Event.START_CUSTOM_BADPUT_EVENT,
+                    custom_badput_event_type="snapshot_restore",
+                )
                 restored_trainer_state = snapshot_mgr.load_pytree(
                     abstract_state=fresh_trainer._trainer_state_specs,
                     reset_snapshot_state=False
+                )
+                measurement.record_event(
+                    measurement.Event.END_CUSTOM_BADPUT_EVENT,
+                    custom_badput_event_type="snapshot_restore",
                 )
                 logging.info(
                     "[ELASTIC] [TIMING] In-memory snapshot restore took %.3f seconds",

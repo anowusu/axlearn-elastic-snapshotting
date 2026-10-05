@@ -518,8 +518,19 @@ class SpmdTrainer(Module):
             if hasattr(self.input, "unbatched_dataset"):
                 try:
                     if SpmdTrainer._persistent_unbatched_input_iter is None:
+                        # T_input: same interval as the "Initial unbatched dataset iterator creation" log.
+                        self._maybe_record_event(
+                            measurement.Event.START_CUSTOM_BADPUT_EVENT,
+                            custom_badput_event_type="input_iterator_init",
+                        )
                         logging.info("[ELASTIC] Instantiating persistent unbatched dataset iterator...")
-                        SpmdTrainer._persistent_unbatched_input_iter = iter(self.input.unbatched_dataset())
+                        try:
+                            SpmdTrainer._persistent_unbatched_input_iter = iter(self.input.unbatched_dataset())
+                        finally:
+                            self._maybe_record_event(
+                                measurement.Event.END_CUSTOM_BADPUT_EVENT,
+                                custom_badput_event_type="input_iterator_init",
+                            )
                         logging.info(
                             "[ELASTIC] [TIMING] Initial unbatched dataset iterator creation took %.3f seconds",
                             time.perf_counter() - t_iter_start,
