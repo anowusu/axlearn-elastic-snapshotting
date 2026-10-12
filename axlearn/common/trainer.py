@@ -1137,7 +1137,7 @@ class SpmdTrainer(Module):
             )
 
     def save_snapshot(self, evaler_summaries: Optional[dict[str, Any]] = None, *, force: bool = False):
-        if "snapshotter" in self.children and (force or not self._is_checkpoint_saving_in_progress()):
+        if "snapshotter" in self.children:
             self.save_checkpoint(evaler_summaries, checkpointer=self.snapshotter, force=force)
 
     def _restore_from_builder(self) -> Optional[TrainerStateBuilder.State]:
