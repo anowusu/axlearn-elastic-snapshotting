@@ -4,6 +4,7 @@
 
 import copy
 import dataclasses
+import datetime
 import math
 
 # pylint: disable=no-self-use
@@ -33,6 +34,7 @@ from axlearn.common import (
     flax_struct_test,
     layers,
     learner,
+    measurement,
     optimizers,
     param_init,
     test_utils,
@@ -704,6 +706,65 @@ class TrainerTest(test_utils.TestCase):
                 expected_non_empty_keys
                 == {k for k, v in output["evaler_summaries"].items() if v is not None}
             )
+
+    def test_eval_goodput_events(self):
+        """Tests that EVAL is recorded only at the steps where an evaler runs."""
+        cfg = SpmdTrainer.default_config().set(name="test_eval_goodput_events_trainer")
+        cfg.dir = tempfile.mkdtemp()
+        cfg.mesh_axis_names = ("data", "model")
+        cfg.mesh_shape = (1, 1)
+        cfg.model = DummyModel.default_config().set(dtype=jnp.float32)
+        cfg.input = DummyInput.default_config()
+        cfg.learner = learner.Learner.default_config().set(
+            optimizer=config_for_function(optimizers.sgd_optimizer).set(
+                learning_rate=0.1, decouple_weight_decay=True
+            )
+        )
+        cfg.evalers = dict(
+            eval_dummy=SpmdEvaler.default_config().set(
+                input=DummyInput.default_config().set(total_num_batches=2),
+                eval_policy=config_for_function(eval_every_n_steps_policy).set(n=2),
+            )
+        )
+        cfg.max_step = 5
+        cfg.watchdog_timeout_seconds = 0.1
+        recorder = unittest.mock.MagicMock()
+        cfg.recorder = config_for_function(lambda: recorder)
+        trainer: SpmdTrainer = cfg.instantiate(parent=None)
+        trainer.run(prng_key=jax.random.PRNGKey(123))
+
+        eval_calls = [
+            c
+            for c in recorder.record.call_args_list
+            if c.kwargs.get("custom_badput_event_type") == "EVAL"
+        ]
+        # The evaler runs at steps 2 and 4 only.
+        self.assertEqual(
+            [c.args[0] for c in eval_calls],
+            [
+                measurement.Event.START_CUSTOM_BADPUT_EVENT,
+                measurement.Event.END_CUSTOM_BADPUT_EVENT,
+            ]
+            * 2,
+        )
+        for start in eval_calls[::2]:
+            self.assertIsInstance(start.kwargs["start_time"], datetime.datetime)
+        events = [c.args[0] for c in recorder.record.call_args_list]
+        self.assertEqual(1, events.count(measurement.Event.END_TRAINING_PREPARATION))
+
+        # A trainer restored at max_step stops during preparation, which must still end.
+        recorder.reset_mock()
+        trainer: SpmdTrainer = cfg.instantiate(parent=None)
+        self.assertIsNone(trainer.run(prng_key=jax.random.PRNGKey(123)))
+        events = [c.args[0] for c in recorder.record.call_args_list]
+        self.assertNotIn(measurement.Event.START_STEP, events)
+        self.assertEqual(
+            [
+                measurement.Event.START_TRAINING_PREPARATION,
+                measurement.Event.END_TRAINING_PREPARATION,
+            ],
+            [e for e in events if "TRAINING_PREPARATION" in e.value],
+        )
 
     def test_stop_on_exception(self):
         """Test that trainer exits cleanly if there's an exception in the main loop."""

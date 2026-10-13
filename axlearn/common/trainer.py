@@ -3,6 +3,7 @@
 """Defines SpmdTrainer, a trainer that supports partitioning of computation and data with GSPMD."""
 
 import contextlib
+import datetime
 import itertools
 import math
 import os.path
@@ -1061,6 +1062,7 @@ class SpmdTrainer(Module):
 
         if self.step >= cfg.max_step:
             self._step_log("Already reached max_step=%s. Stopping", cfg.max_step)
+            self._maybe_record_event(measurement.Event.END_TRAINING_PREPARATION)
             return False
 
         self._jit_train_step = self._pjit_train_step()
@@ -1316,9 +1318,7 @@ class SpmdTrainer(Module):
         force_runs: Optional[set[str]] = None,
     ) -> dict[str, Any]:
         """Runs evaluations and returns the corresponding summaries."""
-        self._maybe_record_event(
-            measurement.Event.START_CUSTOM_BADPUT_EVENT, custom_badput_event_type="EVAL"
-        )
+        eval_start_time = datetime.datetime.now(datetime.timezone.utc)
         evaler_summaries = {}
         # Note: we will use the same eval key as the training keys of the future step,
         # which should be okay.
@@ -1332,9 +1332,16 @@ class SpmdTrainer(Module):
                 force_run=bool(force_runs is not None and evaler_name in force_runs),
             )
             evaler_summaries[evaler_name] = summaries
-        self._maybe_record_event(
-            measurement.Event.END_CUSTOM_BADPUT_EVENT, custom_badput_event_type="EVAL"
-        )
+        # Only record EVAL if an evaler ran. Evalers return None summaries if they did not.
+        if any(summaries is not None for summaries in evaler_summaries.values()):
+            self._maybe_record_event(
+                measurement.Event.START_CUSTOM_BADPUT_EVENT,
+                custom_badput_event_type="EVAL",
+                start_time=eval_start_time,
+            )
+            self._maybe_record_event(
+                measurement.Event.END_CUSTOM_BADPUT_EVENT, custom_badput_event_type="EVAL"
+            )
         return evaler_summaries
 
     def _pjit_train_step(self) -> jax.stages.Wrapped:
