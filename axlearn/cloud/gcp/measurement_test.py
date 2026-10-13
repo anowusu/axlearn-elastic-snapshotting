@@ -8,6 +8,7 @@ from unittest import mock
 from absl import flags, logging
 from absl.testing import absltest, parameterized
 
+from axlearn.cloud.gcp import measurement as measurement_gcp
 from axlearn.cloud.gcp.measurement import GoodputRecorder
 from axlearn.common import measurement
 from axlearn.common.config import RequiredFieldMissingError
@@ -576,6 +577,80 @@ class GoodputRecorderTest(parameterized.TestCase):
             "orbax.checkpoint.logging.CloudLogger", side_effect=RuntimeError("no credentials")
         ):
             self.assertIsNone(recorder.checkpoint_logger())
+
+    @mock.patch("jax.process_index", return_value=0)
+    def test_record_end_job_flushes(self, _):
+        """Tests that goodput logs are flushed at the end of the job."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-flush", upload_dir="/test", upload_interval=30
+        )
+        recorder = GoodputRecorder(cfg)
+        # Flushing before any event is recorded is a no-op.
+        recorder.flush()
+        with mock.patch(
+            "ml_goodput_measurement.src.goodput_elastic.ElasticGoodputRecorder"
+        ) as mock_recorder_cls:
+            mock_instance = mock_recorder_cls.return_value
+            recorder.record(measurement.Event.START_JOB)
+            mock_instance.flush.assert_not_called()
+            recorder.record(measurement.Event.END_JOB)
+            mock_instance.record_job_end_time.assert_called_once()
+            mock_instance.flush.assert_called_once()
+            # `flush()` can also be called directly, e.g. on the exception path.
+            recorder.flush()
+            self.assertEqual(2, mock_instance.flush.call_count)
+
+    @mock.patch("jax.process_index", return_value=0)
+    def test_record_without_elastic_library(self, _):
+        """Tests the fallback when ml-goodput-measurement has no elastic recorder."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-no-elastic", upload_dir="/test", upload_interval=30
+        )
+        recorder = GoodputRecorder(cfg)
+        with (
+            mock.patch(f"{measurement_gcp.__name__}.goodput_elastic", None),
+            mock.patch(f"{measurement_gcp.__name__}.monitoring_elastic", None),
+            mock.patch("ml_goodput_measurement.goodput.GoodputRecorder") as mock_recorder_cls,
+            mock.patch("ml_goodput_measurement.monitoring.GoodputMonitor") as mock_monitor_cls,
+        ):
+            mock_instance = mock_recorder_cls.return_value
+            # The base recorder has neither the elastic methods nor `flush`.
+            del mock_instance.record_elastic_wait_start_time
+            del mock_instance.flush
+            recorder.record(measurement.Event.START_JOB)
+            mock_recorder_cls.assert_called_once()
+            # Elastic events are ignored instead of raising.
+            recorder.record(measurement.Event.START_ELASTIC_WAIT, "elastic_wait")
+            recorder.record(measurement.Event.END_JOB)
+            mock_instance.record_job_end_time.assert_called_once()
+            with recorder.maybe_monitor_all():
+                pass
+            mock_monitor_cls.assert_called_once()
+
+    @mock.patch("jax.process_index", return_value=0)
+    def test_maybe_monitor_all_reentrant(self, _):
+        """Tests that only the outermost monitoring context starts and stops the uploaders."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-reentrant", upload_dir="/test", upload_interval=30, rolling_window_size=[5]
+        )
+        recorder = GoodputRecorder(cfg)
+        with mock.patch("ml_goodput_measurement.monitoring.GoodputMonitor") as mock_monitor_cls:
+            mock_monitor = mock_monitor_cls.return_value
+            with recorder.maybe_monitor_all():
+                mock_monitor.start_goodput_uploader.assert_called_once()
+                with recorder.maybe_monitor_all():
+                    pass
+                # The inner context (e.g. `SpmdTrainer.run`) must not trigger the final upload
+                # before the outer one (e.g. `launch_trainer.run_trainer`) records END_JOB.
+                mock_monitor.stop_goodput_uploader.assert_not_called()
+                mock_monitor.stop_rolling_window_goodput_uploader.assert_not_called()
+            mock_monitor.start_goodput_uploader.assert_called_once()
+            mock_monitor.stop_goodput_uploader.assert_called_once()
+            mock_monitor.stop_rolling_window_goodput_uploader.assert_called_once()
+            # The recorder can be monitored again afterwards.
+            with recorder.maybe_monitor_all():
+                pass
+            self.assertEqual(2, mock_monitor.stop_goodput_uploader.call_count)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 """Tests trainer launch utilities."""
 
+import contextlib
 import copy
 from collections.abc import Sequence
 from typing import Optional
@@ -10,7 +11,7 @@ from unittest import mock
 from absl import flags
 from absl.testing import parameterized
 
-from axlearn.common import launch_trainer
+from axlearn.common import launch_trainer, measurement
 from axlearn.common.test_utils import TestCase
 
 
@@ -289,6 +290,69 @@ class ElasticFlagsTest(TestCase):
         self.assertEqual(cfg.snapshotter.stage_in_hbm, stage)
         self.assertEqual(cfg.elastic_snapshot_defer_during_checkpoint, defer)
         self.assertEqual(cfg.elastic_scale_grad_accumulation, scale)
+
+
+class RunTrainerTest(TestCase):
+    """Tests the goodput events of `run_trainer`."""
+
+    def _run_trainer(self, recorder: Optional[mock.MagicMock], *, run_side_effect=None):
+        """Runs `run_trainer` with a mock trainer and returns (output, ordered events)."""
+        events = []
+
+        @contextlib.contextmanager
+        def monitor_all():
+            events.append("monitor_start")
+            yield
+            events.append("monitor_stop")
+
+        if recorder is not None:
+            recorder.maybe_monitor_all.side_effect = monitor_all
+            recorder.record.side_effect = lambda event, *args, **kwargs: events.append(event)
+            recorder.flush.side_effect = lambda: events.append("flush")
+        trainer_config = mock.MagicMock()
+        trainer_config.instantiate.return_value.run.side_effect = run_side_effect
+        trainer_config.instantiate.return_value.run.return_value = "output"
+        with (
+            mock.patch.object(measurement, "global_recorder", recorder),
+            # Skip writing the config files.
+            mock.patch("jax.process_index", return_value=1),
+            mock.patch(f"{launch_trainer.__name__}.FLAGS") as mock_flags,
+        ):
+            mock_flags.trainer_prng_seed = 0
+            output = launch_trainer.run_trainer(trainer_config)
+        return output, events
+
+    def test_graceful_exit(self):
+        """Tests that END_JOB is recorded and flushed before the monitor's final upload."""
+        output, events = self._run_trainer(mock.MagicMock())
+        self.assertEqual("output", output)
+        self.assertEqual(
+            [
+                measurement.Event.START_JOB,
+                "monitor_start",
+                measurement.Event.END_JOB,
+                "flush",
+                "monitor_stop",
+            ],
+            events,
+        )
+
+    def test_exception(self):
+        """Tests that a failed job flushes its logs but does not record END_JOB."""
+        recorder = mock.MagicMock()
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            self._run_trainer(recorder, run_side_effect=RuntimeError("boom"))
+        self.assertEqual(
+            [measurement.Event.START_JOB], [c.args[0] for c in recorder.record.call_args_list]
+        )
+        recorder.flush.assert_called_once()
+        recorder.maybe_monitor_all.assert_called_once()
+
+    def test_without_recorder(self):
+        """Tests that `run_trainer` works without a recorder."""
+        output, events = self._run_trainer(None)
+        self.assertEqual("output", output)
+        self.assertEqual([], events)
 
 
 if __name__ == "__main__":

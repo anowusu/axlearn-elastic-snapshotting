@@ -23,7 +23,7 @@
 import contextlib
 import functools
 import os
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import jax
 from absl import flags, logging
@@ -108,6 +108,9 @@ class GoodputRecorder(measurement_base.Recorder):
         self._rolling_window_monitor: Optional[goodput_monitoring.GoodputMonitor] = None
         self._job_name = cfg.name
         self._logger_name = f"goodput_logger_{cfg.name}"
+        # Depth of active `maybe_monitor_all()` contexts. Only the outermost one starts and stops
+        # the uploaders, so that the final upload happens after the caller records END_JOB.
+        self._monitoring_depth = 0
 
     def checkpoint_logger(self) -> Optional[Any]:
         """Returns an Orbax logger that writes checkpoint statistics to the goodput log.
@@ -178,6 +181,15 @@ class GoodputRecorder(measurement_base.Recorder):
                     )
         # pylint: enable=try-except-raise
 
+    def _monitor_class(self) -> Callable[..., goodput_monitoring.GoodputMonitor]:
+        """Returns the goodput monitor class to instantiate."""
+        # Older ml-goodput-measurement releases have no elastic monitor.
+        if self._recorder is not None and monitoring_elastic is not None:
+            return monitoring_elastic.ElasticGoodputMonitor
+        return functools.partial(
+            goodput_monitoring.GoodputMonitor, pathway_enabled=self.config.jax_backend == "proxy"
+        )
+
     @contextlib.contextmanager
     def _maybe_monitor_goodput(self, *args, **kwargs):
         """Monitor cumulative goodput if enabled.
@@ -198,7 +210,7 @@ class GoodputRecorder(measurement_base.Recorder):
             return
         try:
             if self._monitor is None:
-                self._monitor = (monitoring_elastic.ElasticGoodputMonitor if self._recorder is not None else functools.partial(goodput_monitoring.GoodputMonitor, pathway_enabled=self.config.jax_backend == "proxy"))(
+                self._monitor = self._monitor_class()(
                     job_name=self._job_name,
                     logger_name=self._logger_name,
                     tensorboard_dir=self.config.upload_dir,
@@ -230,7 +242,7 @@ class GoodputRecorder(measurement_base.Recorder):
                 rolling_window_tensorboard_dir = os.path.join(
                     self.config.upload_dir, f"rolling_window_{self.config.name}"
                 )
-                self._rolling_window_monitor = (monitoring_elastic.ElasticGoodputMonitor if self._recorder is not None else functools.partial(goodput_monitoring.GoodputMonitor, pathway_enabled=self.config.jax_backend == "proxy"))(
+                self._rolling_window_monitor = self._monitor_class()(
                     job_name=self._job_name,
                     logger_name=self._logger_name,
                     tensorboard_dir=rolling_window_tensorboard_dir,
@@ -256,8 +268,19 @@ class GoodputRecorder(measurement_base.Recorder):
 
         @contextlib.contextmanager
         def monitor_goodput():
-            with goodput_monitor_manager, rolling_goodput_monitor_manager:
-                yield
+            # Re-entrant: only the outermost context starts and stops the uploaders, so that an
+            # inner one (e.g. `SpmdTrainer.run`) does not trigger the final upload before the
+            # outer one (e.g. `launch_trainer.run_trainer`) has recorded END_JOB.
+            outermost = self._monitoring_depth == 0
+            self._monitoring_depth += 1
+            try:
+                with contextlib.ExitStack() as stack:
+                    if outermost:
+                        stack.enter_context(goodput_monitor_manager)
+                        stack.enter_context(rolling_goodput_monitor_manager)
+                    yield
+            finally:
+                self._monitoring_depth -= 1
 
         return monitor_goodput()
 
@@ -268,7 +291,13 @@ class GoodputRecorder(measurement_base.Recorder):
         # Lazily instantiate the recorder. This avoids invoking jax before setup is complete.
         if self._recorder is None:
             cfg: GoodputRecorder.Config = self.config
-            self._recorder = goodput_elastic.ElasticGoodputRecorder(
+            # Older ml-goodput-measurement releases have no elastic recorder.
+            recorder_cls = (
+                goodput_elastic.ElasticGoodputRecorder
+                if goodput_elastic is not None
+                else goodput.GoodputRecorder
+            )
+            self._recorder = recorder_cls(
                 job_name=cfg.name,
                 logger_name=f"goodput_logger_{cfg.name}",
                 logging_enabled=(jax.process_index() == 0),
@@ -278,6 +307,7 @@ class GoodputRecorder(measurement_base.Recorder):
             self._recorder.record_job_start_time(*args, **kwargs)
         elif event == measurement_base.Event.END_JOB:
             self._recorder.record_job_end_time(*args, **kwargs)
+            self.flush()
         elif event == measurement_base.Event.START_STEP:
             self._recorder.record_step_start_time(*args, **kwargs)
         elif event == measurement_base.Event.START_ACCELERATOR_INIT:
@@ -296,14 +326,22 @@ class GoodputRecorder(measurement_base.Recorder):
             self._recorder.record_custom_badput_event_start_time(*args, **kwargs)
         elif event == measurement_base.Event.END_CUSTOM_BADPUT_EVENT:
             self._recorder.record_custom_badput_event_end_time(*args, **kwargs)
-        elif fn := {
-            measurement_base.Event.START_ELASTIC_WAIT: self._recorder.record_elastic_wait_start_time,
-            measurement_base.Event.END_ELASTIC_WAIT: self._recorder.record_elastic_wait_end_time,
-            measurement_base.Event.START_ELASTIC_REINIT: self._recorder.record_elastic_reinit_start_time,
-            measurement_base.Event.END_ELASTIC_REINIT: self._recorder.record_elastic_reinit_end_time,
-            measurement_base.Event.RECORD_SLICE_COUNTS: self._recorder.record_elastic_slice_counts,
+        elif method_name := {
+            measurement_base.Event.START_ELASTIC_WAIT: "record_elastic_wait_start_time",
+            measurement_base.Event.END_ELASTIC_WAIT: "record_elastic_wait_end_time",
+            measurement_base.Event.START_ELASTIC_REINIT: "record_elastic_reinit_start_time",
+            measurement_base.Event.END_ELASTIC_REINIT: "record_elastic_reinit_end_time",
+            measurement_base.Event.RECORD_SLICE_COUNTS: "record_elastic_slice_counts",
         }.get(event):
-            fn(*args, **kwargs)
+            if (fn := getattr(self._recorder, method_name, None)) is not None:
+                fn(*args, **kwargs)
+            else:
+                logging.log_first_n(
+                    logging.WARNING,
+                    "Ignoring elastic event %s: ml-goodput-measurement has no elastic recorder.",
+                    1,
+                    event,
+                )
         else:
             logging.log_first_n(
                 logging.WARNING,
@@ -311,6 +349,17 @@ class GoodputRecorder(measurement_base.Recorder):
                 1,
                 event,
             )
+
+    def flush(self):
+        """Flushes pending goodput log writes.
+
+        Logs are written asynchronously (ml-goodput-measurement >= 0.2), so call this before the
+        process exits, whether or not the job ended gracefully. A no-op on older versions.
+        """
+        if self._recorder is None:
+            return
+        if (flush := getattr(self._recorder, "flush", None)) is not None:
+            flush()
 
     def start_monitoring(self, **kwargs):
         """Deprecated: `start_monitoring()` is not used in GoodputRecorder.

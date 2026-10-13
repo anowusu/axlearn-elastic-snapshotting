@@ -114,8 +114,8 @@ To enable Goodput recording and monitoring on AXLearn, follow the example below.
 
 ### How to Monitor Rolling Window Goodput Metrics
 
-To enable rolling window metrics, set `enable_rolling_window_goodput_monitoring` to `True`
-and provide a list of interval sizes for `rolling_window_size` in seconds:
+To enable rolling window metrics, provide a list of interval sizes for `rolling_window_size`
+in seconds:
 
 ```bash
 axlearn gcp launch run --instance_type=tpu-v5litepod-16 \
@@ -126,9 +126,22 @@ axlearn gcp launch run --instance_type=tpu-v5litepod-16 \
         --recorder_spec=name=<unique-readable-name> \
         --recorder_spec=upload_dir=my-output-directory/summaries \
         --recorder_spec=upload_interval=30 \
-        --recorder_spec=enable_rolling_window_goodput_monitoring=True \
         --recorder_spec=rolling_window_size=86400,259200,432000
 ```
+
+### Recorder Spec Reference
+
+`--recorder_spec` accepts the following `key=value` pairs (see `GoodputRecorder.Config`):
+
+| Key | Default | Description |
+|---|---|---|
+| `name` | required | Job name. Must be unique per workload (see above). |
+| `upload_dir` | required | TensorBoard directory for the monitor. |
+| `upload_interval` | required | Seconds between monitor queries and uploads. |
+| `rolling_window_size` | empty | Comma-separated window sizes in seconds. Enables rolling window monitoring when set. |
+| `jax_backend` | none | Set to `proxy` on Pathways. |
+| `enable_monitoring` | `true` | Enables the background uploaders. Recording is always on. |
+| `enable_checkpoint_logging` | `true` | Logs Orbax checkpoint save/restore statistics to the goodput log (process 0 only). |
 
 ### Checkpoint Badput
 
@@ -139,6 +152,14 @@ writes through its logger. When the recorder is configured, `launch_trainer_main
 Logging log as the goodput recorder (`goodput_logger_<name>`), so the library and the dashboard
 pick these entries up automatically. Set `enable_checkpoint_logging=false` to opt out. The
 default `Checkpointer` (non-Orbax) does not report checkpoint statistics.
+
+### Job End and Flushing
+
+`launch_trainer.run_trainer` records `END_JOB` only when `SpmdTrainer.run` returns normally.
+A job that exits with an error or is preempted does not record an end, since a restart continues
+the same goodput timeline. Goodput logs are written asynchronously, so the recorder is flushed on
+every exit path (also on errors), and the monitor uploads its final data point only after
+`END_JOB` has been recorded.
 
 ### Visualize on Tensorboard
 
@@ -152,8 +173,7 @@ By default, when Goodput monitoring is enabled via the recorder, AXLearn automat
 -   **Cumulative Metrics** are enabled by default when you specify the `recorder_type`.
     To disable this, you would need to set `enable_gcp_goodput_metrics` to `False` in
     `goodput_monitoring.GCPOptions` within the `cloud/gcp/measurement.py` file.
--   **Rolling Window Metrics** can be explicitly enabled by setting
-    `enable_rolling_window_goodput_monitoring` to `True` and providing window sizes
+-   **Rolling Window Metrics** can be explicitly enabled by providing window sizes
     via `rolling_window_size`.
 
 You can enable either cumulative monitoring, rolling window monitoring, or both simultaneously.
@@ -168,7 +188,6 @@ You can enable either cumulative monitoring, rolling window monitoring, or both 
         --recorder_spec=name=<unique-readable-name> \
         --recorder_spec=upload_dir=my-output-directory/summaries \
         --recorder_spec=upload_interval=30 \
-        --recorder_spec=enable_rolling_window_goodput_monitoring=True \
         --recorder_spec=rolling_window_size=86400,604800
 ```
 
