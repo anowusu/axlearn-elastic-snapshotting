@@ -130,6 +130,16 @@ axlearn gcp launch run --instance_type=tpu-v5litepod-16 \
         --recorder_spec=rolling_window_size=86400,259200,432000
 ```
 
+### Checkpoint Badput
+
+ml-goodput-measurement computes `UNPRODUCTIVE_CHECKPOINT_SAVE_TIME` and
+`UNPRODUCTIVE_CHECKPOINT_RESTORE_TIME` from the statistics that Orbax's `CheckpointManager`
+writes through its logger. When the recorder is configured, `launch_trainer_main` sets
+`OrbaxCheckpointer.Config.logger` to an Orbax `CloudLogger` that writes to the same Cloud
+Logging log as the goodput recorder (`goodput_logger_<name>`), so the library and the dashboard
+pick these entries up automatically. Set `enable_checkpoint_logging=false` to opt out. The
+default `Checkpointer` (non-Orbax) does not report checkpoint statistics.
+
 ### Visualize on Tensorboard
 
 1. Requires packages: `tensorboard-plugin-profile`, `tensorflow` and `tensorboard`.

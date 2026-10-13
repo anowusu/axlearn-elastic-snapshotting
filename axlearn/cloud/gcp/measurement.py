@@ -23,7 +23,7 @@
 import contextlib
 import functools
 import os
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import jax
 from absl import flags, logging
@@ -59,6 +59,7 @@ class GoodputRecorder(measurement_base.Recorder):
                 docs/05-Goodput-Monitoring.md for more details.
             jax_backend: Jax backend type to infer Pathways environment.
             enable_monitoring: Whether to enable goodput monitoring/uploading.
+            enable_checkpoint_logging: Whether to log Orbax checkpoint statistics for goodput.
         """
 
         upload_dir: Required[str] = REQUIRED
@@ -67,6 +68,7 @@ class GoodputRecorder(measurement_base.Recorder):
         jax_backend: Optional[str] = None
         # Enable or disable monitoring. Recording is always enabled.
         enable_monitoring: bool = True
+        enable_checkpoint_logging: bool = True
 
     @classmethod
     def from_flags(cls, fv: flags.FlagValues) -> "GoodputRecorder":
@@ -82,6 +84,7 @@ class GoodputRecorder(measurement_base.Recorder):
             sizes in seconds.
         - jax_backend: The type of jax backend.
         - enable_monitoring: Boolean to enable/disable goodput monitoring (default: true).
+        - enable_checkpoint_logging: Boolean to enable/disable checkpoint logging (default: true).
         """
         cfg: measurement_base.Recorder.Config = cls.default_config()
         parsed_flags = parse_kv_flags(fv.recorder_spec, delimiter="=")
@@ -93,8 +96,9 @@ class GoodputRecorder(measurement_base.Recorder):
             parsed_flags["rolling_window_size"] = [
                 int(x) for x in parsed_flags["rolling_window_size"].split(",")
             ]
-        if "enable_monitoring" in parsed_flags:
-            parsed_flags["enable_monitoring"] = to_bool(parsed_flags["enable_monitoring"])
+        for key in ("enable_monitoring", "enable_checkpoint_logging"):
+            if key in parsed_flags:
+                parsed_flags[key] = to_bool(parsed_flags[key])
         return maybe_set_config(cfg, **parsed_flags).instantiate()
 
     def __init__(self, cfg):
@@ -104,6 +108,34 @@ class GoodputRecorder(measurement_base.Recorder):
         self._rolling_window_monitor: Optional[goodput_monitoring.GoodputMonitor] = None
         self._job_name = cfg.name
         self._logger_name = f"goodput_logger_{cfg.name}"
+
+    def checkpoint_logger(self) -> Optional[Any]:
+        """Returns an Orbax logger that writes checkpoint statistics to the goodput log.
+
+        ml-goodput-measurement computes the checkpoint badput from these statistics.
+
+        As in MaxText, every process logs its statistics; the library averages the entries of a
+        step across processes.
+
+        Returns:
+            An Orbax `CloudLogger`, or None if disabled or unavailable.
+        """
+        if not self.config.enable_checkpoint_logging:
+            return None
+        try:
+            # pylint: disable-next=import-outside-toplevel
+            from orbax.checkpoint import logging as ocp_logging
+
+            checkpoint_logger = ocp_logging.CloudLogger(
+                options=ocp_logging.CloudLoggerOptions(
+                    job_name=self._job_name, logger_name=self._logger_name
+                )
+            )
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logging.warning("Checkpoint goodput logging is disabled: %s", e)
+            return None
+        logging.info("Successfully set up checkpoint cloud logger: %s", self._logger_name)
+        return checkpoint_logger
 
     @contextlib.contextmanager
     def record_event(self, event: measurement_base.EventType, *args, **kwargs):

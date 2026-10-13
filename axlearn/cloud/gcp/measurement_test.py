@@ -59,6 +59,17 @@ class GoodputRecorderTest(parameterized.TestCase):
             expected_jax_backend=None,
             expected_enable_monitoring=False,
         ),
+        dict(
+            recorder_spec=[
+                "name=test-name",
+                "upload_dir=/test/path",
+                "upload_interval=15",
+                "enable_checkpoint_logging=false",
+            ],
+            expected_rolling_window_size=[],
+            expected_jax_backend=None,
+            expected_enable_checkpoint_logging=False,
+        ),
     )
     def test_from_flags(
         self,
@@ -66,6 +77,7 @@ class GoodputRecorderTest(parameterized.TestCase):
         expected_rolling_window_size,
         expected_jax_backend,
         expected_enable_monitoring=True,
+        expected_enable_checkpoint_logging=True,
     ):
         """Tests that flags are correctly parsed into the config."""
         mock_fv = mock.MagicMock(spec=flags.FlagValues)
@@ -80,6 +92,9 @@ class GoodputRecorderTest(parameterized.TestCase):
         self.assertEqual(expected_rolling_window_size, recorder.config.rolling_window_size)
         self.assertEqual(expected_jax_backend, recorder.config.jax_backend)
         self.assertEqual(expected_enable_monitoring, recorder.config.enable_monitoring)
+        self.assertEqual(
+            expected_enable_checkpoint_logging, recorder.config.enable_checkpoint_logging
+        )
 
     def test_from_flags_missing_required(self):
         """Tests that missing required flags raise an error."""
@@ -515,6 +530,52 @@ class GoodputRecorderTest(parameterized.TestCase):
             with recorder.maybe_monitor_all():
                 pass
             mock_monitor_cls.assert_not_called()
+
+    @parameterized.parameters(
+        dict(enable_checkpoint_logging=True, process_index=0, expect_logger=True),
+        dict(enable_checkpoint_logging=False, process_index=0, expect_logger=False),
+        # As in MaxText, every process logs its checkpoint statistics.
+        dict(enable_checkpoint_logging=True, process_index=1, expect_logger=True),
+    )
+    def test_checkpoint_logger(self, enable_checkpoint_logging, process_index, expect_logger):
+        """Tests that the checkpoint logger writes to the goodput log."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-ckpt-logger",
+            upload_dir="/test",
+            upload_interval=30,
+            enable_checkpoint_logging=enable_checkpoint_logging,
+        )
+        recorder = GoodputRecorder(cfg)
+        with (
+            mock.patch("jax.process_index", return_value=process_index),
+            mock.patch("orbax.checkpoint.logging.CloudLogger") as mock_logger_cls,
+            mock.patch.object(measurement_gcp.logging, "info") as mock_info,
+        ):
+            logger = recorder.checkpoint_logger()
+        if not expect_logger:
+            self.assertIsNone(logger)
+            mock_logger_cls.assert_not_called()
+            return
+        self.assertIs(mock_logger_cls.return_value, logger)
+        mock_info.assert_any_call(
+            "Successfully set up checkpoint cloud logger: %s", "goodput_logger_test-ckpt-logger"
+        )
+        options = mock_logger_cls.call_args.kwargs["options"]
+        # Same names as the goodput recorder, whose log the library reads.
+        self.assertEqual("test-ckpt-logger", options.job_name)
+        self.assertEqual("goodput_logger_test-ckpt-logger", options.logger_name)
+
+    @mock.patch("jax.process_index", return_value=0)
+    def test_checkpoint_logger_unavailable(self, _):
+        """Tests that no logger is returned if it cannot be created."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-ckpt-logger", upload_dir="/test", upload_interval=30
+        )
+        recorder = GoodputRecorder(cfg)
+        with mock.patch(
+            "orbax.checkpoint.logging.CloudLogger", side_effect=RuntimeError("no credentials")
+        ):
+            self.assertIsNone(recorder.checkpoint_logger())
 
 
 if __name__ == "__main__":

@@ -44,7 +44,7 @@ from axlearn.common.checkpointer import (
     maybe_restore_python_savables,
     maybe_save_python_savables,
 )
-from axlearn.common.config import config_class
+from axlearn.common.config import ConfigOr, config_class, maybe_instantiate
 from axlearn.common.module import Module
 from axlearn.common.utils import Nested, Tensor, TensorSpec
 
@@ -328,6 +328,27 @@ class _CheckpointManagerWithTrackerFile(ocp.CheckpointManager):
                 self.tracker_file_path.write_text(str(step))
 
 
+class _RestoreSafeLogger(ocp.logging.AbstractLogger):
+    """Wraps a logger so that failing to log restore statistics never fails the restore.
+
+    As in MaxText, logging restore statistics is auxiliary: errors are logged as warnings instead
+    of propagating out of `CheckpointManager.restore`. Other entries (e.g. save statistics) are
+    passed through unchanged.
+    """
+
+    def __init__(self, logger: ocp.logging.AbstractLogger):
+        self._logger = logger
+
+    def log_entry(self, entry: Any):
+        if not (isinstance(entry, dict) and entry.get("event_type") == "restore"):
+            self._logger.log_entry(entry)
+            return
+        try:
+            self._logger.log_entry(entry)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logging.warning("Failed to log checkpoint restore statistics: %s", e)
+
+
 class OrbaxCheckpointer(BaseCheckpointer):
     """A checkpointer that uses orbax CheckpointManager.
 
@@ -370,6 +391,8 @@ class OrbaxCheckpointer(BaseCheckpointer):
         skip_uncommitted_checkpoint: bool = True
         # Read only the latest checkpoint recorded in the tracker file if set to `True`
         read_latest_checkpoint_from_tracker_file: bool = False
+        # Optional logger of save/restore statistics, e.g. `GoodputRecorder.checkpoint_logger()`.
+        logger: Optional[ConfigOr[ocp.logging.AbstractLogger]] = None
 
     @classmethod
     def checkpoint_paths(cls, base_dir: str) -> List[str]:
@@ -436,6 +459,12 @@ class OrbaxCheckpointer(BaseCheckpointer):
             return is_save
 
         self._save_fn_with_summaries = save_fn_with_summaries
+        # Created once, since the manager is recreated on elastic events.
+        self._checkpoint_logger: Optional[ocp.logging.AbstractLogger] = maybe_instantiate(
+            cfg.logger
+        )
+        if self._checkpoint_logger is not None:
+            self._checkpoint_logger = _RestoreSafeLogger(self._checkpoint_logger)
         self._create_manager()
 
     def _create_manager(self):
@@ -492,6 +521,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
                     restore_concurrent_gb=cfg.max_concurrent_restore_gb,
                 ),
             },
+            logger=self._checkpoint_logger,
         )
 
     def begin_elastic_drain(self) -> threading.Event:
