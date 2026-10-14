@@ -183,9 +183,17 @@ class GoodputRecorder(measurement_base.Recorder):
 
     def _monitor_class(self) -> Callable[..., goodput_monitoring.GoodputMonitor]:
         """Returns the goodput monitor class to instantiate."""
-        # Older ml-goodput-measurement releases have no elastic monitor.
-        if self._recorder is not None and monitoring_elastic is not None:
-            return monitoring_elastic.ElasticGoodputMonitor
+        # Imported lazily: it imports pathwaysutils, which only elastic jobs need.
+        # pylint: disable-next=import-outside-toplevel
+        from axlearn.common import elastic_utils
+
+        # The trainer creates the elastic manager before monitoring starts. Older
+        # ml-goodput-measurement releases have no elastic monitor.
+        if monitoring_elastic is not None and elastic_utils.elastic_enabled():
+            # Also upload the slice efficiency computed from the slice counts, as MaxText does.
+            return functools.partial(
+                monitoring_elastic.ElasticGoodputMonitor, include_slice_efficiency=True
+            )
         return functools.partial(
             goodput_monitoring.GoodputMonitor, pathway_enabled=self.config.jax_backend == "proxy"
         )

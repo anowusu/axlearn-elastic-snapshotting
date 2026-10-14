@@ -64,6 +64,19 @@ def total_slice_count() -> Optional[int]:
     return None if elastic_manager is None else elastic_manager.total_slice_count
 
 
+def available_slice_count() -> Optional[int]:
+    """Returns the number of healthy slices, or None when not elastic or if the check fails."""
+    if elastic_manager is None:
+        return None
+    try:
+        return len(
+            elastic.get_active_slice_indices(slice_to_devices=elastic_manager.slice_to_devices)
+        )
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logging.warning("Failed to check the available slices: %s", e)
+        return None
+
+
 def wait_for_slices(slice_count: Optional[int] = None, *, poll_interval: float = 5):
     if elastic_manager is not None and elastic is not None:
         elastic_manager.active_slice_indices = elastic.wait_for_slices(

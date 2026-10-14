@@ -150,6 +150,20 @@ class ElasticUtilsTest(absltest.TestCase):
         elastic_utils.elastic_manager = _FakeManager(total=4, active=[0, 1])
         self.assertEqual(elastic_utils.total_slice_count(), 4)
 
+    def test_available_slice_count(self):
+        self.assertIsNone(elastic_utils.available_slice_count())
+        mgr = elastic_utils.elastic_manager = _FakeManager(total=4, active=[0])
+        mgr.slice_to_devices = {i: [] for i in range(4)}
+        with mock.patch.object(elastic_utils, "elastic") as mock_elastic:
+            mock_elastic.get_active_slice_indices.return_value = {0, 2, 3}
+            self.assertEqual(elastic_utils.available_slice_count(), 3)
+            mock_elastic.get_active_slice_indices.assert_called_once_with(
+                slice_to_devices=mgr.slice_to_devices
+            )
+            # A failing health check must not interrupt the elastic recovery.
+            mock_elastic.get_active_slice_indices.side_effect = RuntimeError("unreachable")
+            self.assertIsNone(elastic_utils.available_slice_count())
+
     def test_grad_accumulation_steps_with_device_batch_sizes(self):
         elastic_utils.elastic_manager = _FakeManager(total=2, active=[0])
         # The per-device batch grows from 8 to 16: 2 minibatches of 8.

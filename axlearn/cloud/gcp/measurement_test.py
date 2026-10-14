@@ -3,6 +3,7 @@
 """Tests measurement utils for GCP."""
 # pylint: disable=protected-access
 
+import contextlib
 from unittest import mock
 
 from absl import flags, logging
@@ -10,7 +11,7 @@ from absl.testing import absltest, parameterized
 
 from axlearn.cloud.gcp import measurement as measurement_gcp
 from axlearn.cloud.gcp.measurement import GoodputRecorder
-from axlearn.common import measurement
+from axlearn.common import elastic_utils, measurement
 from axlearn.common.config import RequiredFieldMissingError
 
 
@@ -651,6 +652,54 @@ class GoodputRecorderTest(parameterized.TestCase):
             with recorder.maybe_monitor_all():
                 pass
             self.assertEqual(2, mock_monitor.stop_goodput_uploader.call_count)
+
+    @parameterized.parameters(
+        dict(elastic=True, has_elastic_library=True, expect_elastic=True),
+        # A recorded event alone does not make a job elastic.
+        dict(elastic=False, has_elastic_library=True, expect_elastic=False),
+        dict(elastic=True, has_elastic_library=False, expect_elastic=False),
+    )
+    @mock.patch("jax.process_index", return_value=0)
+    def test_maybe_monitor_goodput_elastic(self, _, elastic, has_elastic_library, expect_elastic):
+        """Tests that elastic jobs use the elastic monitor, which uploads the slice efficiency."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-monitor", upload_dir="/test", upload_interval=30, rolling_window_size=[5]
+        )
+        recorder = GoodputRecorder(cfg)
+        with (
+            mock.patch.object(
+                elastic_utils, "elastic_manager", mock.MagicMock() if elastic else None
+            ),
+            mock.patch(
+                "ml_goodput_measurement.src.monitoring_elastic.ElasticGoodputMonitor"
+            ) as mock_elastic_cls,
+            mock.patch("ml_goodput_measurement.monitoring.GoodputMonitor") as mock_monitor_cls,
+            mock.patch("ml_goodput_measurement.src.goodput_elastic.ElasticGoodputRecorder"),
+            contextlib.ExitStack() as stack,
+        ):
+            if not has_elastic_library:
+                stack.enter_context(
+                    mock.patch(f"{measurement_gcp.__name__}.monitoring_elastic", None)
+                )
+            recorder.record(measurement.Event.START_JOB)
+            with recorder.maybe_monitor_all():
+                pass
+        if not expect_elastic:
+            mock_elastic_cls.assert_not_called()
+            self.assertEqual(2, mock_monitor_cls.call_count)
+            return
+        mock_monitor_cls.assert_not_called()
+        # Both the cumulative and the rolling window monitors.
+        self.assertEqual(2, mock_elastic_cls.call_count)
+        mock_elastic_cls.assert_any_call(
+            job_name="test-monitor",
+            logger_name="goodput_logger_test-monitor",
+            tensorboard_dir="/test",
+            upload_interval=30,
+            monitoring_enabled=True,
+            include_badput_breakdown=True,
+            include_slice_efficiency=True,
+        )
 
 
 if __name__ == "__main__":
