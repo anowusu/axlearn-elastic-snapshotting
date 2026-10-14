@@ -137,11 +137,37 @@ axlearn gcp launch run --instance_type=tpu-v5litepod-16 \
 |---|---|---|
 | `name` | required | Job name. Must be unique per workload (see above). |
 | `upload_dir` | required | TensorBoard directory for the monitor. |
-| `upload_interval` | required | Seconds between monitor queries and uploads. |
-| `rolling_window_size` | empty | Comma-separated window sizes in seconds. Enables rolling window monitoring when set. |
+| `upload_interval` | `30` | Seconds between monitor queries and uploads. |
+| `rolling_window_size` | empty | Comma-separated window sizes in seconds. Enables rolling window monitoring when set (MaxText uses `3600,86400,259200,432000`). |
 | `jax_backend` | none | Set to `proxy` on Pathways. |
 | `enable_monitoring` | `true` | Enables the background uploaders. Recording is always on. |
-| `enable_checkpoint_logging` | `true` | Logs Orbax checkpoint save/restore statistics to the goodput log (process 0 only). |
+| `enable_checkpoint_logging` | `true` | Logs Orbax checkpoint save/restore statistics to the goodput log from every process, as in MaxText (the library averages the entries of a step). |
+| `enable_gcp_goodput_metrics` | `true` | Uploads goodput metrics to Google Cloud Monitoring. |
+| `enable_gcp_step_deviation_metrics` | `true` | Uploads step deviation metrics to Google Cloud Monitoring. |
+| `include_step_deviation` | `false` | Computes and uploads the step time deviation in the background. |
+| `step_deviation_interval_seconds` | `30` | Seconds between step deviation queries and uploads. |
+
+Elastic jobs (with an active Pathways elastic manager) use the elastic monitor, which also
+uploads the slice efficiency. The recorder and monitor classes are logged when they are created.
+
+### Recorded Events
+
+Besides the job, step, accelerator initialization, training preparation and data loading events,
+`SpmdTrainer` records:
+
+| Event | Recorded as |
+|---|---|
+| Elastic wait | `elastic_wait_event_type` `elastic_scale_up` (after a cooperative scale-up) or `elastic_slice_down`, from the elastic event until the slices are back. |
+| Elastic reinitialization | `elastic_reinit_*`, from the end of the wait until training can resume. |
+| Slice counts | `active_slices`/`available_slices`/`total_slices` at startup, at the start of an elastic event (0 active slices) and at the start and end of the reinitialization. |
+| Snapshot restore | Custom badput `SNAPSHOT_RESTORE` around the in-memory snapshot restore on elastic events. |
+| Input iterator creation | Custom badput `DATA_ITERATOR_INIT` at init and at every restore. |
+| Compilation | Custom badput `COMPILATION_NO_XSC` / `COMPILATION_WITH_XSC`. |
+| Evaluation | Custom badput `EVAL`, at steps where an evaler ran. |
+
+ml-goodput-measurement only counts custom badput within steps; custom events outside of steps (e.g.
+`SNAPSHOT_RESTORE`, `DATA_ITERATOR_INIT`) are informational and are reported by tools such as the
+goodput timeline.
 
 ### Checkpoint Badput
 
@@ -171,8 +197,8 @@ every exit path (also on errors), and the monitor uploads its final data point o
 By default, when Goodput monitoring is enabled via the recorder, AXLearn automatically pushes metrics to Google Cloud Monitoring.
 
 -   **Cumulative Metrics** are enabled by default when you specify the `recorder_type`.
-    To disable this, you would need to set `enable_gcp_goodput_metrics` to `False` in
-    `goodput_monitoring.GCPOptions` within the `cloud/gcp/measurement.py` file.
+    To disable this, set `--recorder_spec=enable_gcp_goodput_metrics=false` (and
+    `enable_gcp_step_deviation_metrics=false` for the step deviation metrics).
 -   **Rolling Window Metrics** can be explicitly enabled by providing window sizes
     via `rolling_window_size`.
 

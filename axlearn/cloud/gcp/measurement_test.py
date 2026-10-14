@@ -701,6 +701,121 @@ class GoodputRecorderTest(parameterized.TestCase):
             include_slice_efficiency=True,
         )
 
+    @parameterized.parameters(
+        dict(recorder_spec=[], expected={}),
+        dict(
+            recorder_spec=[
+                "upload_interval=15",
+                "enable_gcp_goodput_metrics=false",
+                "enable_gcp_step_deviation_metrics=false",
+                "include_step_deviation=true",
+                "step_deviation_interval_seconds=60",
+            ],
+            expected=dict(
+                upload_interval=15,
+                enable_gcp_goodput_metrics=False,
+                enable_gcp_step_deviation_metrics=False,
+                include_step_deviation=True,
+                step_deviation_interval_seconds=60,
+            ),
+        ),
+    )
+    def test_from_flags_monitoring_options(self, recorder_spec, expected):
+        """Tests the parsing and the defaults (as in MaxText) of the monitoring options."""
+        mock_fv = mock.MagicMock(spec=flags.FlagValues)
+        mock_fv.recorder_spec = ["name=test-name", "upload_dir=/test/path", *recorder_spec]
+        recorder = GoodputRecorder.from_flags(mock_fv)
+        defaults = dict(
+            upload_interval=30,
+            enable_gcp_goodput_metrics=True,
+            enable_gcp_step_deviation_metrics=True,
+            include_step_deviation=False,
+            step_deviation_interval_seconds=30,
+        )
+        for key, value in {**defaults, **expected}.items():
+            self.assertEqual(value, getattr(recorder.config, key), key)
+
+    @mock.patch("jax.process_index", return_value=0)
+    def test_maybe_monitor_all_gcp_options(self, _):
+        """Tests that both monitors get the Google Cloud Monitoring options."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-gcp",
+            upload_dir="/test",
+            rolling_window_size=[5],
+            enable_gcp_goodput_metrics=False,
+        )
+        recorder = GoodputRecorder(cfg)
+        with mock.patch("ml_goodput_measurement.monitoring.GoodputMonitor") as mock_monitor_cls:
+            with recorder.maybe_monitor_all():
+                pass
+        self.assertEqual(2, mock_monitor_cls.call_count)
+        for call in mock_monitor_cls.call_args_list:
+            self.assertEqual(
+                measurement_gcp.goodput_monitoring.GCPOptions(
+                    enable_gcp_goodput_metrics=False, enable_gcp_step_deviation_metrics=True
+                ),
+                call.kwargs["gcp_options"],
+            )
+            self.assertNotIn("include_step_deviation", call.kwargs)
+
+    @parameterized.parameters(
+        dict(include_step_deviation=False, start_error=None, stop_error=None),
+        dict(include_step_deviation=True, start_error=None, stop_error=None),
+        # Failures of the step deviation uploader do not interrupt training.
+        dict(include_step_deviation=True, start_error=RuntimeError("start"), stop_error=None),
+        dict(include_step_deviation=True, start_error=None, stop_error=RuntimeError("stop")),
+    )
+    @mock.patch("jax.process_index", return_value=0)
+    def test_maybe_monitor_goodput_step_deviation(
+        self, _, include_step_deviation, start_error, stop_error
+    ):
+        """Tests the step deviation uploader."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-step-deviation",
+            upload_dir="/test",
+            include_step_deviation=include_step_deviation,
+            step_deviation_interval_seconds=60,
+        )
+        recorder = GoodputRecorder(cfg)
+        with mock.patch("ml_goodput_measurement.monitoring.GoodputMonitor") as mock_monitor_cls:
+            mock_monitor = mock_monitor_cls.return_value
+            mock_monitor.start_step_deviation_uploader.side_effect = start_error
+            mock_monitor.stop_step_deviation_uploader.side_effect = stop_error
+            with recorder._maybe_monitor_goodput():
+                mock_monitor.stop_step_deviation_uploader.assert_not_called()
+        kwargs = mock_monitor_cls.call_args.kwargs
+        mock_monitor.stop_goodput_uploader.assert_called_once()
+        if not include_step_deviation:
+            self.assertNotIn("include_step_deviation", kwargs)
+            mock_monitor.start_step_deviation_uploader.assert_not_called()
+            mock_monitor.stop_step_deviation_uploader.assert_not_called()
+            return
+        self.assertTrue(kwargs["include_step_deviation"])
+        self.assertEqual(60, kwargs["step_deviation_interval_seconds"])
+        mock_monitor.start_step_deviation_uploader.assert_called_once()
+        if start_error:
+            mock_monitor.stop_step_deviation_uploader.assert_not_called()
+        else:
+            mock_monitor.stop_step_deviation_uploader.assert_called_once()
+
+    @mock.patch("jax.process_index", return_value=0)
+    def test_logs_created_classes(self, _):
+        """Tests that the recorder and monitor classes are logged when created."""
+        cfg = GoodputRecorder.default_config().set(name="test-log", upload_dir="/test")
+        recorder = GoodputRecorder(cfg)
+        with (
+            mock.patch("ml_goodput_measurement.src.goodput_elastic.ElasticGoodputRecorder"),
+            mock.patch("ml_goodput_measurement.monitoring.GoodputMonitor"),
+            mock.patch.object(logging, "info") as mock_info,
+        ):
+            recorder.record(measurement.Event.START_JOB)
+            with recorder.maybe_monitor_all():
+                pass
+        created = [c.args for c in mock_info.call_args_list if "created" in c.args[0]]
+        self.assertEqual(2, len(created))
+        for args in created:
+            self.assertEqual(("test-log", "goodput_logger_test-log"), args[2:])
+
 
 if __name__ == "__main__":
     absltest.main()

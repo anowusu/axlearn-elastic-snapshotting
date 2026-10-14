@@ -60,15 +60,25 @@ class GoodputRecorder(measurement_base.Recorder):
             jax_backend: Jax backend type to infer Pathways environment.
             enable_monitoring: Whether to enable goodput monitoring/uploading.
             enable_checkpoint_logging: Whether to log Orbax checkpoint statistics for goodput.
+            enable_gcp_goodput_metrics: Whether to upload goodput metrics to Google Cloud
+                Monitoring.
+            enable_gcp_step_deviation_metrics: Whether to upload step deviation metrics to Google
+                Cloud Monitoring.
+            include_step_deviation: Whether to compute and upload the step time deviation.
+            step_deviation_interval_seconds: Time interval (seconds) for step deviation uploads.
         """
 
         upload_dir: Required[str] = REQUIRED
-        upload_interval: Required[int] = REQUIRED
+        upload_interval: int = 30
         rolling_window_size: Sequence[int] = []
         jax_backend: Optional[str] = None
         # Enable or disable monitoring. Recording is always enabled.
         enable_monitoring: bool = True
         enable_checkpoint_logging: bool = True
+        enable_gcp_goodput_metrics: bool = True
+        enable_gcp_step_deviation_metrics: bool = True
+        include_step_deviation: bool = False
+        step_deviation_interval_seconds: int = 30
 
     @classmethod
     def from_flags(cls, fv: flags.FlagValues) -> "GoodputRecorder":
@@ -79,24 +89,39 @@ class GoodputRecorder(measurement_base.Recorder):
         additionally take in following Tensorboard configs in the recorder_spec:
         - upload_dir: The directory to write Tensorboard data to.
         - upload_interval: The time interval in seconds at which to query and upload data
-            to Tensorboard.
+            to Tensorboard (default: 30).
         - rolling_window_size: Comma-separated list of integers representing rolling window
             sizes in seconds.
         - jax_backend: The type of jax backend.
         - enable_monitoring: Boolean to enable/disable goodput monitoring (default: true).
         - enable_checkpoint_logging: Boolean to enable/disable checkpoint logging (default: true).
+        - enable_gcp_goodput_metrics: Boolean to enable/disable goodput metrics in Google Cloud
+            Monitoring (default: true).
+        - enable_gcp_step_deviation_metrics: Boolean to enable/disable step deviation metrics in
+            Google Cloud Monitoring (default: true).
+        - include_step_deviation: Boolean to enable/disable step deviation monitoring
+            (default: false).
+        - step_deviation_interval_seconds: The time interval in seconds at which to query and
+            upload the step deviation (default: 30).
         """
         cfg: measurement_base.Recorder.Config = cls.default_config()
         parsed_flags = parse_kv_flags(fv.recorder_spec, delimiter="=")
-        if "upload_interval" in parsed_flags:
-            parsed_flags["upload_interval"] = int(parsed_flags["upload_interval"])
+        for key in ("upload_interval", "step_deviation_interval_seconds"):
+            if key in parsed_flags:
+                parsed_flags[key] = int(parsed_flags[key])
         if "rolling_window_size" in parsed_flags and isinstance(
             parsed_flags["rolling_window_size"], str
         ):
             parsed_flags["rolling_window_size"] = [
                 int(x) for x in parsed_flags["rolling_window_size"].split(",")
             ]
-        for key in ("enable_monitoring", "enable_checkpoint_logging"):
+        for key in (
+            "enable_monitoring",
+            "enable_checkpoint_logging",
+            "enable_gcp_goodput_metrics",
+            "enable_gcp_step_deviation_metrics",
+            "include_step_deviation",
+        ):
             if key in parsed_flags:
                 parsed_flags[key] = to_bool(parsed_flags[key])
         return maybe_set_config(cfg, **parsed_flags).instantiate()
@@ -152,6 +177,7 @@ class GoodputRecorder(measurement_base.Recorder):
                 logger_name=self._logger_name,
                 logging_enabled=(jax.process_index() == 0),
             )
+            self._log_created(self._recorder)
 
         start_method_name = f"record_{event.value}_start_time"
         end_method_name = f"record_{event.value}_end_time"
@@ -225,15 +251,77 @@ class GoodputRecorder(measurement_base.Recorder):
                     upload_interval=self.config.upload_interval,
                     monitoring_enabled=True,
                     include_badput_breakdown=True,
+                    **self._monitor_options(step_deviation=True),
                 )
+                self._log_created(self._monitor)
 
             self._monitor.start_goodput_uploader(*args, **kwargs)
             logging.info("Started Goodput upload to Tensorboard & GCM in the background!")
-            yield
+            with self._maybe_monitor_step_deviation():
+                yield
         finally:
             if self._monitor:
                 self._monitor.stop_goodput_uploader()
                 logging.info("Flushed final metrics and safe exited from Goodput monitoring.")
+
+    def _monitor_options(self, *, step_deviation: bool = False) -> dict[str, Any]:
+        """Returns the optional monitor arguments set by the config.
+
+        Only non-default options are passed, so that monitors are created as before by default.
+
+        Args:
+            step_deviation: Whether to include the step deviation options.
+        """
+        cfg: GoodputRecorder.Config = self.config
+        options = {}
+        if not (cfg.enable_gcp_goodput_metrics and cfg.enable_gcp_step_deviation_metrics):
+            options["gcp_options"] = goodput_monitoring.GCPOptions(
+                enable_gcp_goodput_metrics=cfg.enable_gcp_goodput_metrics,
+                enable_gcp_step_deviation_metrics=cfg.enable_gcp_step_deviation_metrics,
+            )
+        if step_deviation and cfg.include_step_deviation:
+            options.update(
+                include_step_deviation=True,
+                step_deviation_interval_seconds=cfg.step_deviation_interval_seconds,
+            )
+        return options
+
+    @contextlib.contextmanager
+    def _maybe_monitor_step_deviation(self):
+        """Uploads the step deviation in the background if enabled.
+
+        As in MaxText's rolling window monitoring, failures to start or stop the uploader are
+        logged and do not interrupt training.
+        """
+        if not self.config.include_step_deviation:
+            yield
+            return
+        started = False
+        try:
+            self._monitor.start_step_deviation_uploader()
+            started = True
+            logging.info("Started Step Deviation upload to Tensorboard & GCM in the background!")
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logging.warning("Failed to start the step deviation uploader: %s", e)
+        try:
+            yield
+        finally:
+            if started:
+                try:
+                    self._monitor.stop_step_deviation_uploader()
+                    logging.info("Flushed final metrics and safe exited from Step Deviation.")
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    logging.warning("Failed to stop the step deviation uploader: %s", e)
+
+    def _log_created(self, obj: Any):
+        """Logs the goodput class used, e.g. whether it is the elastic one."""
+        if jax.process_index() == 0:
+            logging.info(
+                "Goodput: created %s for job: %s (log: %s)",
+                type(obj).__name__,
+                self._job_name,
+                self._logger_name,
+            )
 
     @contextlib.contextmanager
     def _maybe_monitor_rolling_window_goodput(self):
@@ -257,7 +345,9 @@ class GoodputRecorder(measurement_base.Recorder):
                     upload_interval=self.config.upload_interval,
                     monitoring_enabled=True,
                     include_badput_breakdown=True,
+                    **self._monitor_options(),
                 )
+                self._log_created(self._rolling_window_monitor)
             self._rolling_window_monitor.start_rolling_window_goodput_uploader(
                 self.config.rolling_window_size
             )
@@ -310,6 +400,7 @@ class GoodputRecorder(measurement_base.Recorder):
                 logger_name=f"goodput_logger_{cfg.name}",
                 logging_enabled=(jax.process_index() == 0),
             )
+            self._log_created(self._recorder)
 
         if event == measurement_base.Event.START_JOB:
             self._recorder.record_job_start_time(*args, **kwargs)
