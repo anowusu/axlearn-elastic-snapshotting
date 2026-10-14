@@ -21,6 +21,7 @@
 """
 
 import contextlib
+import datetime
 import functools
 import os
 from typing import Any, Callable, Optional, Sequence
@@ -37,6 +38,16 @@ except ImportError:
 from axlearn.cloud.common.utils import parse_kv_flags, to_bool
 from axlearn.common import measurement_base
 from axlearn.common.config import REQUIRED, Required, config_class, maybe_set_config
+
+# The goodput log keys of the dedicated recorder methods that released ml-goodput-measurement
+# versions lack, named as in the proposed `record_data_iterator_init_*` and
+# `record_checkpoint_restore_*` methods.
+_EXPLICIT_EVENT_KEYS = {
+    "record_data_iterator_init_start_time": "data_iterator_init_start_time",
+    "record_data_iterator_init_end_time": "data_iterator_init_end_time",
+    "record_checkpoint_restore_start_time": "checkpoint_restore_start_time",
+    "record_checkpoint_restore_end_time": "checkpoint_restore_end_time",
+}
 
 
 @measurement_base.register_recorder("goodput_elastic")
@@ -426,6 +437,32 @@ class GoodputRecorder(measurement_base.Recorder):
         elif event == measurement_base.Event.END_CUSTOM_BADPUT_EVENT:
             self._recorder.record_custom_badput_event_end_time(*args, **kwargs)
         elif method_name := {
+            measurement_base.Event.START_DATA_ITERATOR_INIT: "record_data_iterator_init_start_time",
+            measurement_base.Event.END_DATA_ITERATOR_INIT: "record_data_iterator_init_end_time",
+            measurement_base.Event.START_CHECKPOINT_RESTORE: "record_checkpoint_restore_start_time",
+            measurement_base.Event.END_CHECKPOINT_RESTORE: "record_checkpoint_restore_end_time",
+        }.get(event):
+            if (fn := getattr(self._recorder, method_name, None)) is not None:
+                fn(*args, **kwargs)
+            elif hasattr(self._recorder, "_cloud_logger"):
+                # Released ml-goodput-measurement versions (up to 0.2.3) have no dedicated method:
+                # write the entry that the method would write, which log consumers such as the
+                # goodput timeline already read.
+                self._write_event_entry(_EXPLICIT_EVENT_KEYS[method_name], **kwargs)
+            else:
+                # A recorder without the Cloud Logging writer: record the same interval as a custom
+                # badput event named after the bucket, e.g. DATA_ITERATOR_INIT or SNAPSHOT_RESTORE.
+                # Custom badput takes no other kwargs.
+                is_start, custom_type = event.value.split("_", 1)
+                if "source" in kwargs:
+                    custom_type = f"{kwargs['source'].upper()}_RESTORE"
+                record_fn = (
+                    self._recorder.record_custom_badput_event_start_time
+                    if is_start == "START"
+                    else self._recorder.record_custom_badput_event_end_time
+                )
+                record_fn(custom_badput_event_type=custom_type)
+        elif method_name := {
             measurement_base.Event.START_ELASTIC_WAIT: "record_elastic_wait_start_time",
             measurement_base.Event.END_ELASTIC_WAIT: "record_elastic_wait_end_time",
             measurement_base.Event.START_ELASTIC_REINIT: "record_elastic_reinit_start_time",
@@ -448,6 +485,33 @@ class GoodputRecorder(measurement_base.Recorder):
                 1,
                 event,
             )
+
+    def _write_event_entry(
+        self, time_key: str, *, source: Optional[str] = None, step: Optional[int] = None
+    ):
+        """Writes a goodput log entry with `time_key` set to the current time.
+
+        Uses the recorder's Cloud Logging writer, which is None in processes that do not log (like
+        the `record_*` methods, nothing is written then).
+
+        Args:
+            time_key: The timestamp key, e.g. `checkpoint_restore_start_time`.
+            source: The restore source, for checkpoint restores.
+            step: The restored step, for checkpoint restores.
+        """
+        # pylint: disable-next=protected-access
+        cloud_logger = self._recorder._cloud_logger
+        if cloud_logger is None:
+            return
+        entry = {
+            "job_name": self._recorder.job_name,
+            time_key: datetime.datetime.now(datetime.timezone.utc).timestamp(),
+        }
+        if source is not None:
+            entry["checkpoint_restore_source"] = source
+        if step is not None:
+            entry["checkpoint_restore_step"] = int(step)
+        cloud_logger.write_cloud_logging_entry(entry)
 
     def flush(self):
         """Flushes pending goodput log writes.

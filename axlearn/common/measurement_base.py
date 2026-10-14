@@ -26,6 +26,11 @@ class Event(enum.Enum):
         END_DATA_LOADING: End of data loading.
         START_CUSTOM_BADPUT_EVENT: Start of custom badput event.
         END_CUSTOM_BADPUT_EVENT: End of custom badput event.
+        START_DATA_ITERATOR_INIT: Start of the creation of the training input iterator.
+        END_DATA_ITERATOR_INIT: End of the creation of the training input iterator.
+        START_CHECKPOINT_RESTORE: Start of a checkpoint restore done by the trainer. Should be
+            recorded with `source` ("checkpoint" or "snapshot") and `step` as keyword args.
+        END_CHECKPOINT_RESTORE: End of a checkpoint restore, with the same keyword args.
     """
 
     START_JOB = "START_JOB"
@@ -39,6 +44,10 @@ class Event(enum.Enum):
     END_DATA_LOADING = "END_DATA_LOADING"
     START_CUSTOM_BADPUT_EVENT = "START_CUSTOM_BADPUT_EVENT"
     END_CUSTOM_BADPUT_EVENT = "END_CUSTOM_BADPUT_EVENT"
+    START_DATA_ITERATOR_INIT = "START_DATA_ITERATOR_INIT"
+    END_DATA_ITERATOR_INIT = "END_DATA_ITERATOR_INIT"
+    START_CHECKPOINT_RESTORE = "START_CHECKPOINT_RESTORE"
+    END_CHECKPOINT_RESTORE = "END_CHECKPOINT_RESTORE"
     START_ELASTIC_WAIT = "START_ELASTIC_WAIT"
     END_ELASTIC_WAIT = "END_ELASTIC_WAIT"
     START_ELASTIC_REINIT = "START_ELASTIC_REINIT"

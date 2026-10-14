@@ -628,6 +628,114 @@ class GoodputRecorderTest(parameterized.TestCase):
                 pass
             mock_monitor_cls.assert_called_once()
 
+    @parameterized.parameters(
+        dict(has_dedicated_methods=True, cloud_logger="mock"),
+        # Released versions: the entries are written directly.
+        dict(has_dedicated_methods=False, cloud_logger="mock"),
+        # A process that does not log.
+        dict(has_dedicated_methods=False, cloud_logger=None),
+        # A recorder without the Cloud Logging writer falls back to custom badput.
+        dict(has_dedicated_methods=False, cloud_logger="missing"),
+    )
+    @mock.patch("jax.process_index", return_value=0)
+    def test_record_data_iterator_init_and_checkpoint_restore(
+        self, _, has_dedicated_methods, cloud_logger
+    ):
+        """Tests the dedicated recorder methods and the fallbacks."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-dedicated", upload_dir="/test", upload_interval=30
+        )
+        recorder = GoodputRecorder(cfg)
+        with mock.patch(
+            "ml_goodput_measurement.src.goodput_elastic.ElasticGoodputRecorder"
+        ) as mock_recorder_cls:
+            mock_instance = mock_recorder_cls.return_value
+            mock_instance.job_name = "test-dedicated"
+            if not has_dedicated_methods:
+                del mock_instance.record_data_iterator_init_start_time
+                del mock_instance.record_data_iterator_init_end_time
+                del mock_instance.record_checkpoint_restore_start_time
+                del mock_instance.record_checkpoint_restore_end_time
+            if cloud_logger is None:
+                mock_instance._cloud_logger = None
+            elif cloud_logger == "missing":
+                del mock_instance._cloud_logger
+            recorder.record(measurement.Event.START_DATA_ITERATOR_INIT)
+            recorder.record(measurement.Event.END_DATA_ITERATOR_INIT)
+            recorder.record(measurement.Event.START_CHECKPOINT_RESTORE, source="snapshot", step=10)
+            recorder.record(measurement.Event.END_CHECKPOINT_RESTORE, source="snapshot", step=10)
+            if has_dedicated_methods:
+                mock_instance.record_data_iterator_init_start_time.assert_called_once_with()
+                mock_instance.record_data_iterator_init_end_time.assert_called_once_with()
+                mock_instance.record_checkpoint_restore_start_time.assert_called_once_with(
+                    source="snapshot", step=10
+                )
+                mock_instance.record_checkpoint_restore_end_time.assert_called_once_with(
+                    source="snapshot", step=10
+                )
+                mock_instance._cloud_logger.write_cloud_logging_entry.assert_not_called()
+                mock_instance.record_custom_badput_event_start_time.assert_not_called()
+            elif cloud_logger == "mock":
+                # The entries that the dedicated methods would write, without custom badput.
+                entries = [
+                    c.args[0]
+                    for c in mock_instance._cloud_logger.write_cloud_logging_entry.call_args_list
+                ]
+                restore = dict(checkpoint_restore_source="snapshot", checkpoint_restore_step=10)
+                self.assertEqual(
+                    [
+                        {"data_iterator_init_start_time"},
+                        {"data_iterator_init_end_time"},
+                        {"checkpoint_restore_start_time", *restore},
+                        {"checkpoint_restore_end_time", *restore},
+                    ],
+                    [set(e) - {"job_name"} for e in entries],
+                )
+                for entry in entries:
+                    self.assertEqual("test-dedicated", entry["job_name"])
+                for entry in entries[2:]:
+                    self.assertEqual(restore, {k: entry[k] for k in restore})
+                times = [v for e in entries for k, v in e.items() if k.endswith("_time")]
+                self.assertEqual(sorted(times), times)
+                mock_instance.record_custom_badput_event_start_time.assert_not_called()
+                mock_instance.record_custom_badput_event_end_time.assert_not_called()
+            elif cloud_logger is None:
+                # Nothing is logged, as by the recorder methods.
+                mock_instance.record_custom_badput_event_start_time.assert_not_called()
+            else:
+                # The custom events are named after the bucket and the restore source.
+                self.assertEqual(
+                    [
+                        mock.call(custom_badput_event_type="DATA_ITERATOR_INIT"),
+                        mock.call(custom_badput_event_type="SNAPSHOT_RESTORE"),
+                    ],
+                    mock_instance.record_custom_badput_event_start_time.call_args_list,
+                )
+                self.assertEqual(
+                    [
+                        mock.call(custom_badput_event_type="DATA_ITERATOR_INIT"),
+                        mock.call(custom_badput_event_type="SNAPSHOT_RESTORE"),
+                    ],
+                    mock_instance.record_custom_badput_event_end_time.call_args_list,
+                )
+
+    def test_library_cloud_logger_attribute(self):
+        """Tests that the installed library's recorder keeps its writer in `_cloud_logger`.
+
+        `GoodputRecorder` writes the entries of missing dedicated methods through it.
+        """
+        writer = mock.MagicMock()
+        recorder_cls = (
+            measurement_gcp.goodput_elastic.ElasticGoodputRecorder
+            if measurement_gcp.goodput_elastic is not None
+            else measurement_gcp.goodput.GoodputRecorder
+        )
+        lib_recorder = recorder_cls(
+            job_name="test-writer", logger_name="test", logging_enabled=True, cloud_logger=writer
+        )
+        self.assertIs(writer, lib_recorder._cloud_logger)
+        self.assertEqual("test-writer", lib_recorder.job_name)
+
     @mock.patch("jax.process_index", return_value=0)
     def test_maybe_monitor_all_reentrant(self, _):
         """Tests that only the outermost monitoring context starts and stops the uploaders."""
