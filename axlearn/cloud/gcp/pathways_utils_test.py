@@ -258,6 +258,34 @@ class PathwaysReplicatedJobTest(TestCase):
             for flag in mxla_arg_flags:
                 self.assertIn(flag, worker_container["args"])
 
+    def test_enable_elastic_slices(self):
+        """Tests that pathways_enable_elastic_slices configures proxy, worker, and pod specs."""
+        with self._job_config(CloudBuildBundler) as (cfg, bundler_cfg):
+            cfg.inner.set(
+                project="test-project",
+                name="test",
+                command="test_command",
+                output_dir="FAKE",
+                service_account="test-service-account",
+            ).instantiate(bundler=bundler_cfg.instantiate())
+            cfg.colocated_python.set(pathways_enable_elastic_slices=True)
+            builder = cfg.instantiate(bundler=bundler_cfg.instantiate())
+            # pylint: disable=protected-access
+            head_pod_spec = builder._build_pathways_head_pod()["spec"]
+            worker_pod_spec = builder._build_pathways_worker_pod()["spec"]
+            # pylint: enable=protected-access
+            self.assertTrue(head_pod_spec.get("hostNetwork"))
+            self.assertTrue(worker_pod_spec.get("hostNetwork"))
+            proxy_args = next(
+                c["args"]
+                for c in head_pod_spec["initContainers"]
+                if c["name"] == _PATHWAYS_PROXY_CONTAINER_NAME
+            )
+            self.assertIn("--num_elastic_slices=1", proxy_args)
+            worker_args = worker_pod_spec["containers"][0]["args"]
+            self.assertIn("--tpu_pinned_host_allocation_recycle=false", worker_args)
+            self.assertIn("--tpu_premapped_buffer_size=68719476736", worker_args)
+
     def test_health_probes_not_applied_to_worker_container(self):
         """Health probes must only apply to the head container in JobSets."""
         with self._job_config(CloudBuildBundler) as (cfg, bundler_cfg):
@@ -1178,3 +1206,4 @@ class PathwaysLeaderWorkerTemplateTest(TestCase):
 
 if __name__ == "__main__":
     absltest.main()
+
