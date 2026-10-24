@@ -12,7 +12,9 @@ See also checkpointer.py for other checkpointing utilities and checkpointer_test
 """
 
 import asyncio
+import contextlib
 import copy
+import threading
 import dataclasses
 import functools
 import os
@@ -384,6 +386,8 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
         cfg: OrbaxCheckpointer.Config = self.config
         save_policy = cfg.save_policy.instantiate()
+        self._save_policy = save_policy
+        self._elastic_drain: Optional[threading.Event] = None
 
         if cfg.enable_single_replica_ckpt_restoring:
             array_handler = ocp.type_handlers.SingleReplicaArrayHandler(
@@ -431,6 +435,26 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
             return is_save
 
+        self._save_fn_with_summaries = save_fn_with_summaries
+        self._create_manager()
+
+    def _create_manager(self):
+        cfg: OrbaxCheckpointer.Config = self.config
+        if os.environ.get("JAX_PLATFORMS") == "proxy" or jax.default_backend() == "proxy":
+            from orbax.checkpoint import pathways  # pylint: disable=import-outside-toplevel  # pytype: disable=import-error
+            from orbax.checkpoint._src.multihost import dispatchers as _disp  # pylint: disable=import-outside-toplevel
+
+            kwargs = {"replica_axis_index": cfg.replica_axis_index, "primary_replica_id": 0} if cfg.enable_single_replica_ckpt_restoring else {}
+            pathways.register_type_handlers(
+                use_single_replica_array_handler=cfg.enable_single_replica_ckpt_restoring,
+                checkpointing_impl=pathways.CheckpointingImpl.COLOCATED_PYTHON,
+                primary_host=None, array_metadata_store=None, enable_write_sharding_file=False, **kwargs,
+            )
+            if not getattr(_disp.ColocatedPythonDispatcher._colocated_cpu_sharding, "_pola_patched", False):
+                _orig = _disp.ColocatedPythonDispatcher._colocated_cpu_sharding
+                _patched = lambda self_d, s: _orig(self_d, s.with_memory_kind("device") if getattr(s, "memory_kind", None) == "pinned_host" else s)
+                _patched._pola_patched = True
+                _disp.ColocatedPythonDispatcher._colocated_cpu_sharding = _patched
         CheckpointManager = (  # pylint: disable=invalid-name
             _CheckpointManagerWithTrackerFile
             if cfg.read_latest_checkpoint_from_tracker_file
@@ -444,7 +468,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
                 keep_period=cfg.keep_period,
                 enable_async_checkpointing=True,
                 step_name_format=self._name_format,
-                should_save_fn=save_fn_with_summaries,
+                should_save_fn=self._save_fn_with_summaries,
                 enable_background_delete=True,
                 async_options=ocp.options.AsyncOptions(
                     timeout_secs=cfg.async_timeout_secs,
@@ -452,9 +476,9 @@ class OrbaxCheckpointer(BaseCheckpointer):
                 ),
                 # Explicitly wrapped in `_ShouldSaveFnPolicy`, otherwise
                 # `PreemptionCheckpointingPolicy` is auto injected
-                save_decision_policy=_ShouldSaveFnPolicy(save_fn_with_summaries),
+                save_decision_policy=_ShouldSaveFnPolicy(self._save_fn_with_summaries),
                 lightweight_initialize=True,
-                cleanup_tmp_directories=True,
+                cleanup_tmp_directories=not hasattr(self, "_manager"),
             ),
             item_handlers={
                 # NOTE: we make a relatively weak assumption that index files are JSON serialized
@@ -469,6 +493,27 @@ class OrbaxCheckpointer(BaseCheckpointer):
                 ),
             },
         )
+
+    def begin_elastic_drain(self) -> threading.Event:
+        if self._elastic_drain is None:
+            old_mgr, ev = self._manager, threading.Event()
+            def _drain():
+                try:
+                    old_mgr.wait_until_finished()
+                except Exception as e:  # pylint: disable=broad-except
+                    logging.warning("[ELASTIC] Interrupted async checkpoint save: %s", e)
+                ev.set()
+            threading.Thread(target=_drain, daemon=True).start()
+            self._elastic_drain = ev
+        return self._elastic_drain
+
+    def reset_after_elastic_event(self, *, devices_changed: bool = False):
+        old_mgr, ev, self._elastic_drain = self._manager, self.begin_elastic_drain(), None
+        if ev.is_set() if devices_changed else ev.wait(120.0):
+            with contextlib.suppress(Exception):
+                old_mgr.close()
+        self._eval_summaries = None
+        self._create_manager()
 
     def _get_spec(self, *, step: int, state: Nested[Any]) -> Nested[Any]:
         spec = {"index": [("step", step)]}
@@ -613,7 +658,8 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
     def stop(self, *, has_exception: bool = False):
         """See `BaseCheckpointer.stop` for details."""
-        self._manager.close()
+        if not has_exception:
+            self._manager.close()
 
 
 # Below are adapted from:
