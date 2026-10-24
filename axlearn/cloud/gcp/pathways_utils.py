@@ -240,6 +240,7 @@ class PathwaysColocatedPythonPlugin(FlagConfigurable):
         pathways_proxy_image: Optional[str] = None
         pathways_server_image: Optional[str] = None
         pathways_disable_shared_cache: Optional[bool] = None
+        pathways_enable_elastic_slices: Optional[bool] = None
 
     @classmethod
     def define_flags(cls, fv):
@@ -263,6 +264,9 @@ class PathwaysColocatedPythonPlugin(FlagConfigurable):
             "If True, use the per-job output directory for pathways staging instead of "
             "the shared bucket root.",
             **common_kwargs,
+        )
+        flags.DEFINE_boolean(
+            "pathways_enable_elastic_slices", None, "Enable elastic slices.", **common_kwargs
         )
 
     def __init__(self, cfg: Config, *, bundler: Bundler):
@@ -343,21 +347,18 @@ def _build_base_pathways_worker_container(
         base_container_builder.config.output_dir,
         shared=colocated_python_plugin.config.pathways_disable_shared_cache is not True,
     )
+    elastic = bool(colocated_python_plugin.config.pathways_enable_elastic_slices)
     args = [
         f"--server_port={_PATHWAYS_WORKER_PORT}",
         f"--resource_manager_address={resource_manager_address}:"
         + f"{_PATHWAYS_RESOURCE_MANAGER_PORT}",
         f"--gcs_scratch_location={gcs_scratch_location}",
-        # Recycling host memory gives a slight increase in performance.
-        "--tpu_pinned_host_allocation_recycle=true",
+        f"--tpu_pinned_host_allocation_recycle={str(not elastic).lower()}",
     ]
     if not colocated_python_plugin.is_colocated_python_enabled:
-        args.append(
-            # The flag below is needed for better H2D performance.
-            # We use 1/4 of the host memory, rounding up to power of 2 as premapped buffer.
-            # Note that pathways worker requires this flag to be a power of 2.
-            f"--tpu_premapped_buffer_size={round_up_to_power_of_2(host_memory // 4) * (1 << 30)}",
-        )
+        # Use 1/4 (1/8 when elastic) of host memory, rounded up to a power of 2, for H2D buffers.
+        div = 8 if elastic else 4
+        args.append(f"--tpu_premapped_buffer_size={round_up_to_power_of_2(host_memory // div) << 30}")
     else:
         # Colocated python uses more host memory.
         # Thus we need to reduce the premapped buffer size.
@@ -609,6 +610,8 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             f"--resource_manager_address=localhost:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
             f"--server_port={_PATHWAYS_PROXY_PORT}",
         ]
+        if self._colocated_python.config.pathways_enable_elastic_slices:
+            cmd_args.append(f"--num_elastic_slices={pathways_instance_count}")
         if self._colocated_python.is_colocated_python_enabled:
             cmd_args.append("--sidecar_name=external")
         cmd_args.extend(xla_flags_from_options(self._xla_options).split())
@@ -714,6 +717,8 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             "serviceAccountName": cfg.service_account,
             "dnsPolicy": "ClusterFirstWithHostNet",
         }
+        if self._colocated_python.config.pathways_enable_elastic_slices:
+            head_pod_spec["hostNetwork"] = True
 
         if cfg.priority_class:
             head_pod_spec["priorityClassName"] = cfg.priority_class
@@ -831,6 +836,8 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         pod_spec.pop("restartPolicy")
         # Only set dnsPolicy if it's not already set
         pod_spec["dnsPolicy"] = "ClusterFirstWithHostNet"
+        if self._colocated_python.config.pathways_enable_elastic_slices:
+            pod_spec["hostNetwork"] = True
         pod_spec["containers"] = [
             self._build_pathways_worker_container(pathways_worker_replicated_job_index)
         ]

@@ -149,6 +149,7 @@ class SpmdTrainer(Module):
         learner: Required[Learner.Config] = REQUIRED
         # The checkpointer config.
         checkpointer: BaseCheckpointer.Config = Checkpointer.default_config()
+        snapshotter: Optional[BaseCheckpointer.Config] = None
         # A dict of evaler names to configs, each name must be non-empty.
         evalers: dict[str, SpmdEvaler.Config] = {}
 
@@ -305,6 +306,8 @@ class SpmdTrainer(Module):
         mesh = jax.sharding.Mesh(devices, cfg.mesh_axis_names)
         self._step_log("Global mesh: %s", mesh)
         self._mesh = mesh
+        if cfg.snapshotter is not None:
+            self._step_log("[ELASTIC][SCALE] devices=%s", len(mesh.devices.flat))
         self._context_manager: Callable[[], ContextManager] = (
             maybe_instantiate(cfg.context_manager) or contextlib.nullcontext
         )
@@ -340,6 +343,8 @@ class SpmdTrainer(Module):
             self._add_child("learner", cfg.learner)
             cfg.checkpointer.dir = cfg.checkpointer.dir or os.path.join(cfg.dir, "checkpoints")
             self._add_child("checkpointer", cfg.checkpointer)
+            if cfg.snapshotter is not None:
+                self._add_child("snapshotter", cfg.snapshotter)
             if cfg.init_state_builder is not None:
                 self._add_child("init_state_builder", cfg.init_state_builder)
 
@@ -615,15 +620,15 @@ class SpmdTrainer(Module):
                 return None
 
             self._is_initialized = True
+            output = None
+            input_iterator = self.input.batches(self._input_iter)
 
-            with self.checkpointer:
+            def _train_loop():
+                nonlocal output
                 logging.info("Starting loop...")
                 start_time = time.perf_counter()
                 num_steps = 0
-                output = None
                 stop_trace_step = None
-
-                input_iterator = self.input.batches(self._input_iter)
                 while True:
                     self._maybe_record_event(measurement.Event.START_DATA_LOADING)
                     try:
@@ -669,6 +674,13 @@ class SpmdTrainer(Module):
                         break
                 if self.step < cfg.max_step:
                     self._step_log("Reached end of inputs. Stopping")
+
+            with self.checkpointer, (self.snapshotter if "snapshotter" in self.children else contextlib.nullcontext()):
+                if "snapshotter" in self.children:
+                    _train_loop = self.snapshotter.elastic_retry(
+                        pre_callback=self._restore_after_elastic_event,
+                        on_elastic_event_callback=lambda: setattr(self, "_trainer_state", None))(_train_loop)
+                _train_loop()
             self._step_log("Checkpointer flushed.")
             return output
 
@@ -907,6 +919,7 @@ class SpmdTrainer(Module):
         """
         self._maybe_record_event(measurement.Event.START_TRAINING_PREPARATION)
         cfg = self.config
+        self._prng_key = prng_key
 
         # Attempt to restore the latest checkpoint, which may contain a saved `_input_iter`.
         self.restore_checkpoint(restore_step=None)
@@ -937,9 +950,31 @@ class SpmdTrainer(Module):
             self._step_log("Already reached max_step=%s. Stopping", cfg.max_step)
             return False
 
+        self.save_snapshot(force=True)
         self._jit_train_step = self._pjit_train_step()
         self._maybe_record_event(measurement.Event.END_TRAINING_PREPARATION)
         return True
+
+    def _restore_after_elastic_event(self):
+        if self._trainer_state is not None:
+            return
+        self._step_log("[ELASTIC][SCALE] devices=%s unchanged; reusing mesh.", len(self._mesh.devices.flat))
+        with contextlib.suppress(Exception):
+            self.checkpointer.wait_until_finished()
+        if hasattr(mgr := getattr(self.checkpointer, "_manager", None), "_finalize_thread"):
+            mgr._finalize_thread.set(None)  # pylint: disable=protected-access
+        with self.mesh():
+            snap_step = self.snapshotter.latest_snapshot_step or -1
+            ckpt_steps = getattr(self.checkpointer, "checkpoint_steps", lambda _: ())(self.checkpointer.config.dir)
+            step, state = (self.snapshotter.restore(state=self._trainer_state_specs._asdict())
+                           if snap_step >= max(ckpt_steps, default=0) else (None, None))
+            if step is not None:
+                self._step, self._trainer_state = step, TrainerState(**state)
+            elif self.restore_checkpoint() is None:
+                logging.warning("[ELASTIC] No snapshot or checkpoint to restore; re-initializing.")
+                self.init(self._prng_key)
+                self._step = 0
+            self.save_snapshot(force=True)
 
     def restore_checkpoint(self, restore_step: Optional[int] = None) -> Optional[int]:
         """Restores trainer state from checkpoint.
@@ -1024,6 +1059,22 @@ class SpmdTrainer(Module):
             self.checkpointer.save(
                 step=self.step, state=ckpt_state, evaler_summaries=evaler_summaries
             )
+
+    def save_snapshot(
+        self, evaler_summaries: Optional[dict[str, Any]] = None, *, force: bool = False
+    ):
+        if "snapshotter" not in self.children:
+            return
+        mgr = getattr(self.checkpointer, "_manager", None)
+        saving = getattr(mgr, "is_saving_in_progress", lambda: False)()
+        if not force and saving and self.snapshotter.config.defer_during_checkpoint:
+            logging.info("[ELASTIC] Step %s: async checkpoint save in progress; deferring snapshot.", self.step)
+        elif force or self.snapshotter.latest_snapshot_step != self.step:
+            with self.mesh():
+                self.snapshotter.save(
+                    step=self.step, state=self._trainer_state._asdict(),
+                    evaler_summaries=evaler_summaries, force=force, hold_previous=saving,
+                )
 
     def _restore_from_builder(self) -> Optional[TrainerStateBuilder.State]:
         """Restores trainer state by building it with init_state_builder."""
@@ -1154,7 +1205,7 @@ class SpmdTrainer(Module):
         if self.step % n == 0 or 0 <= self.step <= 5:
             self._step_log(
                 "loss=%s aux=%s",
-                outputs["loss"],
+                outputs["loss"].item() if hasattr(outputs["loss"], "item") else outputs["loss"],
                 jax.tree.map(lambda x: x.item() if x.ndim == 0 else f"T{x.shape}", outputs["aux"]),
             )
 
@@ -1166,6 +1217,7 @@ class SpmdTrainer(Module):
 
         # Checkpointer policy will decide if we should save.
         self.save_checkpoint(evaler_summaries=evaler_summaries)
+        self.save_snapshot(evaler_summaries=evaler_summaries)
 
         return_dict = {"loss": outputs["loss"], "aux": outputs["aux"]}
         # Returns evaler_summaries if force_run_evals is not None or empty set.
