@@ -47,6 +47,7 @@ from axlearn.common.checkpointer import (
     every_n_steps_policy,
 )
 from axlearn.common.config import REQUIRED, Required, config_class, config_for_function
+from axlearn.common.elastic_input import ElasticInput, ElasticSpmdInputDispatcher
 from axlearn.common.evaler import SpmdEvaler
 from axlearn.common.evaler import every_n_steps_policy as eval_every_n_steps_policy
 from axlearn.common.input_base import Input
@@ -1237,6 +1238,44 @@ class TrainerTest(test_utils.TestCase):
         if not test_utils.is_supported_platform("tpu"):
             self.skipTest("Requires TPU backend")
         self._test_input_dispatch(multiple, backend="tpu")
+
+    @pytest.mark.for_8_devices
+    def test_elastic_input_dispatch(self):
+        """Tests that `ElasticInput` is a drop-in wrapper for a dispatcher-based input."""
+        if jax.device_count() < 2:
+            self.skipTest("Requires multiple devices")
+        device_count = jax.device_count()
+        batch_axis_names = ("data",)
+        global_logical_batch_size = device_count
+        input_cfg = DummyInput.default_config().set(
+            input_dispatcher=ElasticSpmdInputDispatcher.default_config().set(
+                global_logical_batch_size=global_logical_batch_size
+            )
+        )
+        cfg = self._trainer_config(input_cfg)
+        cfg.input = ElasticInput.default_config().set(input=input_cfg)
+        cfg.batch_axis_names = batch_axis_names
+        cfg.max_step = 3
+        cfg.mesh_shape = (device_count, 1)
+        cfg.model = self._dummy_input_checking_model(
+            global_logical_batch_size, partition_spec=PartitionSpec(batch_axis_names)
+        )
+        trainer: SpmdTrainer = cfg.instantiate(parent=None)
+        self.assertIsInstance(trainer.input, ElasticInput)
+        # Without an elastic manager (or `num_max_slices`) the wrapper is transparent.
+        self.assertFalse(trainer.input.is_in_elastic_mode)
+        self.assertEqual(trainer.input.device_batch_sizes, (1, 1))
+        dispatcher = trainer.input.primary_input.input_dispatcher
+        # The trainer's partition spec reaches the wrapped input's dispatcher.
+        self.assertEqual(dispatcher.config.partition_spec, PartitionSpec(batch_axis_names))
+        with trainer.mesh():
+            self.assertEqual(
+                PartitionSpec(batch_axis_names),
+                # pylint: disable-next=protected-access
+                trainer._train_step_input_partition_specs(),
+            )
+        trainer.run(jax.random.PRNGKey(0))
+        self.assertTrue(trainer.model.forward_called)
 
     def test_optional_batch_axes(self):
         """Tests that we can omit batch_axis_names."""
