@@ -152,7 +152,8 @@ class SpmdTrainer(Module):
         learner: Required[Learner.Config] = REQUIRED
         # The checkpointer config.
         checkpointer: BaseCheckpointer.Config = Checkpointer.default_config()
-        snapshotter: Optional[BaseCheckpointer.Config] = None
+        snapshotter: Optional[InstantiableConfig] = None
+        snapshot_every_n_steps: int = 5
         elastic_enabled: bool = False
         elastic_min_slice_count: int = -1
         elastic_timeout_seconds: Optional[float] = None
@@ -358,8 +359,13 @@ class SpmdTrainer(Module):
             self._add_child("learner", cfg.learner)
             cfg.checkpointer.dir = cfg.checkpointer.dir or os.path.join(cfg.dir, "checkpoints")
             self._add_child("checkpointer", cfg.checkpointer)
-            if cfg.snapshotter is not None:
-                self._add_child("snapshotter", cfg.snapshotter)
+            if cfg.snapshotter is not None and hasattr(cfg.snapshotter, "replica_axis_index"):
+                cfg.snapshotter.replica_axis_index = (
+                    cfg.mesh_axis_names.index("data") if "data" in cfg.mesh_axis_names else 0
+                )
+            self.snapshotter = (
+                maybe_instantiate(cfg.snapshotter) if cfg.snapshotter is not None else None
+            )
             if cfg.init_state_builder is not None:
                 self._add_child("init_state_builder", cfg.init_state_builder)
 
@@ -519,6 +525,8 @@ class SpmdTrainer(Module):
 
     def _on_elastic_event(self):
         self._trainer_state = None
+        if self.snapshotter is not None:
+            self.snapshotter.cancel_pending()
         # Goodput classifies the wait by its type, and pairs its start and end by type.
         self._elastic_wait_event_type = (
             "elastic_scale_up" if self._scale_up_requested else "elastic_slice_down"
@@ -566,7 +574,11 @@ class SpmdTrainer(Module):
         if hasattr(self.checkpointer, "reset_after_elastic_event"):
             self.checkpointer.reset_after_elastic_event(devices_changed=devices_changed)
         with self.mesh():
-            snap_step = self.snapshotter.latest_snapshot_step if "snapshotter" in self.children else None
+            snap_step = (
+                self.snapshotter.latest.step
+                if self.snapshotter and self.snapshotter.latest
+                else None
+            )
             ckpt_step = max(self.checkpointer.checkpoint_steps(self.checkpointer.config.dir), default=0) if hasattr(self.checkpointer, "checkpoint_steps") else 0
             restored_step = (
                 self._restore_snapshot(step=snap_step)
@@ -593,16 +605,30 @@ class SpmdTrainer(Module):
         Returns:
             The restored step or None (if no usable snapshot is found).
         """
+        if self.snapshotter is None or self.snapshotter.latest is None:
+            return None
         # Orbax logs checkpoint restores, but nothing logs snapshot restores. If the restore
         # raises, the start stays unpaired and is ignored.
         self._maybe_record_event(
             measurement.Event.START_CHECKPOINT_RESTORE, source="snapshot", step=step
         )
-        restored_step = self.restore_checkpoint(checkpointer=self.snapshotter)
+        try:
+            with self.mesh():
+                restored = self.snapshotter.load(
+                    self._trainer_state_specs._asdict(), reset_snapshot_state=False
+                )
+        except (ValueError, RuntimeError, jax.errors.JaxRuntimeError) as e:
+            logging.warning("Snapshot restore failed at step %s: %s", step, e)
+            self.snapshotter.evict()
+            return None
+        self._step = step
+        self._trainer_state = TrainerState(
+            **{k: v for k, v in restored.items() if k in TrainerState._fields}
+        )
         self._maybe_record_event(
             measurement.Event.END_CHECKPOINT_RESTORE, source="snapshot", step=step
         )
-        return restored_step
+        return step
 
     @contextlib.contextmanager
     def _watchdog(self):
@@ -850,17 +876,22 @@ class SpmdTrainer(Module):
                         self._maybe_record_event(measurement.Event.END_DATA_LOADING)
                         break
 
-            with (
-                self.checkpointer,
-                self.snapshotter if "snapshotter" in self.children else contextlib.nullcontext(),
-            ):
-                elastic_utils.elastic_retry(
-                    min_slice_count=cfg.elastic_min_slice_count,
-                    timeout_seconds=cfg.elastic_timeout_seconds,
-                    max_retries=cfg.elastic_max_retries,
-                    pre_callback=self._restore_after_elastic_event,
-                    on_elastic_event_callback=self._on_elastic_event,
-                )(_step_loop)()
+            with self.checkpointer:
+                try:
+                    elastic_utils.elastic_retry(
+                        min_slice_count=cfg.elastic_min_slice_count,
+                        timeout_seconds=cfg.elastic_timeout_seconds,
+                        max_retries=cfg.elastic_max_retries,
+                        pre_callback=self._restore_after_elastic_event,
+                        on_elastic_event_callback=self._on_elastic_event,
+                    )(_step_loop)()
+                except Exception:
+                    if self.snapshotter is not None:
+                        self.snapshotter.cancel_pending()
+                    raise
+                finally:
+                    if self.snapshotter is not None:
+                        self.snapshotter.join()
                 if self.step < cfg.max_step:
                     self._step_log("Reached end of inputs. Stopping")
             self._step_log("Checkpointer flushed.")
@@ -1148,7 +1179,7 @@ class SpmdTrainer(Module):
         self._maybe_record_event(measurement.Event.END_DATA_ITERATOR_INIT)
         return input_iter
 
-    def restore_checkpoint(self, restore_step: Optional[int] = None, *, checkpointer: Optional[BaseCheckpointer] = None) -> Optional[int]:
+    def restore_checkpoint(self, restore_step: Optional[int] = None) -> Optional[int]:
         """Restores trainer state from checkpoint.
 
         If successful, sets self._step and self._trainer_state to the restored step and state,
@@ -1168,10 +1199,10 @@ class SpmdTrainer(Module):
             for path, spec in utils.flatten_items(self._trainer_state_specs):
                 self.vlog(1, "restore spec: %s=%s", path, spec)
             ckpt_state_spec = self._trainer_state_specs._asdict()
-            restore_input_iter = cfg.save_input_iterator and not ("snapshotter" in self.children and checkpointer is self.snapshotter)
+            restore_input_iter = cfg.save_input_iterator
             try:
                 # Try to restore with `input_iter`.
-                step, ckpt_state = (checkpointer or self.checkpointer).restore(
+                step, ckpt_state = self.checkpointer.restore(
                     step=restore_step,
                     state=(
                         dict(**ckpt_state_spec, input_iter=self._create_input_iterator())
@@ -1191,7 +1222,7 @@ class SpmdTrainer(Module):
             # tensorflow when tensorflow dataset iterator checkpoints are not found
             # pylint: disable-next=broad-exception-caught
             except Exception as e:
-                if checkpointer is not None or isinstance(e, jax.errors.JaxRuntimeError):
+                if isinstance(e, jax.errors.JaxRuntimeError):
                     raise
                 logging.warning(
                     "Attempt to restore checkpoint with restore_input_iter=%s failed: %s",
@@ -1224,31 +1255,40 @@ class SpmdTrainer(Module):
                     self._input_iter = ckpt_state["input_iter"]
             return step
 
-    def save_checkpoint(self, evaler_summaries: Optional[dict[str, Any]] = None, *, checkpointer: Optional[BaseCheckpointer] = None, **kwargs) -> Optional[int]:
+    def save_checkpoint(self, evaler_summaries: Optional[dict[str, Any]] = None) -> Optional[int]:
         """Saves a checkpoint (subject to checkpointer policy)."""
         cfg: SpmdTrainer.Config = self.config
-        target = checkpointer or self.checkpointer
         with self.mesh():
             state = self._trainer_state
-            if checkpointer is None and "snapshotter" in self.children and getattr(target, "_save_policy", lambda **_: False)(step=self.step, evaler_summaries=evaler_summaries or {}):
-                target.wait_until_finished()
+            if self.snapshotter is not None and getattr(self.checkpointer, "_save_policy", lambda **_: False)(step=self.step, evaler_summaries=evaler_summaries or {}):
+                self.checkpointer.wait_until_finished()
                 self.save_snapshot(evaler_summaries=evaler_summaries, force=True)
-                if self.snapshotter.latest_snapshot_state is not None:
+                if self.snapshotter.latest_state is not None:
                     logging.info("[ELASTIC] [POLICY_A] Sharing host-RAM snapshot at step %d with Checkpointer.save()", self.step)
-                    state = self.snapshotter.latest_snapshot_state
+                    state = self.snapshotter.latest_state
             ckpt_state = state._asdict() if hasattr(state, "_asdict") else dict(state)
             if cfg.save_input_iterator:
                 ckpt_state["input_iter"] = self._input_iter
-            target.save(step=self.step, state=ckpt_state, evaler_summaries=evaler_summaries, **kwargs)
+            self.checkpointer.save(step=self.step, state=ckpt_state, evaler_summaries=evaler_summaries)
 
     def save_snapshot(self, evaler_summaries: Optional[dict[str, Any]] = None, *, force: bool = False):
-        if "snapshotter" not in self.children:
+        del evaler_summaries
+        if self.snapshotter is None:
+            return
+        every_n = self._config.snapshot_every_n_steps
+        if not force and (every_n <= 0 or self.step <= 0 or self.step % every_n != 0):
             return
         saving = self._is_checkpoint_saving_in_progress()
         if not force and saving and self._config.elastic_snapshot_defer_during_checkpoint:
             logging.info("[ELASTIC] Step %s: async checkpoint save in progress; deferring snapshot.", self.step)
-        elif force or self.snapshotter.latest_snapshot_step != self.step:
-            self.save_checkpoint(evaler_summaries, checkpointer=self.snapshotter, force=force, hold_previous=saving)
+        elif force or (self.snapshotter.latest is None or self.snapshotter.latest.step != self.step):
+            with self.mesh():
+                self.snapshotter.save(
+                    self.step,
+                    self._trainer_state._asdict(),
+                    force=force,
+                    hold_previous=saving,
+                )
 
     def _restore_from_builder(self) -> Optional[TrainerStateBuilder.State]:
         """Restores trainer state by building it with init_state_builder."""
@@ -1491,7 +1531,7 @@ class SpmdTrainer(Module):
             lowered_train_step = jit_train_step.lower(trainer_state, input_batch)
             compiled = lowered_train_step.compile(compiler_options=compiler_options)
             logging.info("AOT Model Analysis:\n%s", aot_model_analysis(compiled))
-            if "snapshotter" in self.children:
+            if self.snapshotter is not None:
                 self.snapshotter.check_hbm_headroom(compiled, device=self._mesh.devices.flat[0])
             return compiled
 

@@ -12,7 +12,7 @@ from absl import flags, logging
 
 from axlearn.common import file_system as fs
 from axlearn.common import measurement
-from axlearn.common.config import TrainerConfigFn, get_named_trainer_config
+from axlearn.common.config import TrainerConfigFn, config_for_class, get_named_trainer_config
 from axlearn.common.trainer import SpmdTrainer, select_mesh_config
 from axlearn.common.utils import MeshShape, get_data_dir, infer_mesh_shape
 
@@ -184,11 +184,11 @@ def get_trainer_config(
     if flag_values.elastic_enabled:
         # pylint: disable=import-outside-toplevel
         from axlearn.common import elastic_utils
-        from axlearn.common.checkpointer import Checkpointer, every_n_steps_policy
+        from axlearn.common.checkpointer import Checkpointer
         from axlearn.common.checkpointer_orbax import OrbaxCheckpointer
         from axlearn.common.elastic_input import ElasticInput, ElasticSpmdInputDispatcher
         from axlearn.common.input_dispatch import SpmdInputDispatcher
-        from axlearn.common.snapshot import Snapshotter
+        from orbax.checkpoint.experimental.v1.training.pathways import Snapshotter
         # pylint: enable=import-outside-toplevel
 
         trainer_config.set(
@@ -198,6 +198,7 @@ def get_trainer_config(
             elastic_max_retries=flag_values.elastic_max_retries,
             elastic_scale_grad_accumulation=flag_values.elastic_scale_grad_accumulation,
             elastic_snapshot_defer_during_checkpoint=flag_values.elastic_snapshot_defer_during_checkpoint,
+            snapshot_every_n_steps=flag_values.elastic_snapshot_every_n_steps,
         )
         dispatcher = getattr(trainer_config.input, "input_dispatcher", None)
         if elastic_utils.ensure_elastic_manager_initialized(True) is not None and isinstance(dispatcher, SpmdInputDispatcher.Config):
@@ -213,8 +214,7 @@ def get_trainer_config(
                 max_concurrent_save_gb=16,
             )
         if flag_values.elastic_backup_kind == "snapshot":
-            trainer_config.snapshotter = Snapshotter.default_config().set(
-                save_policy=every_n_steps_policy(flag_values.elastic_snapshot_every_n_steps),
+            trainer_config.snapshotter = config_for_class(Snapshotter).set(
                 stage_in_hbm=flag_values.elastic_snapshot_stage_in_hbm,
             )
     if flag_values.save_every_n_steps is not None:
