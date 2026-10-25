@@ -1423,7 +1423,7 @@ class ElasticGoodputEventsTest(test_utils.TestCase):
         dict(scale_up_requested=False, expected_type="elastic_slice_down"),
     )
     def test_elastic_wait_event_type(self, scale_up_requested: bool, expected_type: str):
-        trainer = unittest.mock.MagicMock()
+        trainer = unittest.mock.MagicMock(snapshotter=None)
         trainer._scale_up_requested = scale_up_requested
         trainer._elastic_wait_event_type = None
         SpmdTrainer._on_elastic_event(trainer)
@@ -1451,7 +1451,7 @@ class ElasticGoodputEventsTest(test_utils.TestCase):
 
     def test_reinit_without_elastic_wait(self):
         """Tests that no unpaired end of an elastic wait is recorded."""
-        trainer = unittest.mock.MagicMock()
+        trainer = unittest.mock.MagicMock(snapshotter=None)
         trainer._trainer_state = None
         trainer._elastic_wait_event_type = None
         device = unittest.mock.MagicMock(id=0)
@@ -1477,19 +1477,18 @@ class ElasticGoodputEventsTest(test_utils.TestCase):
         trainer = unittest.mock.MagicMock()
         trainer._trainer_state = None
         trainer._elastic_wait_event_type = None
-        trainer.children = {"snapshotter": trainer.snapshotter}
-        trainer.snapshotter.latest_snapshot_step = 10
+        trainer.snapshotter.latest.step = 10
+        trainer.snapshotter.load.return_value = TrainerState(
+            prng_key=None, model=None, learner=None
+        )._asdict()
+        trainer.snapshotter.load.side_effect = RuntimeError if restore_raises else None
         trainer.checkpointer.checkpoint_steps.return_value = ckpt_steps
         trainer._restore_snapshot.side_effect = lambda **kw: SpmdTrainer._restore_snapshot(
             trainer, **kw
         )
-        trainer.restore_checkpoint.side_effect = RuntimeError if restore_raises else None
         device = unittest.mock.MagicMock(id=0)
         trainer._mesh.devices.flat = [device]
-        with (
-            unittest.mock.patch.object(elastic_utils, "live_devices", return_value=[device]),
-            self.assertRaises(RuntimeError) if restore_raises else contextlib.nullcontext(),
-        ):
+        with unittest.mock.patch.object(elastic_utils, "live_devices", return_value=[device]):
             SpmdTrainer._restore_after_elastic_event(trainer)
         events = [c.args[0] for c in trainer._maybe_record_event.call_args_list]
         snapshot_events = [
@@ -1499,12 +1498,16 @@ class ElasticGoodputEventsTest(test_utils.TestCase):
         ]
         self.assertEqual(expected, snapshot_events)
         if expected:
-            trainer.restore_checkpoint.assert_any_call(checkpointer=trainer.snapshotter)
+            trainer.snapshotter.load.assert_called_once_with(
+                trainer._trainer_state_specs._asdict(), reset_snapshot_state=False
+            )
             trainer._maybe_record_event.assert_any_call(
                 measurement.Event.START_CHECKPOINT_RESTORE, source="snapshot", step=10
             )
             # Within the elastic reinitialization.
             self.assertEqual(measurement.Event.START_ELASTIC_REINIT, events[0])
+        if restore_raises:
+            trainer.snapshotter.evict.assert_called_once_with()
         if expected == ["START", "END"]:
             self.assertEqual(measurement.Event.END_ELASTIC_REINIT, events[-1])
 
@@ -1518,8 +1521,10 @@ class ElasticGoodputEventsTest(test_utils.TestCase):
         trainer = unittest.mock.MagicMock()
         trainer._trainer_state = None
         trainer._elastic_wait_event_type = "elastic_slice_down"
-        trainer.children = {"snapshotter": trainer.snapshotter} if snapshot else {}
-        trainer.snapshotter.latest_snapshot_step = 10
+        if snapshot:
+            trainer.snapshotter.latest.step = 10
+        else:
+            trainer.snapshotter = None
         trainer.checkpointer.checkpoint_steps.return_value = [5]
         trainer._restore_snapshot.return_value = 10
         trainer.restore_checkpoint.return_value = 5

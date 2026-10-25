@@ -15,7 +15,7 @@ from absl.testing import absltest
 
 import numpy as np
 
-from axlearn.common import elastic_utils, snapshot
+from axlearn.common import elastic_utils
 
 
 class _FakeManager:
@@ -40,9 +40,11 @@ def _elastic_trainer_fixture(**overrides):
     `pathwaysutils` does, so `SpmdTrainer.run` can be exercised end to end on CPU devices.
     """
     # pylint: disable=import-outside-toplevel
+    from orbax.checkpoint.experimental.v1.training.pathways import Snapshotter
+
     from axlearn.common import learner, optimizers, param_init
     from axlearn.common.checkpointer import Checkpointer, every_n_steps_policy
-    from axlearn.common.config import config_for_function
+    from axlearn.common.config import config_for_class, config_for_function
     from axlearn.common.elastic_input import ElasticInput, ElasticSpmdInputDispatcher
     from axlearn.common.trainer import SpmdTrainer
     from axlearn.common.trainer_test import DummyInput, DummyModel
@@ -100,9 +102,8 @@ def _elastic_trainer_fixture(**overrides):
         checkpointer=Checkpointer.default_config().set(
             save_policy=config_for_function(every_n_steps_policy).set(n=100)
         ),
-        snapshotter=snapshot.Snapshotter.default_config().set(
-            save_policy=config_for_function(every_n_steps_policy).set(n=1)
-        ),
+        snapshotter=config_for_class(Snapshotter),
+        snapshot_every_n_steps=1,
         elastic_enabled=True,
         elastic_min_slice_count=1,
         max_step=4,
@@ -208,20 +209,20 @@ class ElasticUtilsTest(absltest.TestCase):
 
     def test_snapshot_restore_places_surviving_slice_first(self):
         # When Slice 0 is replaced and Slice 1 holds the surviving pinned_host replica,
-        # Snapshotter.restore must populate Slice 1's device shard locally from its own
+        # Snapshotter.load must populate Slice 1's device shard locally from its own
         # pinned_host shard first rather than caching Slice 0's shard and bouncing back.
+        # pylint: disable-next=import-outside-toplevel
+        from orbax.checkpoint.experimental.v1.training.pathways import Snapshotter
+
         d0, d1 = mock.Mock(id=0), mock.Mock(id=1)
         pinned_shard = mock.Mock(name="slice1_pinned_shard")
         replica_shard = mock.Mock(index=(slice(None),), data=pinned_shard)
-        replica = mock.Mock(
+        replica = mock.MagicMock(
+            dtype=np.float32,
             sharding=mock.Mock(mesh=mock.Mock(devices=np.array([d1]))),
             addressable_shards=[replica_shard],
         )
-        pinned_arr = mock.MagicMock(
-            spec=jax.Array,
-            shape=(4,),
-            sharding=mock.Mock(mesh=mock.Mock(shape={"data": 2}, devices=np.array([d0, d1]))),
-        )
+        replica.__getitem__.return_value = replica
         target_sharding = mock.Mock()
         target_sharding.with_memory_kind.return_value = target_sharding
         target_sharding.mesh.devices = np.array([d0, d1])
@@ -232,35 +233,39 @@ class ElasticUtilsTest(absltest.TestCase):
         }
         spec = mock.Mock(shape=(4,), sharding=target_sharding)
 
-        snap = snapshot.Snapshotter.default_config().set(name="snap").instantiate(parent=None)
-        snap._latest_snapshot = ({"w": pinned_arr}, 5)  # pylint: disable=protected-access
+        replica.shape = (4,)
+        replica.sharding.device_set = {d1}
+        replica.sharding.with_memory_kind.return_value = replica.sharding
+        target_sharding.device_set = {d0, d1}
+        snap = Snapshotter()
+        snap._latest_snapshot = ([{"w": replica}], 5)  # pylint: disable=protected-access
+        snap._concatenate_by_mesh_axis = None  # pylint: disable=protected-access
 
         put_calls = []
 
         def fake_device_put(src, dst_sharding):
-            out = mock.Mock(name=f"hbm_shard_dev{dst_sharding.dev.id}")
-            put_calls.append((src, dst_sharding.dev.id, out))
-            return out
+            if getattr(dst_sharding, "dev", None) in (d0, d1):
+                out = mock.Mock(name=f"hbm_shard_dev{dst_sharding.dev.id}", dtype=np.float32)
+                put_calls.append((src, dst_sharding.dev.id, out))
+                return out
+            return src
 
-        def fake_single_device_sharding(dev):
-            s = mock.Mock(dev=dev)
-            s.with_memory_kind.return_value = s
-            return s
+        class FakeSingleDeviceSharding:
+            def __init__(self, dev):
+                self.dev = dev
+            def with_memory_kind(self, _):
+                return self
 
         with (
-            mock.patch.object(
-                snapshot,
-                "split_by_mesh_axis",
-                mock.Mock(split_by_mesh_axis=mock.Mock(return_value=[replica])),
-            ),
-            mock.patch.object(jax.sharding, "SingleDeviceSharding", side_effect=fake_single_device_sharding),
+            mock.patch.object(snap, "_load_by_region_rebinding", wraps=snap._load_by_region_rebinding),
+            mock.patch("orbax.checkpoint.experimental.v1._src.training.pathways.snapshotter.is_shardable_array", side_effect=lambda x: hasattr(x, "sharding")),
+            mock.patch.object(jax.sharding, "SingleDeviceSharding", FakeSingleDeviceSharding),
             mock.patch.object(jax, "device_put", side_effect=fake_device_put),
             mock.patch.object(jax, "make_array_from_single_device_arrays", side_effect=lambda shape, sh, shards: shards),
             mock.patch.object(jax, "block_until_ready", side_effect=lambda x: x),
         ):
-            step, _ = snap.restore(state={"w": spec})
+            snap.load({"w": spec}, reset_snapshot_state=False)
 
-        self.assertEqual(step, 5)
         self.assertLen(put_calls, 2)
         # First device_put is onto surviving Slice 1 (d1) directly from its local pinned_shard.
         self.assertEqual(put_calls[0][0], pinned_shard)
@@ -284,6 +289,10 @@ class ElasticUtilsTest(absltest.TestCase):
 
         with mock.patch.object(jax, "devices", return_value=devs):
             trainer: SpmdTrainer = cfg.instantiate(parent=None)
+            trainer.snapshotter._split_by_mesh_axis = mock.Mock(  # pylint: disable=protected-access
+                split_by_mesh_axis=lambda x, _: [x]
+            )
+            trainer.snapshotter._concatenate_by_mesh_axis = None  # pylint: disable=protected-access
             init_calls = [0]
             orig_init = trainer.init
 
