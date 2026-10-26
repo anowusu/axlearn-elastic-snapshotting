@@ -494,6 +494,9 @@ class TPUReplicatedJobTest(TestCase):
             else:
                 self.assertEqual(pod_spec.get("priorityClassName", None), priority_class)
 
+            # Host networking is always enabled (cross-slice health checks for elastic training).
+            self.assertTrue(pod_spec.get("hostNetwork", False))
+            self.assertEqual(pod_spec.get("dnsPolicy"), "ClusterFirstWithHostNet")
             if additional_node_networks:
                 self.assertEqual(
                     additional_node_networks,
@@ -503,13 +506,9 @@ class TPUReplicatedJobTest(TestCase):
                     f"{cfg.service_account}@{cfg.project}.iam.gserviceaccount.com",
                     annotations.get(_ANNOTATION_NODE_SERVICE_ACCOUNT),
                 )
-                self.assertTrue(pod_spec.get("hostNetwork", False))
-                self.assertEqual(pod_spec.get("dnsPolicy"), "ClusterFirstWithHostNet")
             else:
                 self.assertNotIn(_ANNOTATION_ADDITIONAL_NODE_NETWORKS, annotations)
                 self.assertNotIn(_ANNOTATION_NODE_SERVICE_ACCOUNT, annotations)
-                self.assertNotIn("hostNetwork", pod_spec)
-                self.assertNotIn("dnsPolicy", pod_spec)
 
     def test_replicated_job(self):
         with (
