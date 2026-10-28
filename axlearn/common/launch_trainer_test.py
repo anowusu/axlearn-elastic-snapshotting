@@ -11,7 +11,9 @@ from absl import flags
 from absl.testing import parameterized
 
 from axlearn.common import launch_trainer
+from axlearn.common.checkpointer_orbax import OrbaxCheckpointer
 from axlearn.common.test_utils import TestCase
+from axlearn.common.trainer import SpmdTrainer
 
 
 def _mock_get_named_trainer_config(config_name: str, *, config_module: str) -> mock.MagicMock:
@@ -201,6 +203,47 @@ class GetTrainerConfigTest(TestCase):
             self.assertEqual(cfg.crash_on_hang_timeout_seconds, 5000)
 
 
+class ElasticFlagsTest(TestCase):
+    """Tests the `--elastic_enabled` pause-and-resume flag wiring."""
+
+    def test_elastic_disabled_is_noop(self):
+        fv = _flag_values_from_dict(
+            {
+                "config": "config",
+                "config_module": "local_module",
+                "trainer_dir": "/tmp/trainer",
+                "trace_at_steps": [],
+                "eval_trace_at_iters": [],
+                "device_monitor": "none",
+                "mesh_selector": None,
+            }
+        )
+        cfg = launch_trainer.get_trainer_config(
+            flag_values=fv, trainer_config_fn=SpmdTrainer.default_config
+        )
+        self.assertIsNone(cfg.snapshotter)
+
+    def test_elastic_enabled_configures_snapshotter(self):
+        fv = _flag_values_from_dict(
+            {
+                "config": "config",
+                "config_module": "local_module",
+                "trainer_dir": "/tmp/trainer",
+                "trace_at_steps": [],
+                "eval_trace_at_iters": [],
+                "device_monitor": "none",
+                "mesh_selector": None,
+                "elastic_enabled": True,
+                "elastic_snapshot_every_n_steps": 3,
+            }
+        )
+        cfg = launch_trainer.get_trainer_config(
+            flag_values=fv, trainer_config_fn=SpmdTrainer.default_config
+        )
+        self.assertIsNotNone(cfg.snapshotter)
+        self.assertEqual(cfg.snapshotter.save_policy.n, 3)
+
+
 if __name__ == "__main__":
     import sys
 
@@ -209,3 +252,4 @@ if __name__ == "__main__":
     # pytest.main is required here: importing axlearn.common.launch_trainer registers absl flags
     # with None defaults. absltest.main() triggers flag parsing which rejects None values.
     sys.exit(pytest.main([__file__]))
+
