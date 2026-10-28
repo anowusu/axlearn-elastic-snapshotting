@@ -25,6 +25,7 @@ core = [
     "etils[epy]==1.13.0",  # pin to ensure importlib-resources is installed (needed by tensorflow-datasets)
     "jax==0.8.3",
     "jaxlib==0.8.3",
+    "pathwaysutils==0.1.11",
     "ml-dtypes==0.5.3",
     "msgpack==1.1.0",  # for checkpointing.
     "nltk==3.9.2",  # for text preprocessing
@@ -100,7 +101,6 @@ gcp = [
 tpu = [
     "axlearn[gcp]",
     "jax[tpu]==0.8.3",  # must be >=0.4.19 for compat with v5p.
-    "pathwaysutils==0.1.10",  # For JAX+Pathways single-controller accelerator coordinator.
 ]
 # Vertex AI tensorboard. TODO(markblee): Merge with `gcp`.
 vertexai_tensorboard = [
