@@ -9,9 +9,14 @@ from unittest import mock
 
 from absl import flags
 from absl.testing import parameterized
+from jax.sharding import PartitionSpec
 
-from axlearn.common import launch_trainer
+from axlearn.common import input_tf_data, launch_trainer
+from axlearn.common.elastic_input import ElasticInput, ElasticSpmdInputDispatcher
+from axlearn.common.input_dispatch import SpmdInputDispatcher
 from axlearn.common.test_utils import TestCase
+from axlearn.common.trainer import SpmdTrainer
+
 
 
 def _mock_get_named_trainer_config(config_name: str, *, config_module: str) -> mock.MagicMock:
@@ -199,6 +204,85 @@ class GetTrainerConfigTest(TestCase):
 
             # Verify that the pre-existing value was not overridden
             self.assertEqual(cfg.crash_on_hang_timeout_seconds, 5000)
+
+
+class ElasticFlagsTest(TestCase):
+    """Tests the `--elastic_enabled` wiring."""
+
+    @parameterized.parameters(dict(pathways=True), dict(pathways=False))
+    def test_elastic_input_wrapping(self, pathways: bool):
+        def trainer_config_fn():
+            cfg = SpmdTrainer.default_config()
+            cfg.input = input_tf_data.Input.default_config().set(
+                input_dispatcher=SpmdInputDispatcher.default_config().set(
+                    global_logical_batch_size=8, partition_spec=PartitionSpec("data")
+                )
+            )
+            return cfg
+
+        fv = _flag_values_from_dict(
+            {
+                "config": "config",
+                "config_module": "local_module",
+                "trainer_dir": "/tmp/trainer",
+                "trace_at_steps": [],
+                "eval_trace_at_iters": [],
+                "device_monitor": "none",
+                "mesh_selector": None,
+                "elastic_enabled": True,
+                "elastic_min_slice_count": 1,
+            }
+        )
+        # The elastic manager only exists on the Pathways backend.
+        with mock.patch(
+            "axlearn.common.elastic_utils.ensure_elastic_manager_initialized",
+            return_value=mock.Mock() if pathways else None,
+        ):
+            cfg = launch_trainer.get_trainer_config(
+                flag_values=fv, trainer_config_fn=trainer_config_fn
+            )
+        self.assertTrue(cfg.elastic_enabled)
+        self.assertEqual(cfg.elastic_min_slice_count, 1)
+        if pathways:
+            self.assertIsInstance(cfg.input, ElasticInput.Config)
+            dispatcher = cfg.input.input.input_dispatcher
+            self.assertIsInstance(dispatcher, ElasticSpmdInputDispatcher.Config)
+            self.assertEqual(dispatcher.global_logical_batch_size, 8)
+            self.assertEqual(dispatcher.partition_spec, PartitionSpec("data"))
+            self.assertIsNone(dispatcher.num_max_slices)
+        else:
+            self.assertIsInstance(cfg.input, input_tf_data.Input.Config)
+            self.assertIsInstance(cfg.input.input_dispatcher, SpmdInputDispatcher.Config)
+
+    @parameterized.parameters(
+        dict(stage=False, defer=True, scale=True),
+        dict(stage=True, defer=False, scale=False),
+    )
+    def test_snapshot_and_grad_accumulation_flags(self, stage, defer, scale):
+        fv = _flag_values_from_dict(
+            {
+                "config": "config",
+                "config_module": "local_module",
+                "trainer_dir": "/tmp/trainer",
+                "trace_at_steps": [],
+                "eval_trace_at_iters": [],
+                "device_monitor": "none",
+                "mesh_selector": None,
+                "elastic_enabled": True,
+                "elastic_snapshot_stage_in_hbm": stage,
+                "elastic_snapshot_defer_during_checkpoint": defer,
+                "elastic_scale_grad_accumulation": scale,
+            }
+        )
+        with mock.patch(
+            "axlearn.common.elastic_utils.ensure_elastic_manager_initialized", return_value=None
+        ):
+            cfg = launch_trainer.get_trainer_config(
+                flag_values=fv, trainer_config_fn=SpmdTrainer.default_config
+            )
+        self.assertEqual(cfg.snapshotter.stage_in_hbm, stage)
+        self.assertEqual(cfg.elastic_snapshot_defer_during_checkpoint, defer)
+        self.assertEqual(cfg.elastic_scale_grad_accumulation, scale)
 
 
 if __name__ == "__main__":
