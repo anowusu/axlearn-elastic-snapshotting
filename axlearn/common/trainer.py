@@ -70,6 +70,12 @@ from axlearn.common.utils import (
 )
 
 
+import pathwaysutils
+from pathwaysutils.elastic import manager
+
+from orbax.checkpoint import pathways as orbax_pathways
+
+
 class TrainerState(NamedTuple):
     prng_key: Union[Tensor, TensorSpec, jax.sharding.NamedSharding]
     model: Union[NestedTensor, Nested[TensorSpec], Nested[jax.sharding.NamedSharding]]
@@ -149,6 +155,8 @@ class SpmdTrainer(Module):
         learner: Required[Learner.Config] = REQUIRED
         # The checkpointer config.
         checkpointer: BaseCheckpointer.Config = Checkpointer.default_config()
+        snapshotter: Optional[InstantiableConfig] = None
+        snapshot_every_n_steps: int = 5
         # A dict of evaler names to configs, each name must be non-empty.
         evalers: dict[str, SpmdEvaler.Config] = {}
 
@@ -305,6 +313,9 @@ class SpmdTrainer(Module):
         mesh = jax.sharding.Mesh(devices, cfg.mesh_axis_names)
         self._step_log("Global mesh: %s", mesh)
         self._mesh = mesh
+        self.snapshotter = None
+        self._elastic_manager = None
+        self._init_snapshotter()
         self._context_manager: Callable[[], ContextManager] = (
             maybe_instantiate(cfg.context_manager) or contextlib.nullcontext
         )
@@ -379,6 +390,50 @@ class SpmdTrainer(Module):
                     model_param_partition_specs=model_param_partition_specs,
                 )
         self._maybe_record_event(measurement.Event.END_ACCELERATOR_INIT)
+
+    def _init_snapshotter(self):
+        """Initializes the host-RAM snapshotter and Pathways elastic runtime if configured."""
+        cfg: SpmdTrainer.Config = self.config
+        if cfg.snapshotter is None:
+            return
+        replica_axis_idx = (
+            cfg.mesh_axis_names.index("data") if "data" in cfg.mesh_axis_names else 0
+        )
+        self.snapshotter = cfg.snapshotter.set(replica_axis_index=replica_axis_idx).instantiate()
+        self._step_log("[ELASTIC][SCALE] devices=%s", len(self._mesh.devices.flat))
+        if pathwaysutils.is_pathways_backend_used():
+            self._elastic_manager = manager.Manager(wait_for_slices=True, poll_interval=5)
+            with contextlib.suppress(Exception):
+                orbax_pathways.register_type_handlers(
+                    use_single_replica_array_handler=False,
+                    primary_host=None,
+                    checkpointing_impl=orbax_pathways.CheckpointingImpl.COLOCATED_PYTHON,
+                    array_metadata_store=None,
+                    enable_write_sharding_file=False,
+                )
+
+    def _on_elastic_event(self):
+        self._trainer_state = None
+
+    def _maybe_elastic_retry(self, fn: Callable[[], None]) -> Callable[[], None]:
+        """Decorates `fn` with Pathways elastic retry if the elastic manager is active."""
+        if self._elastic_manager is None:
+            return fn
+        return self._elastic_manager.elastic_retry(
+            max_retries=100,
+            timeout=3600,
+            pre_callback=self._on_restore,
+            on_elastic_event_callback=self._on_elastic_event,
+        )(fn)
+
+    @contextlib.contextmanager
+    def _snapshotter_context(self):
+        """Manages the snapshotter lifecycle around the training loop."""
+        try:
+            yield
+        finally:
+            if self.snapshotter is not None:
+                self.snapshotter.join()
 
     @property
     def step(self):
@@ -615,15 +670,15 @@ class SpmdTrainer(Module):
                 return None
 
             self._is_initialized = True
+            input_iterator = self.input.batches(self._input_iter)
 
-            with self.checkpointer:
+            @self._maybe_elastic_retry
+            def _train_loop():
+                output = None
                 logging.info("Starting loop...")
                 start_time = time.perf_counter()
                 num_steps = 0
-                output = None
                 stop_trace_step = None
-
-                input_iterator = self.input.batches(self._input_iter)
                 while True:
                     self._maybe_record_event(measurement.Event.START_DATA_LOADING)
                     try:
@@ -669,6 +724,10 @@ class SpmdTrainer(Module):
                         break
                 if self.step < cfg.max_step:
                     self._step_log("Reached end of inputs. Stopping")
+                return output
+
+            with self.checkpointer, self._snapshotter_context():
+                output = _train_loop()
             self._step_log("Checkpointer flushed.")
             return output
 
@@ -937,9 +996,42 @@ class SpmdTrainer(Module):
             self._step_log("Already reached max_step=%s. Stopping", cfg.max_step)
             return False
 
+        self.save_snapshot(force=True)
         self._jit_train_step = self._pjit_train_step()
         self._maybe_record_event(measurement.Event.END_TRAINING_PREPARATION)
         return True
+
+    def _try_restore_snapshot(self) -> bool:
+        if self.snapshotter is None:
+            return False
+        self.snapshotter.join()
+        if self.snapshotter.latest is None:
+            return False
+        snap_step = self.snapshotter.latest.step
+        try:
+            state = self.snapshotter.load(
+                self._trainer_state_specs._asdict(), reset_snapshot_state=False
+            )
+            self._step, self._trainer_state = snap_step, TrainerState(**state)
+            logging.info("[ELASTIC] Restored trainer_state from snapshot at step=%s", snap_step)
+            return True
+        except jax.errors.JaxRuntimeError:
+            raise
+        except (ValueError, RuntimeError) as e:
+            logging.warning("Snapshot restore failed at step %s: %s", snap_step, e)
+            return False
+
+    def _on_restore(self):
+        if self._trainer_state is not None:
+            return
+        self._step_log(
+            "[ELASTIC][SCALE] devices=%s unchanged; reusing mesh.", len(self._mesh.devices.flat)
+        )
+        self.checkpointer.cancel()
+        with self.mesh():
+            if not self._try_restore_snapshot() and self.restore_checkpoint() is None:
+                raise RuntimeError("Failed to restore from both snapshot and checkpoint.")
+            self.save_snapshot(force=True)
 
     def restore_checkpoint(self, restore_step: Optional[int] = None) -> Optional[int]:
         """Restores trainer state from checkpoint.
@@ -1024,6 +1116,20 @@ class SpmdTrainer(Module):
             self.checkpointer.save(
                 step=self.step, state=ckpt_state, evaler_summaries=evaler_summaries
             )
+
+    def save_snapshot(self, *, force: bool = False):
+        if self.snapshotter is None:
+            return
+        n = self._config.snapshot_every_n_steps
+        if not force and (not n or self.step % n != 0):
+            return
+        if force or (self.snapshotter.latest is None or self.snapshotter.latest.step != self.step):
+            with self.mesh():
+                self.snapshotter.save(
+                    self.step,
+                    self._trainer_state._asdict(),
+                    force=force,
+                )
 
     def _restore_from_builder(self) -> Optional[TrainerStateBuilder.State]:
         """Restores trainer state by building it with init_state_builder."""
@@ -1166,6 +1272,7 @@ class SpmdTrainer(Module):
 
         # Checkpointer policy will decide if we should save.
         self.save_checkpoint(evaler_summaries=evaler_summaries)
+        self.save_snapshot()
 
         return_dict = {"loss": outputs["loss"], "aux": outputs["aux"]}
         # Returns evaler_summaries if force_run_evals is not None or empty set.

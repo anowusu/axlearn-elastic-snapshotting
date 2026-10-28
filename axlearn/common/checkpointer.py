@@ -2,6 +2,7 @@
 
 """Checkpointing utilities."""
 
+import contextlib
 import dataclasses
 import difflib
 import enum
@@ -943,6 +944,11 @@ class BaseCheckpointer(Module):
     def wait_until_finished(self):
         """Waits for pending asynchronous saves to finish."""
         raise NotImplementedError(type(self))
+
+    def cancel(self):
+        """Cancels any pending asynchronous saves."""
+        with contextlib.suppress(Exception):
+            self.wait_until_finished()
 
     def stop(self, *, has_exception: bool = False):
         """Stops the checkpointer. Waits for async writes, garbage collection, etc. to finish.

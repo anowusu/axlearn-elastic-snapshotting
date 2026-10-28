@@ -508,18 +508,25 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
         try:
             # Note that save() waits for prior serialization to finish.
-            self._manager.save(
-                step=step,
-                # The input iterator is saved as part of `save_tf_savables`.
-                args=ocp.args.Composite(
-                    index=ocp.args.JsonSave(spec["index"]),
-                    # TODO(markblee): Investigate save_args for chunk_byte_size and
-                    # ocdbt_target_data_file_size:
-                    # https://orbax.readthedocs.io/en/latest/optimized_checkpointing.html#custom-chunk-sizes
-                    # https://orbax.readthedocs.io/en/latest/optimized_checkpointing.html#customizing-data-file-size
-                    state=ocp.args.PyTreeSave(item=state),
-                ),
-            )
+            try:
+                self._manager.save(
+                    step=step,
+                    # The input iterator is saved as part of `save_tf_savables`.
+                    args=ocp.args.Composite(
+                        index=ocp.args.JsonSave(spec["index"]),
+                        # TODO(markblee): Investigate save_args for chunk_byte_size and
+                        # ocdbt_target_data_file_size:
+                        # https://orbax.readthedocs.io/en/latest/optimized_checkpointing.html#custom-chunk-sizes
+                        # https://orbax.readthedocs.io/en/latest/optimized_checkpointing.html#customizing-data-file-size
+                        state=ocp.args.PyTreeSave(item=state),
+                    ),
+                )
+            except jax.errors.JaxRuntimeError as e:
+                if "SidecarSession is cancelled" not in str(e):
+                    raise
+                logging.warning("Cancelling interrupted async checkpoint save at step %s: %s", step, e)
+                self.cancel()
+                return
             # Exit early after pre-emption, equivalent to sys.exit():
             # https://orbax.readthedocs.io/en/latest/preemption_checkpointing.html
             if self._manager.reached_preemption(step):
@@ -610,6 +617,13 @@ class OrbaxCheckpointer(BaseCheckpointer):
     def wait_until_finished(self):
         """See `BaseCheckpointer.wait_until_finished` docstring for details."""
         self._manager.wait_until_finished()
+
+    def cancel(self):
+        """See `BaseCheckpointer.cancel` docstring for details."""
+        if hasattr(self._manager._checkpointer, "cancel"):  # pylint: disable=protected-access
+            self._manager._checkpointer.cancel()  # pylint: disable=protected-access
+        super().cancel()
+        self._manager.reload()
 
     def stop(self, *, has_exception: bool = False):
         """See `BaseCheckpointer.stop` for details."""
