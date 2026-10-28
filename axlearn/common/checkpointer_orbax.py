@@ -12,7 +12,9 @@ See also checkpointer.py for other checkpointing utilities and checkpointer_test
 """
 
 import asyncio
+import contextlib
 import copy
+import threading
 import dataclasses
 import functools
 import os
@@ -42,7 +44,9 @@ from axlearn.common.checkpointer import (
     maybe_restore_python_savables,
     maybe_save_python_savables,
 )
-from axlearn.common.config import config_class
+from jax._src.mesh import thread_resources
+
+from axlearn.common.config import InstantiableConfig, config_class
 from axlearn.common.module import Module
 from axlearn.common.utils import Nested, Tensor, TensorSpec
 
@@ -55,6 +59,9 @@ try:
 except ImportError:
     logging.warning("grain is not installed; checkpointing grain iterators will not work.")
     _GRAIN_INSTALLED = False
+
+from orbax.checkpoint import pathways as orbax_pathways
+
 
 
 class _TfIteratorHandler(ocp.type_handlers.TypeHandler):
@@ -356,6 +363,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
         async_timeout_secs: int = 600
         max_concurrent_save_gb: Optional[int] = None
         max_concurrent_restore_gb: Optional[int] = None
+        save_device_host_concurrent_gb: Optional[int] = None
         # An AXLearn training job may use multiple TPU slices. When restoring, by default, all
         # slices read the checkpoint from GCS. If True, only the first replica loads from GCS and
         # broadcasts to other slices via the training cluster network.
@@ -368,6 +376,9 @@ class OrbaxCheckpointer(BaseCheckpointer):
         skip_uncommitted_checkpoint: bool = True
         # Read only the latest checkpoint recorded in the tracker file if set to `True`
         read_latest_checkpoint_from_tracker_file: bool = False
+        # Optional Orbax Pathways Snapshotter config for unified host-RAM snapshotting and
+        # zero-copy shared checkpoint uploads.
+        snapshotter: Optional[InstantiableConfig[Any]] = None
 
     @classmethod
     def checkpoint_paths(cls, base_dir: str) -> List[str]:
@@ -384,6 +395,8 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
         cfg: OrbaxCheckpointer.Config = self.config
         save_policy = cfg.save_policy.instantiate()
+        self._save_policy = save_policy
+        self._elastic_drain: Optional[threading.Event] = None
 
         if cfg.enable_single_replica_ckpt_restoring:
             array_handler = ocp.type_handlers.SingleReplicaArrayHandler(
@@ -431,6 +444,51 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
             return is_save
 
+        self._save_fn_with_summaries = save_fn_with_summaries
+        self._snapshotter = self._init_snapshotter(cfg)
+        self._create_manager()
+
+    @property
+    def snapshotter(self) -> Optional[Any]:
+        """Returns the underlying Orbax Pathways Snapshotter if configured."""
+        return self._snapshotter
+
+    def _init_snapshotter(self, cfg: Config) -> Optional[Any]:
+        if cfg.snapshotter is None:
+            return None
+        snap_cfg = cfg.snapshotter.clone()
+        mesh = thread_resources.env.physical_mesh
+        axis_idx = getattr(snap_cfg, "replica_axis_index", None)
+        if (
+            not mesh.empty
+            and "data" in mesh.axis_names
+            and (
+                axis_idx is None
+                or (
+                    axis_idx == 0
+                    and mesh.axis_names[0] != "data"
+                    and mesh.shape[mesh.axis_names[0]] == 1
+                )
+            )
+        ):
+            snap_cfg.replica_axis_index = list(mesh.axis_names).index("data")
+        return snap_cfg.instantiate()
+
+    def _create_manager(self):
+        cfg: OrbaxCheckpointer.Config = self.config
+        if os.environ.get("JAX_PLATFORMS") == "proxy" or jax.default_backend() == "proxy":
+            orbax_pathways.register_type_handlers(
+                use_single_replica_array_handler=cfg.enable_single_replica_ckpt_restoring,
+                checkpointing_impl=orbax_pathways.CheckpointingImpl.COLOCATED_PYTHON,
+                primary_host=None,
+                array_metadata_store=None,
+                enable_write_sharding_file=False,
+                **(
+                    {"replica_axis_index": cfg.replica_axis_index, "primary_replica_id": 0}
+                    if cfg.enable_single_replica_ckpt_restoring
+                    else {}
+                ),
+            )
         CheckpointManager = (  # pylint: disable=invalid-name
             _CheckpointManagerWithTrackerFile
             if cfg.read_latest_checkpoint_from_tracker_file
@@ -444,7 +502,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
                 keep_period=cfg.keep_period,
                 enable_async_checkpointing=True,
                 step_name_format=self._name_format,
-                should_save_fn=save_fn_with_summaries,
+                should_save_fn=self._save_fn_with_summaries,
                 enable_background_delete=True,
                 async_options=ocp.options.AsyncOptions(
                     timeout_secs=cfg.async_timeout_secs,
@@ -452,9 +510,9 @@ class OrbaxCheckpointer(BaseCheckpointer):
                 ),
                 # Explicitly wrapped in `_ShouldSaveFnPolicy`, otherwise
                 # `PreemptionCheckpointingPolicy` is auto injected
-                save_decision_policy=_ShouldSaveFnPolicy(save_fn_with_summaries),
+                save_decision_policy=_ShouldSaveFnPolicy(self._save_fn_with_summaries),
                 lightweight_initialize=True,
-                cleanup_tmp_directories=True,
+                cleanup_tmp_directories=not hasattr(self, "_manager"),
             ),
             item_handlers={
                 # NOTE: we make a relatively weak assumption that index files are JSON serialized
@@ -466,9 +524,79 @@ class OrbaxCheckpointer(BaseCheckpointer):
                 "state": ocp.PyTreeCheckpointHandler(
                     save_concurrent_gb=cfg.max_concurrent_save_gb,
                     restore_concurrent_gb=cfg.max_concurrent_restore_gb,
+                    **(
+                        {"save_device_host_concurrent_gb": cfg.save_device_host_concurrent_gb}
+                        if cfg.save_device_host_concurrent_gb is not None
+                        else {}
+                    ),
+                    **(
+                        {"is_prioritized_key_fn": lambda _: False}
+                        if self._snapshotter is not None
+                        and cfg.save_device_host_concurrent_gb is not None
+                        else {}
+                    ),
                 ),
             },
         )
+
+    def begin_elastic_drain(self) -> threading.Event:
+        """Cancels and drains any in-flight async checkpoint save on a background thread."""
+        if self._elastic_drain is None:
+            old_mgr = self._manager
+            drain_event = threading.Event()
+
+            def _drain():
+                try:
+                    if hasattr(old_mgr._checkpointer, "cancel"):  # pylint: disable=protected-access
+                        old_mgr._checkpointer.cancel()  # pylint: disable=protected-access
+                    old_mgr.wait_until_finished()
+                except Exception as e:  # pylint: disable=broad-except
+                    logging.warning("[ELASTIC] Interrupted async checkpoint save: %s", e)
+                drain_event.set()
+
+            threading.Thread(target=_drain, daemon=True).start()
+            self._elastic_drain = drain_event
+        return self._elastic_drain
+
+    def on_elastic_event(self):
+        """Cancels any pending snapshot and begins draining async checkpoint save."""
+        if self._snapshotter is not None:
+            self._snapshotter.cancel_pending()
+        self.begin_elastic_drain()
+
+    def reset_after_elastic_event(self, *, devices_changed: bool = False):
+        """Re-creates the underlying Orbax CheckpointManager after an elastic event."""
+        if self._snapshotter is not None:
+            self._snapshotter.cancel_pending()
+        old_mgr = self._manager
+        drain_event = self.begin_elastic_drain()
+        self._elastic_drain = None
+        drained = drain_event.is_set() if devices_changed else drain_event.wait(120.0)
+        if drained:
+            with contextlib.suppress(Exception):
+                old_mgr.close()
+        self._eval_summaries = None
+        self._create_manager()
+
+    def flush_for_scale_up(self, *, step: int, state: Nested[Tensor]) -> bool:
+        """Ensures `state` at `step` is snapshotted before voluntary scale-up."""
+        if self._manager.is_saving_in_progress():
+            return False
+        if self._snapshotter is not None:
+            self._snapshotter.coordinate_save(
+                step,
+                state,
+                should_checkpoint=False,
+                checkpointer=self._manager,
+                force_snapshot=True,
+            )
+        return True
+
+    def check_hbm_headroom(self, compiled: Any, *, device: Any) -> None:
+        """See `BaseCheckpointer.check_hbm_headroom` for details."""
+        if self._snapshotter is not None:
+            self._snapshotter.check_hbm_headroom(compiled, device=device)
+
 
     def _get_spec(self, *, step: int, state: Nested[Any]) -> Nested[Any]:
         spec = {"index": [("step", step)]}
@@ -502,24 +630,42 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
         Checkpoint saving is handled by `orbax` checkpoint manager.
         """
-        spec = self._get_spec(step=step, state=state)
         assert self._eval_summaries is None, self._eval_summaries
         self._eval_summaries = copy.deepcopy(evaler_summaries or {})
 
         try:
+            if self._snapshotter is not None:
+                should_ckpt = bool(self._manager.should_save(step))
+                state = self._snapshotter.coordinate_save(
+                    step,
+                    state,
+                    should_checkpoint=should_ckpt,
+                    checkpointer=self._manager,
+                    force_snapshot=self._snapshotter.latest is None,
+                )
+                if not should_ckpt and not self._manager.reached_preemption(step):
+                    return
+            spec = self._get_spec(step=step, state=state)
             # Note that save() waits for prior serialization to finish.
-            self._manager.save(
-                step=step,
-                # The input iterator is saved as part of `save_tf_savables`.
-                args=ocp.args.Composite(
-                    index=ocp.args.JsonSave(spec["index"]),
-                    # TODO(markblee): Investigate save_args for chunk_byte_size and
-                    # ocdbt_target_data_file_size:
-                    # https://orbax.readthedocs.io/en/latest/optimized_checkpointing.html#custom-chunk-sizes
-                    # https://orbax.readthedocs.io/en/latest/optimized_checkpointing.html#customizing-data-file-size
-                    state=ocp.args.PyTreeSave(item=state),
-                ),
-            )
+            try:
+                self._manager.save(
+                    step=step,
+                    # The input iterator is saved as part of `save_tf_savables`.
+                    args=ocp.args.Composite(
+                        index=ocp.args.JsonSave(spec["index"]),
+                        # TODO(markblee): Investigate save_args for chunk_byte_size and
+                        # ocdbt_target_data_file_size:
+                        # https://orbax.readthedocs.io/en/latest/optimized_checkpointing.html#custom-chunk-sizes
+                        # https://orbax.readthedocs.io/en/latest/optimized_checkpointing.html#customizing-data-file-size
+                        state=ocp.args.PyTreeSave(item=state),
+                    ),
+                )
+            except jax.errors.JaxRuntimeError as e:
+                if "SidecarSession is cancelled" not in str(e):
+                    raise
+                logging.warning("Cancelling interrupted async checkpoint save at step %s: %s", step, e)
+                self.cancel()
+                return
             # Exit early after pre-emption, equivalent to sys.exit():
             # https://orbax.readthedocs.io/en/latest/preemption_checkpointing.html
             if self._manager.reached_preemption(step):
@@ -537,6 +683,15 @@ class OrbaxCheckpointer(BaseCheckpointer):
         """See `BaseCheckpointer.restore` for details."""
 
         cfg: OrbaxCheckpointer.Config = self.config
+
+        if step is None and self._snapshotter is not None:
+            ckpt_step = self._manager.latest_step() or 0
+            snap_step, snap_state = self._snapshotter.try_load(state, min_step=ckpt_step)
+            if snap_step is not None:
+                logging.info(
+                    "[ELASTIC] Restored trainer_state from snapshot at step=%s", snap_step
+                )
+                return snap_step, snap_state
 
         def _restore_args(x: Any) -> ocp.RestoreArgs:
             if isinstance(x, (Tensor, TensorSpec)):
@@ -605,15 +760,45 @@ class OrbaxCheckpointer(BaseCheckpointer):
             target_structure=self._get_spec(step=step, state=state)["index"],
             validation=cfg.validation_type,
         )
+        if step is not None and self._snapshotter is not None:
+            self._snapshotter.coordinate_save(
+                step,
+                restored_state,
+                should_checkpoint=False,
+                checkpointer=self._manager,
+                force_snapshot=True,
+            )
         return step, restored_state
 
     def wait_until_finished(self):
         """See `BaseCheckpointer.wait_until_finished` docstring for details."""
+        if self._snapshotter is not None:
+            self._snapshotter.join()
         self._manager.wait_until_finished()
+
+    def cancel(self):
+        """See `BaseCheckpointer.cancel` docstring for details."""
+        if self._snapshotter is not None:
+            self._snapshotter.cancel_pending()
+        if hasattr(self._manager._checkpointer, "cancel"):  # pylint: disable=protected-access
+            self._manager._checkpointer.cancel()  # pylint: disable=protected-access
+        super().cancel()
+        self._manager.reload()
 
     def stop(self, *, has_exception: bool = False):
         """See `BaseCheckpointer.stop` for details."""
-        self._manager.close()
+        if self._snapshotter is not None:
+            if has_exception:
+                self._snapshotter.cancel_pending()
+            else:
+                self._snapshotter.join()
+        if not has_exception:
+            self._manager.close()
+        else:
+            if hasattr(self._manager._checkpointer, "cancel"):  # pylint: disable=protected-access
+                self._manager._checkpointer.cancel()  # pylint: disable=protected-access
+            with contextlib.suppress(Exception):
+                self._manager.close()
 
 
 # Below are adapted from:

@@ -2,6 +2,7 @@
 
 """Checkpointing utilities."""
 
+import contextlib
 import dataclasses
 import difflib
 import enum
@@ -943,6 +944,28 @@ class BaseCheckpointer(Module):
     def wait_until_finished(self):
         """Waits for pending asynchronous saves to finish."""
         raise NotImplementedError(type(self))
+
+    def cancel(self):
+        """Cancels any pending asynchronous saves."""
+        with contextlib.suppress(Exception):
+            self.wait_until_finished()
+
+    def on_elastic_event(self):
+        """Notifies the checkpointer that an elastic fault or scale event occurred."""
+
+    def reset_after_elastic_event(self, *, devices_changed: bool = False):
+        """Resets checkpointer state before resuming after an elastic event."""
+        del devices_changed
+        self.cancel()
+
+    def flush_for_scale_up(self, *, step: int, state: NestedTensor) -> bool:
+        """Ensures `state` at `step` is backed up before voluntary scale-up."""
+        del step, state
+        return True
+
+    def check_hbm_headroom(self, compiled: Any, *, device: Any) -> None:
+        """Optional hook allowing checkpointers with HBM staging to inspect compiled memory."""
+        del compiled, device
 
     def stop(self, *, has_exception: bool = False):
         """Stops the checkpointer. Waits for async writes, garbage collection, etc. to finish.

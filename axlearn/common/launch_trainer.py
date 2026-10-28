@@ -9,11 +9,18 @@ from typing import Any, Optional
 import jax
 from absl import flags, logging
 
+from axlearn.common import elastic_utils
 from axlearn.common import file_system as fs
 from axlearn.common import measurement
-from axlearn.common.config import TrainerConfigFn, get_named_trainer_config
+from axlearn.common.checkpointer import Checkpointer
+from axlearn.common.checkpointer_orbax import OrbaxCheckpointer
+from axlearn.common.config import TrainerConfigFn, config_for_class, get_named_trainer_config
+from axlearn.common.elastic_input import ElasticInput, ElasticSpmdInputDispatcher
+from axlearn.common.input_dispatch import SpmdInputDispatcher
 from axlearn.common.trainer import SpmdTrainer, select_mesh_config
 from axlearn.common.utils import MeshShape, get_data_dir, infer_mesh_shape
+
+from orbax.checkpoint.experimental.v1.training.pathways import Snapshotter
 
 # Trainer-specific flags.
 flags.DEFINE_string(
@@ -113,8 +120,80 @@ flags.DEFINE_string(
     None,
     "The mesh selector string. See `SpmdTrainer.Config.mesh_rules` for details.",
 )
+flags.DEFINE_bool("elastic_enabled", False, "Enables elastic training on the Pathways backend.")
+flags.DEFINE_integer("elastic_min_slice_count", -1, "Minimum active slices (-1 waits for all).")
+flags.DEFINE_float("elastic_timeout_seconds", None, "Max seconds to wait for slices per retry.")
+flags.DEFINE_integer("elastic_max_retries", None, "Max retries after elastic events.")
+flags.DEFINE_enum(
+    "elastic_backup_kind", "snapshot", ["snapshot", "checkpoint"], "Elastic recovery source."
+)
+flags.DEFINE_integer("elastic_snapshot_every_n_steps", 5, "Snapshot frequency in steps.")
+flags.DEFINE_bool(
+    "elastic_snapshot_stage_in_hbm", False, "Stage state in HBM before host transfer."
+)
+flags.DEFINE_bool(
+    "elastic_scale_grad_accumulation", True, "Scale grad accumulation on degraded mesh."
+)
+flags.DEFINE_integer("save_every_n_steps", None, "Checkpoint frequency in steps.")
 
 FLAGS = flags.FLAGS
+
+
+def _configure_elastic_training(
+    trainer_config: SpmdTrainer.Config, *, flag_values: flags.FlagValues
+):
+    """Configures elastic input, Orbax checkpointer, and Snapshotter when elastic_enabled."""
+    trainer_config.set(
+        elastic_enabled=True,
+        elastic_min_slice_count=flag_values.elastic_min_slice_count,
+        elastic_timeout_seconds=flag_values.elastic_timeout_seconds,
+        elastic_max_retries=flag_values.elastic_max_retries,
+        elastic_scale_grad_accumulation=flag_values.elastic_scale_grad_accumulation,
+    )
+    dispatcher = getattr(trainer_config.input, "input_dispatcher", None)
+    if elastic_utils.ensure_elastic_manager_initialized(True) is not None and isinstance(
+        dispatcher, SpmdInputDispatcher.Config
+    ):
+        trainer_config.input.input_dispatcher = ElasticSpmdInputDispatcher.default_config().set(
+            global_logical_batch_size=dispatcher.global_logical_batch_size,
+            partition_spec=dispatcher.partition_spec,
+        )
+        trainer_config.input = ElasticInput.default_config().set(input=trainer_config.input)
+    if getattr(trainer_config.checkpointer, "klass", None) is Checkpointer:
+        trainer_config.checkpointer = OrbaxCheckpointer.default_config().set(
+            save_policy=trainer_config.checkpointer.save_policy,
+            keep_last_n=trainer_config.checkpointer.keep_last_n,
+            keep_period=trainer_config.checkpointer.keep_every_n_steps,
+            max_concurrent_save_gb=8,
+            skip_uncommitted_checkpoint=False,
+        )
+    elif isinstance(trainer_config.checkpointer, OrbaxCheckpointer.Config):
+        trainer_config.checkpointer.skip_uncommitted_checkpoint = False
+    if flag_values.elastic_backup_kind == "snapshot" and isinstance(
+        trainer_config.checkpointer, OrbaxCheckpointer.Config
+    ):
+        if trainer_config.checkpointer.save_device_host_concurrent_gb is None:
+            trainer_config.checkpointer.save_device_host_concurrent_gb = 2
+        trainer_config.checkpointer.snapshotter = config_for_class(Snapshotter).set(
+            stage_in_hbm=flag_values.elastic_snapshot_stage_in_hbm,
+            save_interval_steps=flag_values.elastic_snapshot_every_n_steps,
+        )
+
+
+def _configure_checkpoint_frequency(
+    trainer_config: SpmdTrainer.Config, *, save_every_n_steps: int
+):
+    """Overrides checkpointer save policy and retention period."""
+    step_interval = int(save_every_n_steps)
+    ckpt = trainer_config.checkpointer
+    for obj, attr in (
+        (ckpt.save_policy, "n"),
+        (ckpt.save_policy, "min_step"),
+        (ckpt, "keep_every_n_steps"),
+        (ckpt, "keep_period"),
+    ):
+        if hasattr(obj, attr):
+            setattr(obj, attr, step_interval)
 
 
 def get_trainer_config(
@@ -170,6 +249,12 @@ def get_trainer_config(
         )
     if trainer_config.log_every_n_steps is None:
         trainer_config.log_every_n_steps = flag_values.trainer_log_every_n_steps
+    if flag_values.elastic_enabled:
+        _configure_elastic_training(trainer_config, flag_values=flag_values)
+    if flag_values.save_every_n_steps is not None:
+        _configure_checkpoint_frequency(
+            trainer_config, save_every_n_steps=flag_values.save_every_n_steps
+        )
     for eval_cfg in trainer_config.evalers.values():
         eval_cfg.trace_at_iters = [int(el) for el in flag_values.eval_trace_at_iters]
     if flag_values.device_monitor == "tpu":
