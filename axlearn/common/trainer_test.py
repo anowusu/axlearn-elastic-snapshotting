@@ -800,6 +800,22 @@ class TrainerTest(test_utils.TestCase):
             self.assertLess(prep_start, data_iter_init[2])
         self.assertLess(data_iter_init[-1], events.index((measurement.Event.START_STEP, None)))
 
+    def test_logged_loss_is_fetched(self):
+        """Tests that the loss is fetched before it is logged.
+
+        Logging formats its arguments lazily and swallows the errors raised while formatting, so a
+        device error (e.g. after a slice goes down) would not reach the train loop.
+        """
+        cfg, _ = self._goodput_trainer_config()
+        cfg.max_step = 2
+        trainer: SpmdTrainer = cfg.instantiate(parent=None)
+        with unittest.mock.patch.object(trainer, "_step_log", wraps=trainer._step_log) as step_log:
+            trainer.run(prng_key=jax.random.PRNGKey(123))
+        losses = [c.args[1] for c in step_log.call_args_list if c.args[0] == "loss=%s aux=%s"]
+        self.assertNotEmpty(losses)
+        for loss in losses:
+            self.assertIsInstance(loss, float)
+
     def test_stop_on_exception(self):
         """Test that trainer exits cleanly if there's an exception in the main loop."""
         if not test_utils.is_supported_platform("cpu"):

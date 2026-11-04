@@ -1279,9 +1279,12 @@ class SpmdTrainer(Module):
 
         n = self._config.log_every_n_steps or 100
         if self.step % n == 0 or 0 <= self.step <= 5:
+            # Fetch the loss here: logging formats lazily and swallows errors, which would hide
+            # device errors (e.g. after a slice goes down) from elastic retry.
+            loss = outputs["loss"].item() if hasattr(outputs["loss"], "item") else outputs["loss"]
             self._step_log(
                 "loss=%s aux=%s",
-                outputs["loss"],
+                loss,
                 jax.tree.map(lambda x: x.item() if x.ndim == 0 else f"T{x.shape}", outputs["aux"]),
             )
 
