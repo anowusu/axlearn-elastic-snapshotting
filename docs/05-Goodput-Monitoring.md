@@ -114,8 +114,8 @@ To enable Goodput recording and monitoring on AXLearn, follow the example below.
 
 ### How to Monitor Rolling Window Goodput Metrics
 
-To enable rolling window metrics, set `enable_rolling_window_goodput_monitoring` to `True`
-and provide a list of interval sizes for `rolling_window_size` in seconds:
+To enable rolling window metrics, provide a list of interval sizes for `rolling_window_size`
+in seconds:
 
 ```bash
 axlearn gcp launch run --instance_type=tpu-v5litepod-16 \
@@ -126,9 +126,57 @@ axlearn gcp launch run --instance_type=tpu-v5litepod-16 \
         --recorder_spec=name=<unique-readable-name> \
         --recorder_spec=upload_dir=my-output-directory/summaries \
         --recorder_spec=upload_interval=30 \
-        --recorder_spec=enable_rolling_window_goodput_monitoring=True \
         --recorder_spec=rolling_window_size=86400,259200,432000
 ```
+
+### Recorder Spec Reference
+
+`--recorder_spec` accepts the following `key=value` pairs (see `GoodputRecorder.Config`):
+
+| Key | Default | Description |
+|---|---|---|
+| `name` | required | Job name. Must be unique per workload. |
+| `upload_dir` | required | TensorBoard directory for the monitor. |
+| `upload_interval` | `30` | Seconds between monitor uploads. |
+| `rolling_window_size` | empty | Comma-separated window sizes in seconds. Enables rolling window monitoring. |
+| `jax_backend` | none | Set to `proxy` on Pathways. |
+| `enable_monitoring` | `true` | Enables the background uploaders. Recording is always on. |
+| `enable_checkpoint_logging` | `true` | Logs Orbax checkpoint statistics to the goodput log (see below). |
+| `enable_gcp_goodput_metrics` | `true` | Uploads goodput metrics to Google Cloud Monitoring. |
+| `enable_gcp_step_deviation_metrics` | `true` | Uploads step deviation metrics to Google Cloud Monitoring. |
+| `include_step_deviation` | `false` | Computes and uploads the step time deviation. |
+| `step_deviation_interval_seconds` | `30` | Seconds between step deviation uploads. |
+
+Elastic jobs (with a Pathways elastic manager) use the elastic monitor, which also uploads the
+slice efficiency.
+
+### Recorded Events
+
+Besides the job, step, accelerator initialization, training preparation and data loading events,
+`SpmdTrainer` records:
+
+| Event | Recorded as |
+|---|---|
+| Elastic wait | `elastic_wait` of type `elastic_slice_down`, from the elastic event until the slices are back. |
+| Elastic reinitialization | `elastic_reinit`, from the end of the wait until training resumes. Within it, the mesh setup is recorded as `tpu_init` and the restore as `training_prep`, as in MaxText; the library discounts the overlap. |
+| Slice counts | Active, available and total slices at startup, at an elastic event and around the reinitialization. |
+| Snapshot restore | Custom badput `SNAPSHOT_RESTORE`. |
+| Blocking snapshot save | Custom badput `SNAPSHOT_SAVE`, at startup and after each recovery. Periodic snapshots are saved in the background. |
+| Input iterator creation | Custom badput `DATA_ITERATOR_INIT`, at init and when a checkpoint restore rebuilds it. |
+| Compilation | Custom badput `COMPILATION_NO_XSC` / `COMPILATION_WITH_XSC`. |
+| Evaluation | Custom badput `EVAL`, at steps where an evaler ran. |
+
+### Checkpoint Badput
+
+ml-goodput-measurement computes the checkpoint save/restore badput from the statistics that Orbax's
+`CheckpointManager` logs. `launch_trainer_main` sets `OrbaxCheckpointer.Config.logger` to an Orbax
+`CloudLogger` that writes to the goodput log (`goodput_logger_<name>`). The default `Checkpointer`
+does not report checkpoint statistics.
+
+### Job End
+
+`END_JOB` is recorded only when `SpmdTrainer.run` returns normally, since a restarted job continues
+the same goodput timeline. The recorder is flushed on every exit path.
 
 ### Visualize on Tensorboard
 
@@ -140,10 +188,9 @@ axlearn gcp launch run --instance_type=tpu-v5litepod-16 \
 By default, when Goodput monitoring is enabled via the recorder, AXLearn automatically pushes metrics to Google Cloud Monitoring.
 
 -   **Cumulative Metrics** are enabled by default when you specify the `recorder_type`.
-    To disable this, you would need to set `enable_gcp_goodput_metrics` to `False` in
-    `goodput_monitoring.GCPOptions` within the `cloud/gcp/measurement.py` file.
--   **Rolling Window Metrics** can be explicitly enabled by setting
-    `enable_rolling_window_goodput_monitoring` to `True` and providing window sizes
+    To disable this, set `--recorder_spec=enable_gcp_goodput_metrics=false` (and
+    `enable_gcp_step_deviation_metrics=false` for the step deviation metrics).
+-   **Rolling Window Metrics** can be explicitly enabled by providing window sizes
     via `rolling_window_size`.
 
 You can enable either cumulative monitoring, rolling window monitoring, or both simultaneously.
@@ -158,7 +205,6 @@ You can enable either cumulative monitoring, rolling window monitoring, or both 
         --recorder_spec=name=<unique-readable-name> \
         --recorder_spec=upload_dir=my-output-directory/summaries \
         --recorder_spec=upload_interval=30 \
-        --recorder_spec=enable_rolling_window_goodput_monitoring=True \
         --recorder_spec=rolling_window_size=86400,604800
 ```
 
