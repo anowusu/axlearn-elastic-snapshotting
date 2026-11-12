@@ -42,7 +42,7 @@ from axlearn.common.checkpointer import (
     maybe_restore_python_savables,
     maybe_save_python_savables,
 )
-from axlearn.common.config import config_class
+from axlearn.common.config import ConfigOr, config_class, maybe_instantiate
 from axlearn.common.module import Module
 from axlearn.common.utils import Nested, Tensor, TensorSpec
 
@@ -326,6 +326,23 @@ class _CheckpointManagerWithTrackerFile(ocp.CheckpointManager):
                 self.tracker_file_path.write_text(str(step))
 
 
+class _SafeLogger(ocp.logging.AbstractLogger):
+    """Wraps a logger so that failing to log never fails a checkpoint save or restore.
+
+    Orbax calls `log_entry` without a guard, e.g. at the end of `CheckpointManager.save()`, and
+    loggers such as `CloudLogger` log synchronously.
+    """
+
+    def __init__(self, logger: ocp.logging.AbstractLogger):
+        self._logger = logger
+
+    def log_entry(self, entry: Any, *args, **kwargs):
+        try:
+            self._logger.log_entry(entry, *args, **kwargs)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logging.warning("Failed to log checkpoint statistics: %s", e)
+
+
 class OrbaxCheckpointer(BaseCheckpointer):
     """A checkpointer that uses orbax CheckpointManager.
 
@@ -368,6 +385,8 @@ class OrbaxCheckpointer(BaseCheckpointer):
         skip_uncommitted_checkpoint: bool = True
         # Read only the latest checkpoint recorded in the tracker file if set to `True`
         read_latest_checkpoint_from_tracker_file: bool = False
+        # Optional logger of save/restore statistics, e.g. `GoodputRecorder.checkpoint_logger()`.
+        logger: Optional[ConfigOr[ocp.logging.AbstractLogger]] = None
 
     @classmethod
     def checkpoint_paths(cls, base_dir: str) -> List[str]:
@@ -431,6 +450,11 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
             return is_save
 
+        self._checkpoint_logger: Optional[ocp.logging.AbstractLogger] = maybe_instantiate(
+            cfg.logger
+        )
+        if self._checkpoint_logger is not None:
+            self._checkpoint_logger = _SafeLogger(self._checkpoint_logger)
         CheckpointManager = (  # pylint: disable=invalid-name
             _CheckpointManagerWithTrackerFile
             if cfg.read_latest_checkpoint_from_tracker_file
@@ -468,6 +492,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
                     restore_concurrent_gb=cfg.max_concurrent_restore_gb,
                 ),
             },
+            logger=self._checkpoint_logger,
         )
 
     def _get_spec(self, *, step: int, state: Nested[Any]) -> Nested[Any]:

@@ -17,6 +17,7 @@ from pathwaysutils.experimental import split_by_mesh_axis
 
 from orbax.checkpoint import pathways as orbax_pathways
 
+from axlearn.common import elastic_utils
 from axlearn.common.checkpointer import BaseCheckpointer, every_n_steps_policy
 from axlearn.common.config import ConfigOr, config_class, config_for_function, maybe_instantiate
 from axlearn.common.module import Module
@@ -56,6 +57,7 @@ class Snapshotter(BaseCheckpointer):
         self._manager = None
         if pathwaysutils.is_pathways_backend_used():
             self._manager = manager.Manager(wait_for_slices=True, poll_interval=5)
+            elastic_utils.elastic_manager = self._manager
             with contextlib.suppress(Exception):
                 orbax_pathways.register_type_handlers(
                     use_single_replica_array_handler=False,
