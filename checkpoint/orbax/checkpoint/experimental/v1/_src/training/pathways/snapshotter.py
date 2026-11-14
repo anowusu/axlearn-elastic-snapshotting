@@ -23,6 +23,7 @@ from typing import Any
 
 from etils import epath
 import jax
+from orbax.checkpoint._src import sharding_utils
 from orbax.checkpoint.experimental.v1._src.training.metadata import types as training_metadata_types
 from orbax.checkpoint.experimental.v1._src.tree import types as tree_types
 
@@ -55,11 +56,25 @@ def _wrap_if_prng_key(x: Any, orig_x: Any) -> Any:
   return x
 
 
-def _pin_host(array: Any) -> Any:
-  """Copies the unwrapped JAX `array` into pinned host memory."""
+def _pin_host(array: Any, may_alias: bool = False) -> Any:
+  """Puts the unwrapped `array` in pinned host memory, copying by default."""
   return jax.device_put(
-      array, array.sharding.with_memory_kind("pinned_host"), may_alias=False
+      array, array.sharding.with_memory_kind("pinned_host"), may_alias=may_alias
   )
+
+
+def _copy_arrays(state: tree_types.PyTree) -> tree_types.PyTree:
+  """Copies array leaves so that the caller may donate or mutate `state`."""
+
+  def _copy_leaf(leaf: Any) -> Any:
+    if not is_shardable_array(leaf):
+      return leaf
+    array = _unwrap_if_prng_key(leaf)
+    if sharding_utils.is_in_device_memory(array):
+      return _wrap_if_prng_key(jax.numpy.copy(array), leaf)
+    return _wrap_if_prng_key(_pin_host(array), leaf)
+
+  return jax.tree.map(_copy_leaf, state)
 
 
 def _has_sharding_without_mesh(leaf: Any) -> bool:
@@ -166,12 +181,24 @@ def _get_pathwaysutils():
 class Snapshotter:
   """Manages asynchronous backups of JAX array states to pinned host memory."""
 
-  def __init__(self, *, replica_axis_index: int = 0):
+  def __init__(
+      self,
+      *,
+      replica_axis_index: int = 0,
+      copy_device_arrays_for_async_transfer: bool = False,
+  ):
     """Initializes Snapshotter.
 
     Args:
       replica_axis_index: The index of the mesh axis representing data/model
         replicas. Typically corresponds to physical slices (connected by DCN).
+      copy_device_arrays_for_async_transfer: Whether `save` copies device arrays
+        on device, instead of transferring them to host, before returning to the
+        caller. The copies are transferred to pinned host memory in the
+        background and released when their transfer completes, so the caller may
+        donate or mutate the originals without waiting for the transfer. This
+        can double peak device memory usage. A `save` that takes the snapshot
+        before it returns makes no copy.
     """
     self._concatenate_by_mesh_axis, self._split_by_mesh_axis = (
         _get_pathwaysutils()
@@ -184,6 +211,7 @@ class Snapshotter:
     self._queue = queue.Queue(maxsize=1)
     self._generation = 0
     self.replica_axis_index = replica_axis_index
+    self._copy_on_device = copy_device_arrays_for_async_transfer
 
     self._worker_thread = threading.Thread(target=self._worker, daemon=True)
     self._worker_thread.start()
@@ -191,20 +219,39 @@ class Snapshotter:
   def _worker(self):
     """Processes background snapshot requests from the queue."""
     while True:
-      full_mesh_pinned_state, per_replica_pinned_trees, step, generation = (
-          self._queue.get()
-      )
+      (
+          full_mesh_pinned_state,
+          per_replica_pinned_trees,
+          step,
+          generation,
+          staged_copy,
+      ) = self._queue.get()
       try:
         # `cancel_pending` ran after `save` queued this request, so discard it.
         if generation != self._generation:
           continue
+        if staged_copy is not None:
+          # `staged_copy` holds copies that only this request uses: wait for
+          # them, start their transfer to pinned host memory and release them.
+          jax.block_until_ready(jax.tree.map(_unwrap_if_prng_key, staged_copy))
+          full_mesh_pinned_state, per_replica_pinned_trees = (
+              self._to_snapshot_state(staged_copy, may_alias=True)
+          )
+          staged_copy = None
         jax.block_until_ready(
             jax.tree.map(
                 _unwrap_if_prng_key,
                 (full_mesh_pinned_state, per_replica_pinned_trees),
             )
         )
-      except (jax.errors.JaxRuntimeError, RuntimeError) as e:
+      except (
+          jax.errors.JaxRuntimeError,
+          RuntimeError,
+          # Raised by `_to_snapshot_state`, which runs on this thread for a
+          # staged request. An uncaught error would end this thread.
+          ValueError,
+          IndexError,
+      ) as e:
         logging.exception("Failed to snapshot state at step %d: %s", step, e)
       else:
         with self._lock:
@@ -216,15 +263,18 @@ class Snapshotter:
             )
       finally:
         del full_mesh_pinned_state, per_replica_pinned_trees
+        del staged_copy
         self._queue.task_done()
 
   def _to_snapshot_state(
-      self, state: tree_types.PyTree
+      self, state: tree_types.PyTree, may_alias: bool = False
   ) -> tuple[tree_types.PyTree, list[tree_types.PyTree]]:
     """Copies a PyTree to pinned host memory, whole and split into replicas.
 
     Args:
       state: The PyTree to be converted and split.
+      may_alias: Whether arrays of `state` that already reside in pinned host
+        memory may be used as they are instead of being copied.
 
     Returns:
       A tuple of `state` with its arrays in pinned host memory, and a list of
@@ -245,7 +295,7 @@ class Snapshotter:
         per_replica_pinned_leaves.append(x)
       else:
         data = _unwrap_if_prng_key(x)
-        pinned = _pin_host(data)
+        pinned = _pin_host(data, may_alias)
         full_mesh_pinned_leaves.append(_wrap_if_prng_key(pinned, x))
         mesh = getattr(pinned.sharding, "mesh", None)
         replicas = [pinned]
@@ -282,20 +332,26 @@ class Snapshotter:
     return full_mesh_pinned_state, per_replica_pinned_trees
 
   def _enqueue_snapshot(
-      self, step: int, state: tree_types.PyTree
-  ) -> tree_types.PyTree:
+      self, step: int, state: tree_types.PyTree, copy_on_device: bool = False
+  ) -> tree_types.PyTree | None:
     """Queues the snapshot of `state` at `step` for the worker thread.
 
     Args:
       step: The training step number associated with the state.
       state: The PyTree to be saved.
+      copy_on_device: Whether to queue a copy of the device arrays of `state`,
+        which the worker thread transfers to pinned host memory.
 
     Returns:
-      `state` with its arrays in pinned host memory, as the snapshot stores it.
+      `state` with its arrays in pinned host memory, as the snapshot stores it,
+      or None with `copy_on_device`.
     """
+    if copy_on_device:
+      self._queue.put((None, None, step, self._generation, _copy_arrays(state)))
+      return None
     pinned_state, per_replica_pinned_trees = self._to_snapshot_state(state)
     self._queue.put(
-        (pinned_state, per_replica_pinned_trees, step, self._generation)
+        (pinned_state, per_replica_pinned_trees, step, self._generation, None)
     )
     return pinned_state
 
@@ -342,15 +398,22 @@ class Snapshotter:
       The result of `checkpointer_save_fn`, or None without that function.
     """
     if not (wait or checkpointer_wait_fn or checkpointer_save_fn):
-      if self._queue.full():
+      staged = self._copy_on_device
+      # A staged request keeps a second copy of `state` in device memory until
+      # its transfer to host finishes, so only one such request may be in
+      # flight.
+      busy = self._queue.unfinished_tasks > 0 if staged else self._queue.full()
+      if busy:
         logging.warning("Snapshotter busy. Skipping snapshot for step %d", step)
         return None
-      self._enqueue_snapshot(step, state)
+      self._enqueue_snapshot(step, state, copy_on_device=staged)
       return None
 
     if checkpointer_wait_fn is not None:
       checkpointer_wait_fn()
     self.join()
+    # The caller cannot donate `state` before this method returns, so the
+    # snapshot needs no copy of `state` in device memory.
     pinned_state = self._enqueue_snapshot(step, state)
     self.join()
     if checkpointer_save_fn is None:
