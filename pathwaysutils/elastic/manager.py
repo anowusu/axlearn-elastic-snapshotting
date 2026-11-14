@@ -19,6 +19,7 @@ events. It also provides a utility for waiting for slices to become active.
 """
 
 from collections.abc import Callable, Iterator, Mapping, Sequence, Set
+import contextlib
 import functools
 import logging
 import math
@@ -590,3 +591,122 @@ class Manager:
         pre_callback=pre_callback,
         on_elastic_event_callback=on_elastic_event_callback,
     )
+
+
+class RetryCache:
+  """Slice-keyed cache for setup objects across elastic retry attempts."""
+
+  def __init__(
+      self, *, enabled: bool = False, retain_across_slices: bool = False
+  ) -> None:
+    self.enabled = enabled
+    self._retain_across_slices = retain_across_slices
+    self._slices: frozenset[int] | None = None
+    self._buckets: dict[frozenset[int] | None, dict[Any, Any]] = {}
+    self.snapshotter: Any = None
+
+  def reset(self, enabled: bool = False) -> None:
+    """Clears cached entries and sets whether caching is enabled."""
+    self.enabled, self._slices = enabled, None
+    self._buckets.clear()
+
+  def clear_if_slices_changed(self, active_slices: Set[int]) -> None:
+    """Updates active slice key and clears stale entries unless retained."""
+    slices = frozenset(active_slices)
+    if self._slices != slices:
+      if not self._retain_across_slices:
+        self._buckets.clear()
+      self._slices = slices
+
+  def contains(self, name: Any) -> bool:
+    """Returns True if `name` is cached for the current active slices."""
+    return self.enabled and name in self._buckets.get(self._slices, ())
+
+  def get(self, name: Any) -> Any:
+    """Returns the cached value for `name`, or None if disabled/missing."""
+    return self._buckets[self._slices][name] if self.contains(name) else None
+
+  def put(self, name: Any, value: Any) -> None:
+    """Stores `value` under `name` when the cache is enabled."""
+    if self.enabled:
+      self._buckets.setdefault(self._slices, {})[name] = value
+
+  def get_or_build(self, name: Any, build_fn: Callable[[], Any]) -> Any:
+    """Returns the cached value for `name` or builds and caches it."""
+    if self.contains(name):
+      return self.get(name)
+    value = build_fn()
+    self.put(name, value)
+    return value
+
+
+_default_manager: Manager | None = None
+
+
+def initialize(enabled: bool = True, **kwargs: Any) -> Manager | None:
+  """Initializes and returns the process-global Manager on Pathways."""
+  global _default_manager
+  if enabled and _default_manager is None:
+    is_pw = None
+    with contextlib.suppress(ImportError):
+      import pathwaysutils  # pylint: disable=g-import-not-at-top  # pyrefly: ignore[missing-import]
+
+      is_pw = getattr(pathwaysutils, "is_pathways_backend_used", None)
+    platforms = jax.config.jax_platforms or ""
+    if not (is_pw() if callable(is_pw) else "proxy" in platforms):
+      _logger.warning("Elastic training requires the Pathways backend.")
+      return None
+    kwargs.setdefault("poll_interval", 5)
+    _default_manager = Manager(**kwargs)
+  return _default_manager if enabled else None
+
+
+def get_default_manager() -> Manager | None:
+  """Returns the process-global Manager, or None if uninitialized."""
+  return _default_manager
+
+
+def reset_default_manager() -> None:
+  """Closes and clears the process-global Manager."""
+  global _default_manager
+  if _default_manager is not None:
+    _default_manager.close()
+    _default_manager = None
+
+
+def active_devices() -> list[jax.Device]:
+  """Returns active slice devices, or `jax.devices()` without a Manager."""
+  mgr = _default_manager
+  return list(jax.devices()) if mgr is None else mgr.active_devices
+
+
+def active_slice_count() -> int:
+  """Returns the number of active slices (at least 1 on non-elastic runs)."""
+  if _default_manager is not None and _default_manager.active_slice_indices:
+    return _default_manager.active_slice_count
+  return len({getattr(d, "slice_index", 0) for d in active_devices()}) or 1
+
+
+def total_slice_count() -> int | None:
+  """Returns total slices in the allocation, or None without a Manager."""
+  return _default_manager.total_slice_count if _default_manager else None
+
+
+def is_scale_up_available() -> bool:
+  """Returns True if inactive slices are healthy and ready for scale-up."""
+  return bool(_default_manager and _default_manager.available_inactive_slices)
+
+
+def is_elastic_exception(error: BaseException) -> bool:
+  """Returns True if `error` should propagate to `elastic_retry`."""
+  return isinstance(error, (jax.errors.JaxRuntimeError, ScaleUpSignalError))
+
+
+def elastic_retry(**kwargs: Any) -> Callable[[_F], _F]:
+  """Decorates a function with the default Manager's `elastic_retry`."""
+  if _default_manager is None:
+    return lambda func: func
+  kwargs.setdefault("poll_interval", 5)
+  return _default_manager.elastic_retry(**kwargs)
+
+get_global_elastic_manager = get_default_manager
