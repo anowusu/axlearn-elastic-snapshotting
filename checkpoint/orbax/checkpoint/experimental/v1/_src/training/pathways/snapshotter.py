@@ -14,6 +14,7 @@
 
 """Manages asynchronous backups of JAX array states to pinned host memory."""
 
+import contextlib
 import logging
 import queue
 import threading
@@ -177,6 +178,7 @@ class Snapshotter:
     self._latest_snapshot: tuple[list[tree_types.PyTree], int] | None = None
     self._lock = threading.Lock()
     self._queue = queue.Queue(maxsize=1)
+    self._generation = 0
     self.replica_axis_index = replica_axis_index
 
     self._worker_thread = threading.Thread(target=self._worker, daemon=True)
@@ -185,14 +187,18 @@ class Snapshotter:
   def _worker(self):
     """Processes background snapshot requests from the queue."""
     while True:
-      pinned_state, step = self._queue.get()
+      pinned_state, step, generation = self._queue.get()
       try:
+        # `cancel_pending` ran after `save` queued this request, so discard it.
+        if generation != self._generation:
+          continue
         jax.block_until_ready(jax.tree.map(_unwrap_if_prng_key, pinned_state))
       except (jax.errors.JaxRuntimeError, RuntimeError) as e:
         logging.exception("Failed to snapshot state at step %d: %s", step, e)
       else:
         with self._lock:
-          self._latest_snapshot = (pinned_state, step)
+          if generation == self._generation:
+            self._latest_snapshot = (pinned_state, step)
       finally:
         del pinned_state
         self._queue.task_done()
@@ -270,13 +276,13 @@ class Snapshotter:
 
     pinned_state = self._to_snapshot_state(state)
 
-    self._queue.put((pinned_state, step))
+    self._queue.put((pinned_state, step, self._generation))
 
   def load(
       self,
       abstract_state: tree_types.PyTree,
       *,
-      reset_snapshot_state: bool = True,
+      reset_snapshot_state: bool | None = None,
   ) -> tree_types.PyTree:
     """Move arrays from workers onto TPU devices.
 
@@ -286,7 +292,9 @@ class Snapshotter:
       abstract_state: An abstract representation of the state, used to provide
         the target shardings for the restored arrays on the TPU devices.
       reset_snapshot_state: If True, clears snapshot history and resets it to
-        contain only the returned restored state (in host-pinned memory).
+        contain only the returned restored state (in host-pinned memory). If
+        None, resets only when the mesh of `abstract_state` has more than one
+        replica along the replica axis.
 
     Returns:
       The restored array state.
@@ -355,12 +363,40 @@ class Snapshotter:
     unwrapped_restored = jax.tree.map(_unwrap_if_prng_key, restored_state)
     jax.block_until_ready(unwrapped_restored)
 
-    if reset_snapshot_state:
+    if (should_reset := reset_snapshot_state) is None:
+      mesh = _find_named_mesh(abstract_state)
+      should_reset = bool(
+          mesh and mesh.shape[mesh.axis_names[self.replica_axis_index]] > 1
+      )
+    if should_reset:
       new_snapshot_state = self._to_snapshot_state(restored_state)
       with self._lock:
         self._latest_snapshot = (new_snapshot_state, step)
 
     return restored_state
+
+  def try_load(
+      self,
+      abstract_state: tree_types.PyTree,
+      *,
+      reset_snapshot_state: bool | None = None,
+  ) -> tuple[int | None, tree_types.PyTree | None]:
+    """Restores `(step, state)` from the latest snapshot, or `(None, None)`."""
+    self.join()
+    if (latest := self.latest) is None:
+      return None, None
+    try:
+      return latest.step, self.load(
+          abstract_state, reset_snapshot_state=reset_snapshot_state
+      )
+    except jax.errors.JaxRuntimeError:
+      raise
+    except RuntimeError as e:
+      logging.warning("Snapshot restore failed at step %d: %s", latest.step, e)
+      # Drop the unusable snapshot so that `latest` stops reporting it.
+      with self._lock:
+        self._latest_snapshot = None
+      return None, None
 
   def join(self, timeout: float | None = _DEFAULT_JOIN_TIMEOUT_SECS) -> bool:
     """Blocks until all queued snapshot requests have been processed.
@@ -385,6 +421,25 @@ class Snapshotter:
           lambda: not self._queue.unfinished_tasks,
           timeout=max(timeout, 0.0),
       )
+
+  def cancel_pending(
+      self, timeout: float | None = _DEFAULT_JOIN_TIMEOUT_SECS
+  ) -> bool:
+    """Cancels pending or in-flight snapshots, keeping the latest completed one.
+
+    Args:
+      timeout: Maximum seconds to wait for an in-flight snapshot to finish.
+        Defaults to 120.0 seconds. If None, waits without a timeout.
+
+    Returns:
+      True if all queued requests finished within `timeout`, else False.
+    """
+    with self._lock, contextlib.suppress(queue.Empty):
+      self._generation += 1
+      while True:
+        self._queue.get_nowait()
+        self._queue.task_done()
+    return self.join(timeout)
 
   @property
   def latest(self) -> training_metadata_types.CheckpointMetadata[None] | None:
