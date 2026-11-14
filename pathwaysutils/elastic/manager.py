@@ -18,9 +18,10 @@ retries a function in case of `jax.errors.JaxRuntimeError` caused by slice down
 events. It also provides a utility for waiting for slices to become active.
 """
 
-from collections.abc import Callable, Mapping, Sequence, Set
+from collections.abc import Callable, Iterator, Mapping, Sequence, Set
 import functools
 import logging
+import math
 import threading
 from typing import Any, TypeAlias, TypeVar
 import warnings
@@ -88,9 +89,11 @@ class Manager:
     inactive_slice_indices: A set of indices of the slices in the allocation
       that are not currently participating in the JAX computation mesh (e.g.
       because they are down or have not joined yet).
-    available_inactive_slices: A set of indices of the inactive slices that
-      have been detected as up and healthy by the background monitor thread,
-      but have not yet been joined to the active JAX computation mesh.
+    available_inactive_slices: A set of indices of the inactive slices that have
+      been detected as up and healthy by the background monitor thread, but have
+      not yet been joined to the active JAX computation mesh.
+    last_event_was_scale_up: Whether the most recent elastic event caught by
+      `elastic_retry` was a voluntary scale-up rather than a slice failure.
   """
 
   slice_to_devices: Mapping[int, Sequence[jax.Device]]
@@ -98,6 +101,8 @@ class Manager:
   active_slice_indices: Set[int]
   inactive_slice_indices: Set[int]
   available_inactive_slices: Set[int]
+  last_event_was_scale_up: bool
+
   _stop_event: threading.Event | None
   _monitor_thread: threading.Thread | None
   def __init__(
@@ -105,6 +110,7 @@ class Manager:
       devices: Sequence[jax.Device] | None = None,
       *,
       wait_for_slices: bool = False,
+      minimum_slice_count: int | None = None,
       poll_interval: float | int = 10,
       timeout: float | int | None = None,
   ) -> None:
@@ -112,7 +118,8 @@ class Manager:
 
     Args:
       devices: The devices to use. If None, jax.devices() is used.
-      wait_for_slices: If True, waits until all slices become active.
+      wait_for_slices: If True, waits until minimum slices become active.
+      minimum_slice_count: Minimum active slices when waiting (-1/None = all).
       poll_interval: Seconds between slice health checks when waiting.
       timeout: Maximum seconds to wait when waiting, or None for no timeout.
     """
@@ -126,7 +133,9 @@ class Manager:
     self.available_inactive_slices = frozenset()
 
     if wait_for_slices:
+      slice_count = None if minimum_slice_count == -1 else minimum_slice_count
       self.active_slice_indices = elastic.wait_for_slices(
+          slice_count=slice_count,
           poll_interval=poll_interval,
           timeout=timeout,
           slice_to_devices=self.slice_to_devices,
@@ -135,6 +144,8 @@ class Manager:
       self.active_slice_indices = elastic.get_active_slice_indices(
           slice_to_devices=self.slice_to_devices
       )
+
+    self.last_event_was_scale_up = False
 
     self._stop_event = None
     self._monitor_thread = None
@@ -222,6 +233,40 @@ class Manager:
     for slice_index in sorted(self.active_slice_indices):
       devices.extend(self.slice_to_devices[slice_index])
     return devices
+
+  def scale_grad_accumulation_steps(
+      self, base_steps: int, *, batch_sizes: tuple[int, int] | None = None
+  ) -> int:
+    """Scales gradient accumulation steps for the active slice count."""
+    min_steps = max(1, base_steps)
+    active_batch, target_batch = batch_sizes or (
+        self.active_slice_count * min_steps,
+        self.total_slice_count * min_steps,
+    )
+    if active_batch <= 0 or target_batch <= 0:
+      return base_steps
+    steps = math.ceil(target_batch / max(1, active_batch // min_steps))
+    while target_batch % steps != 0:
+      steps += 1
+    return base_steps if steps <= min_steps else steps
+
+  def aot_slice_subsets(
+      self, minimum_slice_count: int | None = None
+  ) -> Iterator[list[jax.Device]]:
+    """Yields `active_devices` for each degraded slice prefix and restores."""
+    orig_active = self.active_slice_indices
+    orig_available = self.available_inactive_slices
+    ordered = sorted(orig_active)
+    if minimum_slice_count is not None and 0 < minimum_slice_count < len(
+        ordered
+    ):
+      try:
+        for count in range(minimum_slice_count, len(ordered)):
+          self.active_slice_indices = frozenset(ordered[:count])
+          yield self.active_devices
+      finally:
+        self.active_slice_indices = orig_active
+        self.available_inactive_slices = orig_available
 
   def scale_by_active_slices(self, x: int | float) -> int | float:
     """Scale x by the number of active slices."""
@@ -365,7 +410,7 @@ class Manager:
     """
     target_slice_count = (
         self.total_slice_count
-        if minimum_slice_count is None
+        if minimum_slice_count in (None, -1)
         else minimum_slice_count
     )
 
@@ -384,6 +429,7 @@ class Manager:
     def decorator(func: _F) -> _F:
       @functools.wraps(func)
       def wrapper(*args: Any, **kwargs: Any) -> Any:
+        self.last_event_was_scale_up = False
         self.start_monitoring(poll_interval)
 
         def attempt_execution(attempt: int) -> Any:
@@ -413,6 +459,7 @@ class Manager:
           _elastic_event_cleanup()
           # Reset available_inactive_slices before retry callback and next attempt.
           self.available_inactive_slices = frozenset()
+          self.last_event_was_scale_up = True
 
           if on_elastic_event_callback is not None:
             on_elastic_event_callback()
@@ -433,6 +480,7 @@ class Manager:
           _elastic_event_cleanup()
           # Reset available_inactive_slices on slice-down failure before retry.
           self.available_inactive_slices = frozenset()
+          self.last_event_was_scale_up = False
 
           if on_elastic_event_callback is not None:
             on_elastic_event_callback()
@@ -460,6 +508,7 @@ class Manager:
               handle_slice_down_error(attempt, error)
             attempt += 1
         finally:
+          self.last_event_was_scale_up = False
           jax.config.update("jax_default_device", previous_default_device)
           self.close()
 
