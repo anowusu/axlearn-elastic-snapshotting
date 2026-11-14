@@ -14,6 +14,7 @@
 
 """Manages asynchronous backups of JAX array states to pinned host memory."""
 
+from collections.abc import Callable
 import contextlib
 import logging
 import queue
@@ -175,7 +176,10 @@ class Snapshotter:
     self._concatenate_by_mesh_axis, self._split_by_mesh_axis = (
         _get_pathwaysutils()
     )
-    self._latest_snapshot: tuple[list[tree_types.PyTree], int] | None = None
+    # The replicas of the latest snapshot, its step and its full-mesh state.
+    self._latest_snapshot: (
+        tuple[list[tree_types.PyTree], int, tree_types.PyTree] | None
+    ) = None
     self._lock = threading.Lock()
     self._queue = queue.Queue(maxsize=1)
     self._generation = 0
@@ -187,46 +191,62 @@ class Snapshotter:
   def _worker(self):
     """Processes background snapshot requests from the queue."""
     while True:
-      pinned_state, step, generation = self._queue.get()
+      full_mesh_pinned_state, per_replica_pinned_trees, step, generation = (
+          self._queue.get()
+      )
       try:
         # `cancel_pending` ran after `save` queued this request, so discard it.
         if generation != self._generation:
           continue
-        jax.block_until_ready(jax.tree.map(_unwrap_if_prng_key, pinned_state))
+        jax.block_until_ready(
+            jax.tree.map(
+                _unwrap_if_prng_key,
+                (full_mesh_pinned_state, per_replica_pinned_trees),
+            )
+        )
       except (jax.errors.JaxRuntimeError, RuntimeError) as e:
         logging.exception("Failed to snapshot state at step %d: %s", step, e)
       else:
         with self._lock:
           if generation == self._generation:
-            self._latest_snapshot = (pinned_state, step)
+            self._latest_snapshot = (
+                per_replica_pinned_trees,
+                step,
+                full_mesh_pinned_state,
+            )
       finally:
-        del pinned_state
+        del full_mesh_pinned_state, per_replica_pinned_trees
         self._queue.task_done()
 
   def _to_snapshot_state(
       self, state: tree_types.PyTree
-  ) -> list[tree_types.PyTree]:
-    """Converts a PyTree into a list of replica PyTrees in pinned host memory.
+  ) -> tuple[tree_types.PyTree, list[tree_types.PyTree]]:
+    """Copies a PyTree to pinned host memory, whole and split into replicas.
 
     Args:
       state: The PyTree to be converted and split.
 
     Returns:
-      A list of PyTrees where each PyTree represents a single replica of
-      `state`. Non-array leaves (e.g., scalars, strings, metadata, Python
-      objects) are preserved across all replica PyTrees.
+      A tuple of `state` with its arrays in pinned host memory, and a list of
+      PyTrees where each PyTree represents a single replica of `state`. In all
+      of these PyTrees, single-device arrays are replicated across the mesh, and
+      non-array leaves (e.g., scalars, strings, metadata, Python objects) are
+      preserved.
     """
     replicated = _replicate_single_device_leaves(state)
     leaves, tree_def = jax.tree_util.tree_flatten(replicated)
-    split_leaves = []
+    full_mesh_pinned_leaves: list[Any] = []
+    per_replica_pinned_leaves = []
     num_replicas = None
 
     for x in leaves:
       if not is_shardable_array(x):
-        split_leaves.append(x)
+        full_mesh_pinned_leaves.append(x)
+        per_replica_pinned_leaves.append(x)
       else:
         data = _unwrap_if_prng_key(x)
         pinned = _pin_host(data)
+        full_mesh_pinned_leaves.append(_wrap_if_prng_key(pinned, x))
         mesh = getattr(pinned.sharding, "mesh", None)
         replicas = [pinned]
         if mesh is not None:
@@ -241,42 +261,106 @@ class Snapshotter:
               f" replica axis, got {len(replicas)} and {num_replicas}."
           )
         reps = [_wrap_if_prng_key(rep, x) for rep in replicas]
-        split_leaves.append(reps)
+        per_replica_pinned_leaves.append(reps)
 
     if num_replicas is None:
-      return [state]
+      return state, [state]
 
-    replica_trees = []
+    per_replica_pinned_trees = []
     for r in range(num_replicas):
       r_leaves = [
           reps[r] if is_shardable_array(orig_x) else reps
-          for reps, orig_x in zip(split_leaves, leaves)
+          for reps, orig_x in zip(per_replica_pinned_leaves, leaves)
       ]
-      replica_trees.append(jax.tree_util.tree_unflatten(tree_def, r_leaves))
+      per_replica_pinned_trees.append(
+          jax.tree_util.tree_unflatten(tree_def, r_leaves)
+      )
 
-    return replica_trees
+    full_mesh_pinned_state = jax.tree_util.tree_unflatten(
+        tree_def, full_mesh_pinned_leaves
+    )
+    return full_mesh_pinned_state, per_replica_pinned_trees
 
-  def save(self, step: int, state: tree_types.PyTree) -> None:
-    """Backs up JAX array states to pinned host memory, asynchronously.
+  def _enqueue_snapshot(
+      self, step: int, state: tree_types.PyTree
+  ) -> tree_types.PyTree:
+    """Queues the snapshot of `state` at `step` for the worker thread.
 
-    If previous snapshotting requests are still in progress, this request may
-    be skipped.
+    Args:
+      step: The training step number associated with the state.
+      state: The PyTree to be saved.
+
+    Returns:
+      `state` with its arrays in pinned host memory, as the snapshot stores it.
+    """
+    pinned_state, per_replica_pinned_trees = self._to_snapshot_state(state)
+    self._queue.put(
+        (pinned_state, per_replica_pinned_trees, step, self._generation)
+    )
+    return pinned_state
+
+  def save(
+      self,
+      step: int,
+      state: tree_types.PyTree,
+      *,
+      wait: bool = False,
+      checkpointer_wait_fn: Callable[[], Any] | None = None,
+      checkpointer_save_fn: Callable[[tree_types.PyTree], Any] | None = None,
+  ) -> Any:
+    """Backs up JAX array states to pinned host memory.
+
+    By default, the backup runs asynchronously. If previous snapshotting
+    requests are still in progress, this request may be skipped.
 
     The saved state contains all replicas of user data. When restoring via
     `load_pytree`, snapshotter is able to reconstruct user data even if some
     replicas are unavailable, making it resilient to failures of some replicas.
 
+    With `wait` or a checkpointer function, this method instead takes the
+    snapshot of `step` before it returns, in the following order:
+
+    1. Calls `checkpointer_wait_fn`, so that the previous checkpoint save
+       releases its host arrays before the snapshot allocates new ones.
+    2. Waits for the snapshotting requests in progress.
+    3. Takes the snapshot.
+    4. Calls `checkpointer_save_fn` with `state` backed by the host arrays of
+       the snapshot, so that the checkpoint needs no second transfer from device
+       memory. If the snapshot failed, passes `state` itself.
+
     Args:
       step: The training step number associated with the state.
       state: The PyTree to be saved.
+      wait: Whether to take the snapshot of `step` before returning.
+      checkpointer_wait_fn: Waits for the previous save of a checkpointer.
+      checkpointer_save_fn: Saves the PyTree that it is given as a checkpoint.
+        The arrays of that PyTree belong to the snapshot, so the function must
+        not donate or delete them. Single-device arrays are replicated across
+        the mesh.
+
+    Returns:
+      The result of `checkpointer_save_fn`, or None without that function.
     """
-    if self._queue.full():
-      logging.warning("Snapshotter busy. Skipping snapshot for step %d", step)
-      return
+    if not (wait or checkpointer_wait_fn or checkpointer_save_fn):
+      if self._queue.full():
+        logging.warning("Snapshotter busy. Skipping snapshot for step %d", step)
+        return None
+      self._enqueue_snapshot(step, state)
+      return None
 
-    pinned_state = self._to_snapshot_state(state)
-
-    self._queue.put((pinned_state, step, self._generation))
+    if checkpointer_wait_fn is not None:
+      checkpointer_wait_fn()
+    self.join()
+    pinned_state = self._enqueue_snapshot(step, state)
+    self.join()
+    if checkpointer_save_fn is None:
+      return None
+    with self._lock:
+      latest_snapshot = self._latest_snapshot
+    if latest_snapshot is None or latest_snapshot[2] is not pinned_state:
+      # The snapshot failed, so the checkpoint transfers `state` itself.
+      pinned_state = state
+    return checkpointer_save_fn(pinned_state)
 
   def load(
       self,
@@ -306,7 +390,7 @@ class Snapshotter:
     with self._lock:
       if self._latest_snapshot is None:
         raise RuntimeError("No snapshots available to restore from.")
-      replica_trees, step = self._latest_snapshot
+      replica_trees, step, _ = self._latest_snapshot
 
     def is_replica_active(replica_tree):
       try:
@@ -369,9 +453,15 @@ class Snapshotter:
           mesh and mesh.shape[mesh.axis_names[self.replica_axis_index]] > 1
       )
     if should_reset:
-      new_snapshot_state = self._to_snapshot_state(restored_state)
+      full_mesh_pinned_state, per_replica_pinned_trees = (
+          self._to_snapshot_state(restored_state)
+      )
       with self._lock:
-        self._latest_snapshot = (new_snapshot_state, step)
+        self._latest_snapshot = (
+            per_replica_pinned_trees,
+            step,
+            full_mesh_pinned_state,
+        )
 
     return restored_state
 
@@ -402,8 +492,7 @@ class Snapshotter:
     """Blocks until all queued snapshot requests have been processed.
 
     A processed request may have failed, so check `latest` for the saved step.
-    To take a blocking snapshot, call `join` before `save` so that the request
-    is not skipped, and again after `save` to wait for it.
+    To take a blocking snapshot, call `save` with `wait=True`.
 
     Args:
       timeout: The maximum number of seconds to wait. Defaults to 120.0 seconds.
@@ -447,7 +536,7 @@ class Snapshotter:
     with self._lock:
       if self._latest_snapshot is None:
         return None
-      _, step = self._latest_snapshot
+      _, step, _ = self._latest_snapshot
     return training_metadata_types.CheckpointMetadata(
         step=step,
         path=epath.Path(),
