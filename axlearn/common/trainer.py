@@ -3,13 +3,14 @@
 """Defines SpmdTrainer, a trainer that supports partitioning of computation and data with GSPMD."""
 
 import contextlib
+import datetime
 import itertools
 import math
 import os.path
 import signal
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Any, Callable, ContextManager, Literal, NamedTuple, Optional, Union
 
 import jax
@@ -21,9 +22,9 @@ from jax.experimental.pjit import pjit
 
 from pathwaysutils.elastic import manager as elastic_manager
 
+from axlearn.common import elastic_utils, measurement, utils
 from axlearn.common import file_system as fs
 from axlearn.common import gradient_accumulation as ga
-from axlearn.common import measurement, utils
 from axlearn.common.base_layer import ParameterSpec
 from axlearn.common.base_model import BaseModel
 from axlearn.common.checkpointer import BaseCheckpointer, Checkpointer
@@ -275,6 +276,8 @@ class SpmdTrainer(Module):
         self._device_monitor = maybe_instantiate(cfg.device_monitor)
         self._recorder = maybe_instantiate(cfg.recorder)
         self._is_initialized: bool = False
+        self._scale_up_requested: bool = False
+        self._elastic_wait_event_type: Optional[str] = None
         self._init_prng_key: Optional[tuple[np.ndarray, Any]] = None
         elastic_manager.initialize(
             cfg.elastic_enabled,
@@ -349,7 +352,7 @@ class SpmdTrainer(Module):
                 "input", maybe_set_config(cfg.input, is_training=True)
             )
             # Start from the beginning of the input dataset by default.
-            self._input_iter = iter(self.input.dataset())
+            self._input_iter = self._create_input_iterator()
             cfg.summary_writer.dir = cfg.summary_writer.dir or os.path.join(
                 cfg.dir, "summaries", "train_train"
             )
@@ -398,6 +401,7 @@ class SpmdTrainer(Module):
                     model_param_partition_specs=model_param_partition_specs,
                 )
         self._maybe_record_event(measurement.Event.END_ACCELERATOR_INIT)
+        self._record_slice_counts()
 
     @property
     def step(self):
@@ -498,9 +502,33 @@ class SpmdTrainer(Module):
         except NotImplementedError:
             self._reconfigure_elastic_mesh(orig_devs)
 
+    def _record_slice_counts(self, *, stepping: bool = True):
+        """Records active, total, and available slice counts for goodput monitoring."""
+        mgr = self._elastic_manager()
+        if mgr is None:
+            return
+        active_slices = mgr.active_slice_count if stepping else 0
+        available_slices = None if stepping else elastic_utils.available_slice_count()
+        self._maybe_record_event(
+            measurement.Event.RECORD_SLICE_COUNTS,
+            active_slices=active_slices,
+            total_slices=mgr.total_slice_count,
+            available_slices=(
+                mgr.active_slice_count if available_slices is None else available_slices
+            ),
+        )
+
     def _on_elastic_event(self):
         self._trainer_state = None
         self.checkpointer.on_elastic_event()
+        self._elastic_wait_event_type = (
+            "elastic_scale_up" if self._scale_up_requested else "elastic_slice_down"
+        )
+        self._scale_up_requested = False
+        self._maybe_record_event(
+            measurement.Event.START_ELASTIC_WAIT, self._elastic_wait_event_type
+        )
+        self._record_slice_counts(stepping=False)
 
     def _restore_after_elastic_event(self):
         """Reconfigures the mesh if devices changed and restores trainer state."""
@@ -508,26 +536,60 @@ class SpmdTrainer(Module):
         devices_changed = {d.id for d in live_devs} != set(self._mesh_cache_key())
         if self._trainer_state is not None and not devices_changed:
             return
-        if devices_changed:
-            steps = self._reconfigure_elastic_mesh(live_devs)
-            self._step_log(
-                "[ELASTIC][SCALE] devices=%s minibatch_steps=%s Reconfigured mesh: %s",
-                len(live_devs),
-                steps,
-                self._mesh,
+        if self._elastic_wait_event_type is not None:
+            self._maybe_record_event(
+                measurement.Event.END_ELASTIC_WAIT, self._elastic_wait_event_type
             )
-        else:
-            self._step_log("[ELASTIC][SCALE] devices=%s unchanged; reusing mesh.", len(live_devs))
-        self.checkpointer.reset_after_elastic_event(devices_changed=devices_changed)
-        with self.mesh():
-            if self.restore_checkpoint() is None:
-                raw_key, key_impl = self._init_prng_key
-                init_key = jnp.asarray(raw_key)
-                if key_impl is not None:
-                    init_key = jax.random.wrap_key_data(init_key, impl=key_impl)
-                self.init(init_key)
-                self._step = 0
-                self.save_checkpoint(self._run_eval())
+            self._elastic_wait_event_type = None
+        self._maybe_record_event(measurement.Event.START_ELASTIC_REINIT)
+        try:
+            self._record_slice_counts(stepping=False)
+            self._maybe_record_event(measurement.Event.START_ACCELERATOR_INIT)
+            try:
+                if devices_changed:
+                    steps = self._reconfigure_elastic_mesh(live_devs)
+                    self._step_log(
+                        "[ELASTIC][SCALE] devices=%s minibatch_steps=%s Reconfigured mesh: %s",
+                        len(live_devs),
+                        steps,
+                        self._mesh,
+                    )
+                else:
+                    self._step_log(
+                        "[ELASTIC][SCALE] devices=%s unchanged; reusing mesh.", len(live_devs)
+                    )
+            finally:
+                self._maybe_record_event(measurement.Event.END_ACCELERATOR_INIT)
+            self._maybe_record_event(measurement.Event.START_TRAINING_PREPARATION)
+            try:
+                self.checkpointer.reset_after_elastic_event(devices_changed=devices_changed)
+                with self.mesh():
+                    if self.restore_checkpoint() is None:
+                        raw_key, key_impl = self._init_prng_key
+                        init_key = jnp.asarray(raw_key)
+                        if key_impl is not None:
+                            init_key = jax.random.wrap_key_data(init_key, impl=key_impl)
+                        self.init(init_key)
+                        self._step = 0
+                        self.save_checkpoint(self._run_eval())
+            finally:
+                self._maybe_record_event(measurement.Event.END_TRAINING_PREPARATION)
+        finally:
+            self._maybe_record_event(measurement.Event.END_ELASTIC_REINIT)
+            self._record_slice_counts(stepping=True)
+
+    def _create_input_iterator(self) -> Iterator:
+        self._maybe_record_event(
+            measurement.Event.START_CUSTOM_BADPUT_EVENT,
+            custom_badput_event_type="DATA_ITERATOR_INIT",
+        )
+        try:
+            return iter(self.input.dataset())
+        finally:
+            self._maybe_record_event(
+                measurement.Event.END_CUSTOM_BADPUT_EVENT,
+                custom_badput_event_type="DATA_ITERATOR_INIT",
+            )
 
     def _sync_prng_key_spec(self, prng_key: Tensor) -> None:
         """Synchronizes `trainer_state_specs.prng_key` with `prng_key`'s dtype and shape."""
@@ -1080,6 +1142,7 @@ class SpmdTrainer(Module):
 
         if self.step >= cfg.max_step:
             self._step_log("Already reached max_step=%s. Stopping", cfg.max_step)
+            self._maybe_record_event(measurement.Event.END_TRAINING_PREPARATION)
             return False
 
         self._jit_train_step = self._pjit_train_step()
@@ -1110,7 +1173,7 @@ class SpmdTrainer(Module):
 
             def _state_spec(with_iter: bool) -> dict[str, Any]:
                 if with_iter:
-                    return dict(**ckpt_state_spec, input_iter=iter(self.input.dataset()))
+                    return dict(**ckpt_state_spec, input_iter=self._create_input_iterator())
                 return ckpt_state_spec
 
             restore_input_iter = cfg.save_input_iterator
@@ -1320,6 +1383,7 @@ class SpmdTrainer(Module):
             and self.checkpointer.flush_for_scale_up(step=self.step, state=self._checkpoint_state())
         ):
             self._step_log("[ELASTIC] New slice ready at step=%s; triggering scale-up", self.step)
+            self._scale_up_requested = True
             raise elastic_manager.ScaleUpSignalError(f"Scale-up at step {self.step}")
 
         return_dict = {"loss": outputs["loss"], "aux": outputs["aux"]}
@@ -1336,9 +1400,7 @@ class SpmdTrainer(Module):
         force_runs: Optional[set[str]] = None,
     ) -> dict[str, Any]:
         """Runs evaluations and returns the corresponding summaries."""
-        self._maybe_record_event(
-            measurement.Event.START_CUSTOM_BADPUT_EVENT, custom_badput_event_type="EVAL"
-        )
+        eval_start_time = datetime.datetime.now(datetime.timezone.utc)
         evaler_summaries = {}
         # Note: we will use the same eval key as the training keys of the future step,
         # which should be okay.
@@ -1352,9 +1414,15 @@ class SpmdTrainer(Module):
                 force_run=bool(force_runs is not None and evaler_name in force_runs),
             )
             evaler_summaries[evaler_name] = summaries
-        self._maybe_record_event(
-            measurement.Event.END_CUSTOM_BADPUT_EVENT, custom_badput_event_type="EVAL"
-        )
+        if any(summaries is not None for summaries in evaler_summaries.values()):
+            self._maybe_record_event(
+                measurement.Event.START_CUSTOM_BADPUT_EVENT,
+                custom_badput_event_type="EVAL",
+                start_time=eval_start_time,
+            )
+            self._maybe_record_event(
+                measurement.Event.END_CUSTOM_BADPUT_EVENT, custom_badput_event_type="EVAL"
+            )
         return evaler_summaries
 
     def _pjit_train_step(self) -> jax.stages.Wrapped:
