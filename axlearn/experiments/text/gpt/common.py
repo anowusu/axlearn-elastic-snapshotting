@@ -42,6 +42,7 @@ from axlearn.common.attention import (
     set_double_shard_weights_config,
 )
 from axlearn.common.checkpointer import every_n_steps_and_last_policy
+from axlearn.common.checkpointer_orbax import OrbaxCheckpointer
 from axlearn.common.config import (
     ConfigOr,
     FunctionConfigBase,
@@ -770,12 +771,16 @@ def get_trainer_config_fn(
             )
             cfg.evalers[name] = evaler_cfg
         # Summaries and checkpoints.
-        cfg.checkpointer.save_policy = config_for_function(every_n_steps_and_last_policy).set(
-            n=save_every_n_steps or min(eval_every_n_steps, 5_000),
-            max_step=max_step,
+        cfg.checkpointer = OrbaxCheckpointer.default_config().set(
+            save_policy=config_for_function(every_n_steps_and_last_policy).set(
+                n=save_every_n_steps or min(eval_every_n_steps, 5_000),
+                max_step=max_step,
+            ),
+            keep_period=min(max_step, keep_every_n_steps),
+            keep_last_n=3,
+            max_concurrent_save_gb=16,
+            skip_uncommitted_checkpoint=False,
         )
-        cfg.checkpointer.keep_every_n_steps = min(max_step, keep_every_n_steps)
-        cfg.checkpointer.keep_last_n = 3
         cfg.summary_writer.write_every_n_steps = min(eval_every_n_steps, 100)
         cfg.summary_writer.max_queue = 1000
         if len(mesh_axis_names) != len(mesh_shape):
