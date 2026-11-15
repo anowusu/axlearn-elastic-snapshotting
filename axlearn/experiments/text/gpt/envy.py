@@ -42,7 +42,7 @@ from axlearn.common.base_layer import RematSpec
 from axlearn.common.config import TrainerConfigFn, config_for_function
 from axlearn.common.embedding import TransformerTextEmbeddings
 from axlearn.common.layers import RMSNorm
-from axlearn.common.mixture_of_experts import TransformerFeedForwardMoE, get_outer_batch_from_mesh
+from axlearn.common.mixture_of_experts import TransformerFeedForwardMoE
 from axlearn.common.trainer import SpmdTrainer
 from axlearn.common.trainer_config_modifier import (
     ChainConfigModifier,
@@ -444,7 +444,7 @@ def model_config(
         ffn_dim: The feed-forward dimension or config function.
             If None, defaults to a setting from https://arxiv.org/abs/2002.05202.
         flash_attention: If True, use flash attention implementation.
-        mesh_shape: the mesh shape, used to infer the outer batch size.
+        mesh_shape: Unused; outer batch size is inferred dynamically from the active mesh.
         kwargs: Default kwargs forwarded to `common_model_config`.
 
     Returns:
@@ -475,13 +475,9 @@ def model_config(
         query_scale=ScaleQuery.default_config().set(norm=norm_cfg.clone()),
         key_scale=ScaleKey.default_config().set(norm=norm_cfg.clone()),
     )
-    outer_batch_size = get_outer_batch_from_mesh(
-        mesh_axis_names=MESH_AXIS_NAMES,
-        outer_batch_axis_names=MOE_OUTER_BATCH_AXIS_NAMES,
-        mesh_shape=mesh_shape,
-    )
+    del mesh_shape
     expert_config = TransformerFeedForwardMoE.default_config().set(
-        outer_batch=outer_batch_size,
+        outer_batch=None,
         num_experts=num_experts,
         input_dim=hidden_dim,
         num_groups=num_groups,
