@@ -19,6 +19,8 @@ from jax import numpy as jnp
 from jax.experimental import multihost_utils
 from jax.experimental.pjit import pjit
 
+from pathwaysutils.elastic import manager as elastic_manager
+
 from axlearn.common import file_system as fs
 from axlearn.common import measurement, utils
 from axlearn.common.base_layer import ParameterSpec
@@ -149,6 +151,7 @@ class SpmdTrainer(Module):
         learner: Required[Learner.Config] = REQUIRED
         # The checkpointer config.
         checkpointer: BaseCheckpointer.Config = Checkpointer.default_config()
+        elastic_enabled: bool = False
         # A dict of evaler names to configs, each name must be non-empty.
         evalers: dict[str, SpmdEvaler.Config] = {}
 
@@ -305,6 +308,9 @@ class SpmdTrainer(Module):
         mesh = jax.sharding.Mesh(devices, cfg.mesh_axis_names)
         self._step_log("Global mesh: %s", mesh)
         self._mesh = mesh
+        if cfg.elastic_enabled:
+            self._elastic_manager = elastic_manager.Manager(minimum_slice_count=-1, poll_interval=5)
+            self._step_log("[ELASTIC][SCALE] devices=%s", mesh.size)
         self._context_manager: Callable[[], ContextManager] = (
             maybe_instantiate(cfg.context_manager) or contextlib.nullcontext
         )
@@ -423,6 +429,14 @@ class SpmdTrainer(Module):
 
     def mesh(self):
         return jax.sharding.Mesh(self._mesh.devices, self._mesh.axis_names)
+
+    def _restore_after_elastic_event(self):
+        if self._trainer_state is not None:
+            return
+        self._step_log("[ELASTIC][SCALE] devices=%s unchanged; reusing mesh.", self._mesh.size)
+        self.checkpointer.cancel()
+        if self.restore_checkpoint() is None:
+            raise RuntimeError("Failed to restore from both snapshot and checkpoint.")
 
     @contextlib.contextmanager
     def _watchdog(self):
@@ -616,7 +630,7 @@ class SpmdTrainer(Module):
 
             self._is_initialized = True
 
-            with self.checkpointer:
+            def _train_loop():
                 logging.info("Starting loop...")
                 start_time = time.perf_counter()
                 num_steps = 0
@@ -669,6 +683,19 @@ class SpmdTrainer(Module):
                         break
                 if self.step < cfg.max_step:
                     self._step_log("Reached end of inputs. Stopping")
+                return output
+
+            if cfg.elastic_enabled:
+                _train_loop = self._elastic_manager.elastic_retry(
+                    max_retries=100,
+                    timeout=3600,
+                    poll_interval=5,
+                    pre_callback=self._restore_after_elastic_event,
+                    on_elastic_event_callback=lambda: setattr(self, "_trainer_state", None),
+                )(_train_loop)
+
+            with self.checkpointer:
+                output = _train_loop()
             self._step_log("Checkpointer flushed.")
             return output
 
@@ -985,6 +1012,8 @@ class SpmdTrainer(Module):
             # tensorflow when tensorflow dataset iterator checkpoints are not found
             # pylint: disable-next=broad-exception-caught
             except Exception as e:
+                if isinstance(e, jax.errors.JaxRuntimeError):
+                    raise
                 logging.warning(
                     "Attempt to restore checkpoint with restore_input_iter=%s failed: %s",
                     restore_input_iter,
@@ -1152,9 +1181,12 @@ class SpmdTrainer(Module):
 
         n = self._config.log_every_n_steps or 100
         if self.step % n == 0 or 0 <= self.step <= 5:
+            # Fetch the loss here: logging formats lazily and swallows errors, which would hide
+            # device errors (e.g. after a slice goes down) from elastic retry.
+            loss = outputs["loss"].item() if hasattr(outputs["loss"], "item") else outputs["loss"]
             self._step_log(
                 "loss=%s aux=%s",
-                outputs["loss"],
+                loss,
                 jax.tree.map(lambda x: x.item() if x.ndim == 0 else f"T{x.shape}", outputs["aux"]),
             )
 

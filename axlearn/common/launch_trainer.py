@@ -11,7 +11,7 @@ from absl import flags, logging
 
 from axlearn.common import file_system as fs
 from axlearn.common import measurement
-from axlearn.common.config import TrainerConfigFn, get_named_trainer_config
+from axlearn.common.config import TrainerConfigFn, config_for_class, get_named_trainer_config
 from axlearn.common.trainer import SpmdTrainer, select_mesh_config
 from axlearn.common.utils import MeshShape, get_data_dir, infer_mesh_shape
 
@@ -113,8 +113,27 @@ flags.DEFINE_string(
     None,
     "The mesh selector string. See `SpmdTrainer.Config.mesh_rules` for details.",
 )
+flags.DEFINE_bool("elastic_enabled", False, "Enables Pathways pause-and-resume training.")
+flags.DEFINE_integer("elastic_snapshot_every_n_steps", 5, "Snapshot frequency in steps.")
 
 FLAGS = flags.FLAGS
+
+
+def _configure_elastic_training(trainer_config: SpmdTrainer.Config, flag_values: flags.FlagValues):
+    """Configures Pathways elastic training and Orbax Snapshotter when elastic_enabled."""
+    # pylint: disable-next=import-error,import-outside-toplevel
+    from orbax.checkpoint.experimental.v1.training.pathways import Snapshotter
+
+    trainer_config.elastic_enabled = True
+    ckpt = trainer_config.checkpointer
+    dims = getattr(trainer_config.mesh_shape, "dcn_mesh_shape", trainer_config.mesh_shape)
+    axis_idx = dims.index(-1) if -1 in dims else next((i for i, d in enumerate(dims) if d != 1), 0)
+    ckpt.set(
+        replica_axis_index=axis_idx,
+        skip_uncommitted_checkpoint=False,
+        snapshot_every_n_steps=flag_values.elastic_snapshot_every_n_steps,
+        snapshotter=config_for_class(Snapshotter).set(replica_axis_index=axis_idx),
+    )
 
 
 def get_trainer_config(
@@ -170,6 +189,8 @@ def get_trainer_config(
         )
     if trainer_config.log_every_n_steps is None:
         trainer_config.log_every_n_steps = flag_values.trainer_log_every_n_steps
+    if flag_values.elastic_enabled:
+        _configure_elastic_training(trainer_config, flag_values)
     for eval_cfg in trainer_config.evalers.values():
         eval_cfg.trace_at_iters = [int(el) for el in flag_values.eval_trace_at_iters]
     if flag_values.device_monitor == "tpu":
