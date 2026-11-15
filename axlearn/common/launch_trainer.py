@@ -2,6 +2,7 @@
 
 """Utilities to launch a trainer."""
 
+import contextlib
 import json
 import os
 from typing import Any, Optional
@@ -231,6 +232,12 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
 
     trainer: SpmdTrainer = trainer_config.instantiate(parent=None)
     prng_key = jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
-    output = trainer.run(prng_key)
-    measurement.record_event(measurement.Event.END_JOB)
+    recorder = measurement.global_recorder
+    with recorder.maybe_monitor_all() if recorder is not None else contextlib.nullcontext():
+        try:
+            output = trainer.run(prng_key)
+            measurement.record_event(measurement.Event.END_JOB)
+        finally:
+            if (flush := getattr(recorder, "flush", None)) is not None:
+                flush()
     return output
