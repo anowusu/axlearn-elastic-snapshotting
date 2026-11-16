@@ -8,10 +8,16 @@ from typing import Any, Optional
 
 import jax
 from absl import flags, logging
+from orbax.checkpoint.experimental.v1.training.pathways import Snapshotter
+from pathwaysutils.elastic import manager as elastic_manager
 
 from axlearn.common import file_system as fs
 from axlearn.common import measurement
+from axlearn.common.checkpointer import Checkpointer
+from axlearn.common.checkpointer_orbax import OrbaxCheckpointer
 from axlearn.common.config import TrainerConfigFn, config_for_class, get_named_trainer_config
+from axlearn.common.elastic_input import ElasticInput, ElasticSpmdInputDispatcher
+from axlearn.common.input_dispatch import SpmdInputDispatcher
 from axlearn.common.trainer import SpmdTrainer, select_mesh_config
 from axlearn.common.utils import MeshShape, get_data_dir, infer_mesh_shape
 
@@ -113,26 +119,64 @@ flags.DEFINE_string(
     None,
     "The mesh selector string. See `SpmdTrainer.Config.mesh_rules` for details.",
 )
-flags.DEFINE_bool("elastic_enabled", False, "Enables Pathways pause-and-resume training.")
+flags.DEFINE_bool("elastic_enabled", False, "Enables elastic training on the Pathways backend.")
+flags.DEFINE_integer("elastic_min_slice_count", -1, "Minimum active slices (-1 waits for all).")
+flags.DEFINE_float("elastic_timeout_seconds", None, "Max seconds to wait for slices per retry.")
+flags.DEFINE_integer("elastic_max_retries", None, "Max retries after elastic events.")
+flags.DEFINE_enum("elastic_backup_kind", "snapshot", ["snapshot", "checkpoint"], "Backup kind.")
 flags.DEFINE_integer("elastic_snapshot_every_n_steps", 5, "Snapshot frequency in steps.")
+flags.DEFINE_bool("elastic_snapshot_stage_in_hbm", False, "Stage snapshots in HBM.")
+flags.DEFINE_bool("elastic_scale_grad_accumulation", True, "Scale grad accum when degraded.")
 
 FLAGS = flags.FLAGS
 
 
 def _configure_elastic_training(trainer_config: SpmdTrainer.Config, flag_values: flags.FlagValues):
-    """Configures Pathways elastic training and Orbax Snapshotter when elastic_enabled."""
-    # pylint: disable-next=import-error,import-outside-toplevel
-    from orbax.checkpoint.experimental.v1.training.pathways import Snapshotter
-
-    trainer_config.elastic_enabled = True
+    """Configures elastic input, Orbax checkpointer, and Snapshotter when elastic_enabled."""
+    trainer_config.set(
+        elastic_enabled=True,
+        elastic_min_slice_count=flag_values.elastic_min_slice_count,
+        elastic_timeout_seconds=flag_values.elastic_timeout_seconds,
+        elastic_max_retries=flag_values.elastic_max_retries,
+        elastic_scale_grad_accumulation=flag_values.elastic_scale_grad_accumulation,
+    )
+    mgr = elastic_manager.initialize(
+        True,
+        wait_for_slices=True,
+        minimum_slice_count=flag_values.elastic_min_slice_count,
+        timeout=flag_values.elastic_timeout_seconds,
+    )
+    dispatcher = getattr(trainer_config.input, "input_dispatcher", None)
+    if mgr is not None and isinstance(dispatcher, SpmdInputDispatcher.Config):
+        trainer_config.input.input_dispatcher = ElasticSpmdInputDispatcher.default_config().set(
+            global_logical_batch_size=dispatcher.global_logical_batch_size,
+            partition_spec=dispatcher.partition_spec,
+        )
+        trainer_config.input = ElasticInput.default_config().set(input=trainer_config.input)
+    if getattr(trainer_config.checkpointer, "klass", None) is Checkpointer:
+        old_ckpt = trainer_config.checkpointer
+        trainer_config.checkpointer = OrbaxCheckpointer.default_config().set(
+            save_policy=old_ckpt.save_policy,
+            keep_last_n=old_ckpt.keep_last_n,
+            keep_period=old_ckpt.keep_every_n_steps,
+            max_concurrent_save_gb=8,
+        )
     ckpt = trainer_config.checkpointer
+    if not isinstance(ckpt, OrbaxCheckpointer.Config):
+        return
+    ckpt.skip_uncommitted_checkpoint = False
+    if flag_values.elastic_backup_kind != "snapshot":
+        return
     dims = getattr(trainer_config.mesh_shape, "dcn_mesh_shape", trainer_config.mesh_shape)
     axis_idx = dims.index(-1) if -1 in dims else next((i for i, d in enumerate(dims) if d != 1), 0)
     ckpt.set(
         replica_axis_index=axis_idx,
-        skip_uncommitted_checkpoint=False,
+        save_device_host_concurrent_gb=ckpt.save_device_host_concurrent_gb or 2,
         snapshot_every_n_steps=flag_values.elastic_snapshot_every_n_steps,
-        snapshotter=config_for_class(Snapshotter).set(replica_axis_index=axis_idx),
+        snapshotter=config_for_class(Snapshotter).set(
+            replica_axis_index=axis_idx,
+            copy_device_arrays_for_async_transfer=flag_values.elastic_snapshot_stage_in_hbm,
+        ),
     )
 
 
@@ -167,8 +211,9 @@ def get_trainer_config(
     if flag_values.mesh_selector is not None:
         select_mesh_config(trainer_config, mesh_selector=flag_values.mesh_selector)
     trainer_config.mesh_axis_names = trainer_config.mesh_axis_names or ("data", "model")
-    trainer_config.mesh_shape = trainer_config.mesh_shape or (len(jax.devices()), 1)
-    if isinstance(trainer_config.mesh_shape, MeshShape):
+    default_shape = (-1, 1) if flag_values.elastic_enabled else (len(jax.devices()), 1)
+    trainer_config.mesh_shape = trainer_config.mesh_shape or default_shape
+    if not flag_values.elastic_enabled and isinstance(trainer_config.mesh_shape, MeshShape):
         trainer_config.mesh_shape = infer_mesh_shape(trainer_config.mesh_shape)
     trainer_config.start_trace_steps = [int(el) for el in flag_values.trace_at_steps]
     if flag_values["n_steps_for_each_trace"].present:

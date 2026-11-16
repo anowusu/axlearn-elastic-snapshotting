@@ -944,6 +944,18 @@ class BaseCheckpointer(Module):
         """Waits for pending asynchronous saves to finish."""
         raise NotImplementedError(type(self))
 
+    def on_elastic_event(self):
+        """Notifies the checkpointer of an elastic fault or scale event."""
+
+    def reset_after_elastic_event(self, *, devices_changed: bool = False):
+        """Resets checkpointer state before resuming after an elastic event."""
+        del devices_changed
+
+    def flush_for_scale_up(self, *, step: int, state: NestedTensor) -> bool:
+        """Ensures `state` at `step` is backed up before voluntary scale-up."""
+        del step, state
+        return True
+
     def stop(self, *, has_exception: bool = False):
         """Stops the checkpointer. Waits for async writes, garbage collection, etc. to finish.
 

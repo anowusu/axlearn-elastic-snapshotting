@@ -54,6 +54,7 @@ from jax.ad_checkpoint import Offloadable, Recompute, Saveable
 from jax.experimental import mesh_utils, multihost_utils
 from jax.extend.core import Primitive
 from jax.sharding import PartitionSpec
+from pathwaysutils.elastic.manager import active_devices as live_devices
 
 from axlearn.common import serialization
 from axlearn.common.config import (
@@ -1797,7 +1798,7 @@ def create_device_mesh(
         NotImplementedError: If not all devices have the same platform.
     """
     if devices is None:
-        devices = jax.devices()
+        devices = live_devices()
     devices = np.asarray(devices)
 
     # Check if the devices are part of a multi-granule configuration.
@@ -1809,7 +1810,7 @@ def create_device_mesh(
         raise NotImplementedError(f"Not all devices had platform: {device_platform}.")
 
     num_granules = (
-        max(getattr(el, device_attr) for el in devices.flatten()) + 1 if is_multi_granule_env else 1
+        len({getattr(el, device_attr) for el in devices.flatten()}) if is_multi_granule_env else 1
     )
     num_devices = len(devices)
     assert num_devices % num_granules == 0, (
@@ -1908,7 +1909,7 @@ def infer_mesh_shape(mesh_shape: MeshShape, *, num_devices: Optional[int] = None
     # Handle the case with one -1.
     prod = math.prod(mesh_shape, start=-1)
     if num_devices is None:
-        num_devices = len(jax.devices())
+        num_devices = len(live_devices())
     if num_devices % prod != 0:
         raise ValueError(
             f"Unable to infer -1 in mesh shape {mesh_shape} as num_devices {num_devices} "

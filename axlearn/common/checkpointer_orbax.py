@@ -17,9 +17,11 @@ import copy
 import dataclasses
 import functools
 import os
+import threading
 from concurrent import futures
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from tempfile import TemporaryDirectory
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import jax
 import numpy as np
@@ -44,6 +46,7 @@ from axlearn.common.checkpointer import (
     maybe_save_python_savables,
 )
 from axlearn.common.config import InstantiableConfig, config_class, maybe_instantiate
+from axlearn.common.elastic_input import ElasticDatasetIterator
 from axlearn.common.module import Module
 from axlearn.common.utils import Nested, Tensor, TensorSpec
 
@@ -85,12 +88,6 @@ class _TfIteratorHandler(ocp.type_handlers.TypeHandler):
     def typestr(self) -> str:
         return "TfIterator"
 
-    def _ckpt_dir(self, info: ocp.type_handlers.ParamInfo) -> str:
-        # Each worker writes its tf checkpoints under a different path.
-        return os.path.join(
-            os.path.dirname(info.parent_dir), "tfds", f"tf_{jax.process_index()}", info.name
-        )
-
     def _get_or_create_tf_ckpt(self, value: tf.data.Iterator) -> tf.train.Checkpoint:
         # This is to avoid recreating `tf.train.Checkpoint` instances on each
         # checkpointing. When `enable_async` is `True` the resources will only
@@ -113,6 +110,35 @@ class _TfIteratorHandler(ocp.type_handlers.TypeHandler):
         # pytype: enable=attribute-error
         # pylint: enable=protected-access
 
+    def _tasks(self, items, infos, *, save: bool) -> List[Callable[[], Any]]:
+        tasks = []
+        for value, info in zip(items, infos, strict=False):
+            entries = [(value, jax.process_index())]
+            if isinstance(value, ElasticDatasetIterator):
+                entries = [(value.primary_iterator, jax.process_index())]
+                if value.elastic_iterator is not None:
+                    pids = value.elastic_process_ids if save else value.elastic_process_ids[:1]
+                    if not save or value.is_primary_for_checkpoint:
+                        entries.extend((value.elastic_iterator, pid) for pid in pids)
+            base = os.path.dirname(info.parent_dir)
+            for iterator, pid in entries:
+                if isinstance(iterator, tf.data.Iterator):
+                    ckpt = self._get_or_create_tf_ckpt(iterator)
+                    (ckpt.write if save else ckpt.read)(
+                        os.path.join(base, "tfds", f"tf_{pid}", info.name),
+                        tf.train.CheckpointOptions(enable_async=True),
+                    )
+                    tasks.append(functools.partial(self._sync_tf_ckpt_and_check_error, ckpt))
+                elif isinstance(iterator, PythonSavable) or (
+                    _GRAIN_INSTALLED and isinstance(iterator, _GrainIterator)
+                ):
+                    io_fn = maybe_save_python_savables if save else maybe_restore_python_savables
+                    path = os.path.join(base, "python", f"python_{pid}")
+                    tasks.append(functools.partial(io_fn, {info.name: iterator}, dir=path))
+                else:
+                    raise NotImplementedError(f"Unsupported dataset iterator: {type(iterator)}")
+        return tasks
+
     async def serialize(
         self,
         values: Sequence[tf.data.Iterator],
@@ -121,16 +147,7 @@ class _TfIteratorHandler(ocp.type_handlers.TypeHandler):
     ) -> List[futures.Future]:
         """Serializes `values` into corresponding `info.path`s."""
         del args  # Unused.
-        futs = []
-        for value, info in zip(values, infos, strict=False):
-            tf_ckpt = self._get_or_create_tf_ckpt(value)
-            tf_ckpt.write(self._ckpt_dir(info), tf.train.CheckpointOptions(enable_async=True))
-            futs.append(
-                self._executor.submit(
-                    functools.partial(self._sync_tf_ckpt_and_check_error, tf_ckpt)
-                )
-            )
-        return futs
+        return [self._executor.submit(task) for task in self._tasks(values, infos, save=True)]
 
     async def deserialize(
         self,
@@ -139,22 +156,9 @@ class _TfIteratorHandler(ocp.type_handlers.TypeHandler):
     ) -> Sequence[tf.data.Iterator]:
         if args is None:
             raise ValueError(f"{self.RestoreArgs.__name__} should be supplied as args.")
-
-        tf_ckpts = []
-        for arg, info in zip(args, infos, strict=False):
-            tf_ckpt = self._get_or_create_tf_ckpt(arg.item)
-            tf_ckpt.read(self._ckpt_dir(info), tf.train.CheckpointOptions(enable_async=True))
-            tf_ckpts.append(tf_ckpt)
-
-        await asyncio.gather(
-            *(
-                asyncio.get_event_loop().run_in_executor(
-                    self._executor, functools.partial(self._sync_tf_ckpt_and_check_error, ckpt)
-                )
-                for ckpt in tf_ckpts
-            )
-        )
-
+        loop = asyncio.get_event_loop()
+        tasks = self._tasks([arg.item for arg in args], infos, save=False)
+        await asyncio.gather(*(loop.run_in_executor(self._executor, task) for task in tasks))
         return [arg.item for arg in args]
 
     async def metadata(
@@ -163,7 +167,15 @@ class _TfIteratorHandler(ocp.type_handlers.TypeHandler):
         return [ocp.metadata.Metadata(name=info.name, directory=info.path) for info in infos]
 
 
+class _ElasticDatasetIteratorHandler(_TfIteratorHandler):
+    def typestr(self) -> str:
+        return "ElasticDatasetIterator"
+
+
 ocp.type_handlers.register_type_handler(tf.data.Iterator, _TfIteratorHandler(), override=True)
+ocp.type_handlers.register_type_handler(
+    ElasticDatasetIterator, _ElasticDatasetIteratorHandler(), override=True
+)
 ocp.type_handlers.register_type_handler(
     jax.Array,
     ArrayHandler(
@@ -257,7 +269,7 @@ if _GRAIN_INSTALLED:
 
 def _iterator_restore_arg(x: Any) -> Optional[ocp.RestoreArgs]:
     """Returns the Orbax `RestoreArgs` for dataset iterator leaves, or None."""
-    if isinstance(x, tf.data.Iterator):
+    if isinstance(x, (tf.data.Iterator, ElasticDatasetIterator)):
         return _TfIteratorHandler.RestoreArgs(item=x)
     if _GRAIN_INSTALLED and isinstance(x, _GrainIterator):
         return _GrainDatasetIteratorHandler.RestoreArgs(item=x)
@@ -283,6 +295,13 @@ def _install_orbax_jax_compat_patches() -> None:
 
 
 _install_orbax_jax_compat_patches()
+
+
+def _handle_cancelled_sidecar(err: jax.errors.JaxRuntimeError, on_cancelled: Callable[[], Any]):
+    if "SidecarSession is cancelled" not in str(err):
+        raise err
+    logging.warning("Cancelled interrupted async checkpoint save: %s", err)
+    on_cancelled()
 
 
 class _CheckpointManagerWithTrackerFile(ocp.CheckpointManager):
@@ -391,6 +410,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
         async_timeout_secs: int = 600
         max_concurrent_save_gb: Optional[int] = None
         max_concurrent_restore_gb: Optional[int] = None
+        save_device_host_concurrent_gb: Optional[int] = None
         # An AXLearn training job may use multiple TPU slices. When restoring, by default, all
         # slices read the checkpoint from GCS. If True, only the first replica loads from GCS and
         # broadcasts to other slices via the training cluster network.
@@ -405,7 +425,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
         read_latest_checkpoint_from_tracker_file: bool = False
         # Optional Orbax Pathways Snapshotter config for host-RAM snapshots.
         snapshotter: Optional[InstantiableConfig[Any]] = None
-        snapshot_every_n_steps: int = 5
+        snapshot_every_n_steps: int = 1
 
     @classmethod
     def checkpoint_paths(cls, base_dir: str) -> List[str]:
@@ -422,6 +442,8 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
         cfg: OrbaxCheckpointer.Config = self.config
         save_policy = cfg.save_policy.instantiate()
+        self._elastic_drain: Optional[threading.Thread] = None
+        self._pending_drains: list[threading.Thread] = []
 
         if cfg.enable_single_replica_ckpt_restoring:
             array_handler = ocp.type_handlers.SingleReplicaArrayHandler(
@@ -470,35 +492,60 @@ class OrbaxCheckpointer(BaseCheckpointer):
             return is_save
 
         self._save_fn_with_summaries = save_fn_with_summaries
+        self._iter_handler = ocp.PyTreeCheckpointHandler(use_ocdbt=False)
         self.snapshotter = maybe_instantiate(cfg.snapshotter)
         self._create_manager()
 
+    @staticmethod
+    def _merge_iterators(state: Nested[Any], target: Nested[Any]) -> Nested[Any]:
+        return jax.tree.map(
+            lambda kept, live: live if _iterator_restore_arg(live) else kept, state, target
+        )
+
     def _snapshot_iterators(self, state: Nested[Any]) -> Nested[Any]:
-        # pylint: disable-next=protected-access
-        return jax.tree.map(lambda x: x._save().numpy() if _iterator_restore_arg(x) else x, state)
+        """Saves dataset iterators via `PyTreeCheckpointHandler` into a `/dev/shm` temp dir."""
+        iters = {k: v for k, v in utils.flatten_items(state) if _iterator_restore_arg(v)}
+        if not iters:
+            return state
+        tmp = TemporaryDirectory(dir="/dev/shm" if os.path.isdir("/dev/shm") else None)
+        step_dir = epath.Path(tmp.name) / "s"
+        step_dir.mkdir()
+        self._iter_handler.save(step_dir, args=ocp.args.PyTreeSave(item=iters))
+        return jax.tree.map(lambda x: tmp if _iterator_restore_arg(x) else x, state)
 
     def _restore_snapshot_iterators(self, snap: Nested[Any], target: Nested[Any]) -> Nested[Any]:
-        for saved, live in zip(jax.tree.leaves(snap), jax.tree.leaves(target)):
-            if _iterator_restore_arg(live):
-                live._restore(saved)  # pylint: disable=protected-access
-        return jax.tree.map(
-            lambda kept, live: live if _iterator_restore_arg(live) else kept, snap, target
-        )
+        """Restores dataset iterators in `target` from a snapshot's `/dev/shm` temp dir."""
+        iters = {k: v for k, v in utils.flatten_items(target) if _iterator_restore_arg(v)}
+        tmp = next((x for x in jax.tree.leaves(snap) if isinstance(x, TemporaryDirectory)), None)
+        if iters and tmp is not None:
+            self._iter_handler.restore(
+                epath.Path(tmp.name) / "s",
+                args=ocp.args.PyTreeRestore(
+                    item=iters, restore_args=jax.tree.map(_iterator_restore_arg, iters)
+                ),
+            )
+        return self._merge_iterators(snap, target)
 
     def _create_manager(self):
         cfg: OrbaxCheckpointer.Config = self.config
-        if pathwaysutils.is_pathways_backend_used():
-            orbax_pathways.register_type_handlers(
+        is_proxy = bool(pathwaysutils.is_pathways_backend_used())
+        if is_proxy:
+            kwargs = dict(
+                use_single_replica_array_handler=cfg.enable_single_replica_ckpt_restoring,
                 checkpointing_impl=orbax_pathways.CheckpointingImpl.COLOCATED_PYTHON,
                 primary_host=None,
                 array_metadata_store=None,
                 enable_write_sharding_file=False,
             )
+            if cfg.enable_single_replica_ckpt_restoring:
+                kwargs.update(replica_axis_index=cfg.replica_axis_index, primary_replica_id=0)
+            orbax_pathways.register_type_handlers(**kwargs)
         CheckpointManager = (  # pylint: disable=invalid-name
             _CheckpointManagerWithTrackerFile
             if cfg.read_latest_checkpoint_from_tracker_file
             else ocp.CheckpointManager
         )
+        host_gb = None if is_proxy else cfg.save_device_host_concurrent_gb
         self._manager = CheckpointManager(
             directory=cfg.dir,
             options=ocp.CheckpointManagerOptions(
@@ -529,9 +576,28 @@ class OrbaxCheckpointer(BaseCheckpointer):
                 "state": ocp.PyTreeCheckpointHandler(
                     save_concurrent_gb=cfg.max_concurrent_save_gb,
                     restore_concurrent_gb=cfg.max_concurrent_restore_gb,
+                    save_device_host_concurrent_gb=host_gb,
+                    is_prioritized_key_fn=(lambda _: False) if self.snapshotter else None,
                 ),
             },
         )
+
+    @staticmethod
+    def _cancel_manager(manager: ocp.CheckpointManager):
+        with contextlib.suppress(Exception):
+            manager.cancel()
+        with contextlib.suppress(Exception):
+            manager.close()
+
+    def on_elastic_event(self):
+        """Cancels pending snapshots and starts draining async saves in the background."""
+        if self.snapshotter is not None:
+            self.snapshotter.cancel_pending(timeout=0.0)
+        if self._elastic_drain is None:
+            self._elastic_drain = threading.Thread(
+                target=self._cancel_manager, args=(self._manager,), daemon=True
+            )
+            self._elastic_drain.start()
 
     def _blocking_snapshot(self, step: int, state: Nested[Any]) -> None:
         """Takes a blocking host-RAM snapshot if `step` is not already snapshotted."""
@@ -539,15 +605,42 @@ class OrbaxCheckpointer(BaseCheckpointer):
         if getattr(self.snapshotter.latest, "step", None) != step:
             self.snapshotter.save(step, self._snapshot_iterators(state), wait=True)
 
+    def _drain_pending(self):
+        for thread in self._pending_drains:
+            thread.join(timeout=self.config.async_timeout_secs)
+        self._pending_drains = [t for t in self._pending_drains if t.is_alive()]
+
+    def reset_after_elastic_event(self, *, devices_changed: bool = False):
+        """Re-creates the underlying Orbax CheckpointManager after an elastic event."""
+        if self.snapshotter is not None:
+            self.snapshotter.cancel_pending(timeout=0.0 if devices_changed else 5.0)
+        if self._elastic_drain is None:
+            self.on_elastic_event()
+        if not devices_changed:
+            self._elastic_drain.join(timeout=self.config.async_timeout_secs)
+        if self._elastic_drain.is_alive():
+            self._pending_drains.append(self._elastic_drain)
+        self._elastic_drain = None
+        self._eval_summaries = None
+        self._create_manager()
+
+    def flush_for_scale_up(self, *, step: int, state: Nested[Tensor]) -> bool:
+        """Ensures `state` at `step` is snapshotted before voluntary scale-up."""
+        if self._manager.is_saving_in_progress():
+            return False
+        if self.snapshotter is not None:
+            self._blocking_snapshot(step, state)
+        return True
+
     def _get_spec(self, *, step: int, state: Nested[Any]) -> Nested[Any]:
         spec = {"index": [("step", step)]}
         for path, value in utils.flatten_items(state):
-            if isinstance(value, (Tensor, TensorSpec)):
+            if isinstance(value, (Tensor, TensorSpec, jax.ShapeDtypeStruct)):
                 dtype = getattr(value.dtype, "dtype", value.dtype)
                 spec["index"].append(
                     (path, {"dtype": str(dtype), "shape": str(tuple(value.shape))})
                 )
-            elif isinstance(value, (tf.data.Iterator, PythonSavable)):
+            elif isinstance(value, (tf.data.Iterator, ElasticDatasetIterator, PythonSavable)):
                 spec["index"].append((path, str(type(value))))
             else:
                 spec["index"].append((path, value))
@@ -577,12 +670,28 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
         try:
             if self.snapshotter is not None:
-                latest = self.snapshotter.latest
-                every = self.config.snapshot_every_n_steps
-                if latest is None:
-                    self._blocking_snapshot(step, state)
-                elif every > 0 and step > 0 and step % every == 0 and latest.step != step:
-                    self.snapshotter.save(step, self._snapshot_iterators(state))
+                if not self._manager.should_save(step):
+                    latest = self.snapshotter.latest
+                    every = self.config.snapshot_every_n_steps
+                    if latest is None:
+                        self._blocking_snapshot(step, state)
+                    elif every > 0 and step > 0 and step % every == 0 and latest.step != step:
+                        self.snapshotter.save(step, self._snapshot_iterators(state))
+                    return
+
+                def _wait_prior():
+                    try:
+                        self._manager.wait_until_finished()
+                    except jax.errors.JaxRuntimeError as e:
+                        _handle_cancelled_sidecar(e, self._manager.reload)
+
+                state = self.snapshotter.save(
+                    step,
+                    self._snapshot_iterators(state),
+                    checkpointer_wait_fn=_wait_prior,
+                    checkpointer_save_fn=functools.partial(self._merge_iterators, target=state),
+                )
+            self._drain_pending()
             # Note that save() waits for prior serialization to finish.
             self._manager.save(
                 step=step,
@@ -602,10 +711,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
                 self._manager.wait_until_finished()
                 raise SystemExit(f"Exiting after saving checkpoint at {step=} due to pre-emption.")
         except jax.errors.JaxRuntimeError as e:
-            if "SidecarSession is cancelled" not in str(e):
-                raise
-            logging.warning("Cancelled interrupted async checkpoint save: %s", e)
-            self.cancel()
+            _handle_cancelled_sidecar(e, self.cancel)
         finally:
             self._eval_summaries = None
 
@@ -627,7 +733,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
                 return snap_step, self._restore_snapshot_iterators(snap_state, state)
 
         def _restore_args(x: Any) -> ocp.RestoreArgs:
-            if isinstance(x, (Tensor, TensorSpec)):
+            if isinstance(x, (Tensor, TensorSpec, jax.ShapeDtypeStruct)):
                 arg = ocp.checkpoint_utils.construct_restore_args(
                     jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=x.sharding)
                 )
@@ -709,8 +815,20 @@ class OrbaxCheckpointer(BaseCheckpointer):
     def stop(self, *, has_exception: bool = False):
         """See `BaseCheckpointer.stop` for details."""
         if self.snapshotter is not None:
-            self.snapshotter.join()
-        self._manager.close()
+            if has_exception:
+                self.snapshotter.cancel_pending(timeout=0.0)
+            else:
+                self.snapshotter.join()
+        if has_exception:
+            with contextlib.suppress(Exception):
+                self._manager.cancel()
+        self._drain_pending()
+        try:
+            self._manager.close()
+        except Exception:  # pylint: disable=broad-exception-caught
+            if not has_exception:
+                raise
+            logging.warning("Checkpointer close failed after error.", exc_info=True)
 
 
 # Below are adapted from:
