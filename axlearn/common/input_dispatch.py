@@ -345,6 +345,7 @@ class SpmdInputDispatcher(BaseInputDispatcher):
         """
 
         partition_spec: Required[PartitionSpec] = REQUIRED
+        num_max_slices: Optional[int] = None
 
     def __init__(self, cfg: Config, *, parent: Optional[Module]):
         super().__init__(cfg, parent=parent)
@@ -374,11 +375,15 @@ class SpmdInputDispatcher(BaseInputDispatcher):
         num_partitions = math.prod(
             mesh.shape[axis] for axis in jax.tree.leaves(logical_sharding.spec[0])
         )
+        if cfg.num_max_slices:
+            slices = len({getattr(d, "slice_index", 0) for d in mesh.devices.flat}) or 1
+            num_partitions = num_partitions * cfg.num_max_slices // slices
         if cfg.global_logical_batch_size % num_partitions != 0:
             raise ValueError(
                 f"{cfg.partition_spec=} attempts to divide batch over {num_partitions=}, "
                 f"which is incompatible with {cfg.global_logical_batch_size=}."
             )
+        self._dev_batch_size = cfg.global_logical_batch_size // num_partitions
 
         # Infer the physical feeds and feed index along dim=0.
         feed_index, feed_count = get_process_index_and_count(
@@ -386,6 +391,19 @@ class SpmdInputDispatcher(BaseInputDispatcher):
         )
         self._num_logical_feeds = feed_count
         self._logical_feed_index = feed_index
+
+    def _live_partitions(self) -> int:
+        mesh = thread_resources.env.physical_mesh
+        return math.prod(mesh.shape[a] for a in jax.tree.leaves(self._partition_spec[0]))
+
+    @property
+    def device_batch_sizes(self) -> tuple[int, int]:
+        bs = self._config.global_logical_batch_size
+        return self._dev_batch_size, math.ceil(bs / self._live_partitions())
+
+    def _padding_size(self) -> int:
+        n = self._live_partitions() if self._config.num_max_slices else 0
+        return self.device_batch_sizes[1] * n - self._config.global_logical_batch_size if n else 0
 
     @property
     def num_logical_feeds(self) -> int:
@@ -408,6 +426,13 @@ class SpmdInputDispatcher(BaseInputDispatcher):
         return dict(num_shards=self._num_logical_feeds, shard_index=self._logical_feed_index)
 
     def logical_to_physical_batch(self, logical_feed_batch: Nested[Tensor]) -> Nested[Tensor]:
+        if (n := self._padding_size()) > 0:
+            return jax.tree.map_with_path(
+                lambda p, x: np.pad(x, [(0, n)] + [(0, 0)] * (x.ndim - 1), constant_values=-1)
+                if jax.tree_util.keystr(p, simple=True) == "target_labels"
+                else np.pad(x, [(0, n)] + [(0, 0)] * (x.ndim - 1), "edge"),
+                logical_feed_batch,
+            )
         return jax.tree.map(lambda x: x, logical_feed_batch)
 
     def physical_to_logical_batch(self, global_physical_batch: Nested[Tensor]) -> Nested[Tensor]:
@@ -417,5 +442,6 @@ class SpmdInputDispatcher(BaseInputDispatcher):
         self, logical_feed_shapes: Nested[jax.ShapeDtypeStruct]
     ) -> Nested[jax.ShapeDtypeStruct]:
         _validate_logical_feed_shapes(logical_feed_shapes)
-        # Ensure that we always return ShapeDtypeStructs.
-        return jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), logical_feed_shapes)
+        n = self._padding_size()
+        return jax.tree.map(lambda x: jax.ShapeDtypeStruct((x.shape[0] + n, *x.shape[1:]), x.dtype),
+                            logical_feed_shapes)
