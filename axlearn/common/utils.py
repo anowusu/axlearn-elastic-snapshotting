@@ -1809,7 +1809,7 @@ def create_device_mesh(
         raise NotImplementedError(f"Not all devices had platform: {device_platform}.")
 
     num_granules = (
-        max(getattr(el, device_attr) for el in devices.flatten()) + 1 if is_multi_granule_env else 1
+        len({getattr(el, device_attr) for el in devices.flatten()}) if is_multi_granule_env else 1
     )
     num_devices = len(devices)
     assert num_devices % num_granules == 0, (

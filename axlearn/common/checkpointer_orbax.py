@@ -17,11 +17,13 @@ import copy
 import dataclasses
 import functools
 import os
+import threading
 from concurrent import futures
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import jax
+import msgpack
 import numpy as np
 import orbax.checkpoint as ocp
 import tensorflow as tf
@@ -475,12 +477,14 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
     def _snapshot_iterators(self, state: Nested[Any]) -> Nested[Any]:
         # pylint: disable-next=protected-access
-        return jax.tree.map(lambda x: x._save().numpy() if _iterator_restore_arg(x) else x, state)
+        return jax.tree.map(lambda v: (msgpack.packb(v.get_state()) if hasattr(v, "get_state")
+                            else v._save().numpy()) if _iterator_restore_arg(v) else v, state)
 
     def _restore_snapshot_iterators(self, snap: Nested[Any], target: Nested[Any]) -> Nested[Any]:
-        for saved, live in zip(jax.tree.leaves(snap), jax.tree.leaves(target)):
-            if _iterator_restore_arg(live):
-                live._restore(saved)  # pylint: disable=protected-access
+        for s, it in zip(jax.tree.leaves(snap), jax.tree.leaves(target)):
+            if _iterator_restore_arg(it):
+                # pylint: disable-next=protected-access
+                it.set_state(msgpack.unpackb(s)) if hasattr(it, "set_state") else it._restore(s)
         return jax.tree.map(
             lambda kept, live: live if _iterator_restore_arg(live) else kept, snap, target
         )
@@ -539,6 +543,13 @@ class OrbaxCheckpointer(BaseCheckpointer):
         if getattr(self.snapshotter.latest, "step", None) != step:
             self.snapshotter.save(step, self._snapshot_iterators(state), wait=True)
 
+    def flush_for_scale_up(self, *, step: int, state: Nested[Tensor]) -> bool:
+        if self._manager.is_saving_in_progress():
+            return False
+        if self.snapshotter is not None:
+            self._blocking_snapshot(step, state)
+        return True
+
     def _get_spec(self, *, step: int, state: Nested[Any]) -> Nested[Any]:
         spec = {"index": [("step", step)]}
         for path, value in utils.flatten_items(state):
@@ -576,13 +587,22 @@ class OrbaxCheckpointer(BaseCheckpointer):
         self._eval_summaries = copy.deepcopy(evaler_summaries or {})
 
         try:
-            if self.snapshotter is not None:
+            if self.snapshotter is not None and self._manager.should_save(step):
+                state = self.snapshotter.save(
+                    step, self._snapshot_iterators(state),
+                    checkpointer_wait_fn=self._manager.wait_until_finished,
+                    checkpointer_save_fn=lambda s: jax.tree.map(
+                        lambda k, v: v if _iterator_restore_arg(v) else k, s, state
+                    ),
+                )
+            elif self.snapshotter is not None:
                 latest = self.snapshotter.latest
                 every = self.config.snapshot_every_n_steps
                 if latest is None:
                     self._blocking_snapshot(step, state)
                 elif every > 0 and step > 0 and step % every == 0 and latest.step != step:
                     self.snapshotter.save(step, self._snapshot_iterators(state))
+                return
             # Note that save() waits for prior serialization to finish.
             self._manager.save(
                 step=step,
@@ -696,21 +716,27 @@ class OrbaxCheckpointer(BaseCheckpointer):
         """See `BaseCheckpointer.wait_until_finished` docstring for details."""
         self._manager.wait_until_finished()
 
-    def cancel(self):
+    def _close_manager(self, mgr: ocp.CheckpointManager):
+        for fn in (mgr.cancel, mgr.close):
+            with contextlib.suppress(Exception):
+                fn()
+
+    def cancel(self, *, wait: bool = True):
         """Cancels pending snapshots/saves and recreates the checkpoint manager."""
         if self.snapshotter is not None:
-            self.snapshotter.cancel_pending(timeout=0.0)
-        with contextlib.suppress(Exception):
-            self._manager.cancel()
-        with contextlib.suppress(Exception):
-            self._manager.close()
+            self.snapshotter.cancel_pending(timeout=5.0 if wait else 0.0)
+        t = threading.Thread(target=self._close_manager, args=(self._manager,), daemon=True)
+        t.start()
+        if wait:
+            t.join(timeout=self.config.async_timeout_secs)
+        self._eval_summaries = None
         self._create_manager()
 
     def stop(self, *, has_exception: bool = False):
         """See `BaseCheckpointer.stop` for details."""
         if self.snapshotter is not None:
-            self.snapshotter.join()
-        self._manager.close()
+            self.snapshotter.cancel_pending(0.0) if has_exception else self.snapshotter.join()
+        self._close_manager(self._manager) if has_exception else self._manager.close()
 
 
 # Below are adapted from:

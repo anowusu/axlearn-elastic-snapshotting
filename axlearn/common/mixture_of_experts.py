@@ -16,6 +16,7 @@ Reference: https://arxiv.org/abs/2405.15052.
 
 import contextlib
 import enum
+import math
 import re
 from functools import partial, reduce
 from typing import Any, Callable, NamedTuple, Optional, Sequence, Tuple, Union
@@ -1396,7 +1397,7 @@ class TransformerFeedForwardMoE(DenseGeneralBaseLayer):
         # If greater than 1, we reshape all tensors from (batch, seq_len, dim) to
         # (outer_batch, inner_batch, seq_len, dim). This is useful for 3D mesh. Reference:
         # https://github.com/tensorflow/mesh/blob/fbf7b1e547e8b8cb134e81e1cd350c312c0b5a16/mesh_tensorflow/transformer/moe.py#L294-L336
-        outer_batch: int = 1
+        outer_batch: Optional[int] = 1
         # The normalization layer config.
         norm: BaseNormalizationLayer.Config = LayerNorm.default_config()
         activation: Union[str, tuple[str, str]] = "nn.relu"
@@ -1624,6 +1625,10 @@ class TransformerFeedForwardMoE(DenseGeneralBaseLayer):
         input_dtype = x.dtype
         cfg = self.config
         outer_batch = cfg.outer_batch
+        if outer_batch is None:
+            mesh = get_current_abstract_or_physical_mesh()
+            axes = jax.tree.leaves((cfg.dim_to_mesh_axis_map.get("ogsm") or (None,))[0])
+            outer_batch = 1 if mesh.empty else math.prod(mesh.shape.get(a, 1) for a in axes)
         if x.shape[0] % outer_batch != 0:
             raise ValueError(
                 f"batch_size {x.shape[0]} has to be divisible by outer_batch {outer_batch}."
