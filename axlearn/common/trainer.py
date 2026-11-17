@@ -3,13 +3,14 @@
 """Defines SpmdTrainer, a trainer that supports partitioning of computation and data with GSPMD."""
 
 import contextlib
+import datetime
 import itertools
 import math
 import os.path
 import signal
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Any, Callable, ContextManager, Literal, NamedTuple, Optional, Union
 
 import jax
@@ -272,6 +273,8 @@ class SpmdTrainer(Module):
         self._device_monitor = maybe_instantiate(cfg.device_monitor)
         self._recorder = maybe_instantiate(cfg.recorder)
         self._is_initialized: bool = False
+        self._scale_up_requested: bool = False
+        self._elastic_wait_event_type: Optional[str] = None
         self._maybe_record_event(measurement.Event.START_ACCELERATOR_INIT)
 
         if cfg.model.dtype is None:
@@ -312,6 +315,7 @@ class SpmdTrainer(Module):
         self._step_log("Global mesh: %s", mesh)
         self._mesh = mesh
         if mgr is not None:
+            elastic_utils.elastic_manager = mgr
             jax.config.update("jax_default_device", mgr.default_device)
             self._step_log("[ELASTIC][SCALE] devices=%s", mesh.size)
         self._context_manager: Callable[[], ContextManager] = (
@@ -343,7 +347,7 @@ class SpmdTrainer(Module):
                 "input", maybe_set_config(cfg.input, is_training=True)
             )
             # Start from the beginning of the input dataset by default.
-            self._input_iter = iter(self.input.dataset())
+            self._input_iter = self._create_input_iterator()
             cfg.summary_writer.dir = cfg.summary_writer.dir or os.path.join(
                 cfg.dir, "summaries", "train_train"
             )
@@ -391,6 +395,7 @@ class SpmdTrainer(Module):
                     model_param_partition_specs=model_param_partition_specs,
                 )
         self._maybe_record_event(measurement.Event.END_ACCELERATOR_INIT)
+        self._record_slice_counts()
 
     @property
     def step(self):
@@ -435,6 +440,46 @@ class SpmdTrainer(Module):
 
     def mesh(self):
         return jax.sharding.Mesh(self._mesh.devices, self._mesh.axis_names)
+
+    def _record_slice_counts(self, *, stepping: bool = True):
+        """Records active, total, and available slice counts for goodput monitoring."""
+        mgr = self._elastic_manager
+        if mgr is None:
+            return
+        active_slices = mgr.active_slice_count if stepping else 0
+        available_slices = None if stepping else elastic_utils.available_slice_count()
+        self._maybe_record_event(
+            measurement.Event.RECORD_SLICE_COUNTS,
+            active_slices=active_slices,
+            total_slices=mgr.total_slice_count,
+            available_slices=(
+                mgr.active_slice_count if available_slices is None else available_slices
+            ),
+        )
+
+    def _on_elastic_event(self):
+        self._trainer_state = None
+        self._elastic_wait_event_type = (
+            "elastic_scale_up" if self._scale_up_requested else "elastic_slice_down"
+        )
+        self._scale_up_requested = False
+        self._maybe_record_event(
+            measurement.Event.START_ELASTIC_WAIT, self._elastic_wait_event_type
+        )
+        self._record_slice_counts(stepping=False)
+
+    def _create_input_iterator(self) -> Iterator:
+        self._maybe_record_event(
+            measurement.Event.START_CUSTOM_BADPUT_EVENT,
+            custom_badput_event_type="DATA_ITERATOR_INIT",
+        )
+        try:
+            return iter(self.input.dataset())
+        finally:
+            self._maybe_record_event(
+                measurement.Event.END_CUSTOM_BADPUT_EVENT,
+                custom_badput_event_type="DATA_ITERATOR_INIT",
+            )
 
     @contextlib.contextmanager
     def _watchdog(self):
@@ -958,6 +1003,7 @@ class SpmdTrainer(Module):
 
         if self.step >= cfg.max_step:
             self._step_log("Already reached max_step=%s. Stopping", cfg.max_step)
+            self._maybe_record_event(measurement.Event.END_TRAINING_PREPARATION)
             return False
 
         self._jit_train_step = self._pjit_train_step()
@@ -985,16 +1031,15 @@ class SpmdTrainer(Module):
             for path, spec in utils.flatten_items(self._trainer_state_specs):
                 self.vlog(1, "restore spec: %s=%s", path, spec)
             ckpt_state_spec = self._trainer_state_specs._asdict()
-            ckpt_state_spec_with_input_iter = dict(
-                **ckpt_state_spec, input_iter=iter(self.input.dataset())
-            )
             restore_input_iter = cfg.save_input_iterator
             try:
                 # Try to restore with `input_iter`.
                 step, ckpt_state = self.checkpointer.restore(
                     step=restore_step,
                     state=(
-                        ckpt_state_spec_with_input_iter if restore_input_iter else ckpt_state_spec
+                        dict(**ckpt_state_spec, input_iter=self._create_input_iterator())
+                        if restore_input_iter
+                        else ckpt_state_spec
                     ),
                 )
                 if step is not None:
@@ -1021,7 +1066,9 @@ class SpmdTrainer(Module):
                 step, ckpt_state = self.checkpointer.restore(
                     step=restore_step,
                     state=(
-                        ckpt_state_spec_with_input_iter if restore_input_iter else ckpt_state_spec
+                        dict(**ckpt_state_spec, input_iter=self._create_input_iterator())
+                        if restore_input_iter
+                        else ckpt_state_spec
                     ),
                 )
                 if step is not None:
@@ -1057,6 +1104,7 @@ class SpmdTrainer(Module):
                 and (not flush or flush(step=self.step, state=ckpt_state))
             ):
                 self._step_log("[ELASTIC] New slice ready at step=%s; scaling up", self.step)
+                self._scale_up_requested = True
                 raise elastic_manager.ScaleUpSignalError(f"Scale-up at step {self.step}")
 
     def _restore_from_builder(self) -> Optional[TrainerStateBuilder.State]:
@@ -1213,9 +1261,7 @@ class SpmdTrainer(Module):
         force_runs: Optional[set[str]] = None,
     ) -> dict[str, Any]:
         """Runs evaluations and returns the corresponding summaries."""
-        self._maybe_record_event(
-            measurement.Event.START_CUSTOM_BADPUT_EVENT, custom_badput_event_type="EVAL"
-        )
+        eval_start_time = datetime.datetime.now(datetime.timezone.utc)
         evaler_summaries = {}
         # Note: we will use the same eval key as the training keys of the future step,
         # which should be okay.
@@ -1229,9 +1275,15 @@ class SpmdTrainer(Module):
                 force_run=bool(force_runs is not None and evaler_name in force_runs),
             )
             evaler_summaries[evaler_name] = summaries
-        self._maybe_record_event(
-            measurement.Event.END_CUSTOM_BADPUT_EVENT, custom_badput_event_type="EVAL"
-        )
+        if any(summaries is not None for summaries in evaler_summaries.values()):
+            self._maybe_record_event(
+                measurement.Event.START_CUSTOM_BADPUT_EVENT,
+                custom_badput_event_type="EVAL",
+                start_time=eval_start_time,
+            )
+            self._maybe_record_event(
+                measurement.Event.END_CUSTOM_BADPUT_EVENT, custom_badput_event_type="EVAL"
+            )
         return evaler_summaries
 
     def _pjit_train_step(self) -> jax.stages.Wrapped:

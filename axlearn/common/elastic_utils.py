@@ -1,17 +1,43 @@
 # Copyright © 2025 Apple Inc.
-"""Elastic training utilities for the Pathways backend."""
+"""Elastic training utilities for the Pathways backend (no-ops on McJAX)."""
 # pylint: disable=protected-access
 
 from collections.abc import Sequence
 import itertools
-from typing import Any
+from typing import Any, Optional
 
-from absl import flags
+from absl import flags, logging
 import jax
+from pathwaysutils.elastic import elastic, manager
 
 from axlearn.common import gradient_accumulation as ga
-from axlearn.common import utils
+from axlearn.common import measurement, utils
 from axlearn.common.config import config_for_class
+
+# Optional explicit manager reference; falls back to `manager.get_default_manager()` when unset.
+elastic_manager: Optional[manager.Manager] = None
+
+
+def get_manager() -> Any:
+    if elastic_manager is not None:
+        return elastic_manager
+    return getattr(manager, "get_default_manager", lambda: None)()
+
+
+def elastic_enabled() -> bool:
+    return get_manager() is not None
+
+
+def available_slice_count() -> Optional[int]:
+    """Returns the number of healthy slices, or None when not elastic or if the check fails."""
+    mgr = get_manager()
+    if mgr is None:
+        return None
+    try:
+        return len(elastic.get_active_slice_indices(slice_to_devices=mgr.slice_to_devices))
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logging.warning("Failed to check the available slices: %s", e)
+        return None
 
 
 def configure_trainer(cfg: Any, fv: flags.FlagValues) -> None:
@@ -74,12 +100,31 @@ def restore_after_event(trainer: Any) -> None:
     changed = {d.id for d in live} != {d.id for d in trainer._mesh.devices.flat}
     if trainer._trainer_state is not None and not changed:
         return
-    n = reconfigure_mesh(trainer, live) if changed else None
-    sfx = f"minibatch_steps={n}" if changed else "unchanged; reusing mesh."
-    trainer._step_log("[ELASTIC][SCALE] devices=%s %s", len(live), sfx)
-    trainer.checkpointer.cancel(wait=not changed)
-    if trainer.restore_checkpoint() is None:
-        raise RuntimeError("Failed to restore from both snapshot and checkpoint.")
+    if trainer._elastic_wait_event_type is not None:
+        trainer._maybe_record_event(
+            measurement.Event.END_ELASTIC_WAIT, trainer._elastic_wait_event_type
+        )
+        trainer._elastic_wait_event_type = None
+    trainer._maybe_record_event(measurement.Event.START_ELASTIC_REINIT)
+    try:
+        trainer._record_slice_counts(stepping=False)
+        trainer._maybe_record_event(measurement.Event.START_ACCELERATOR_INIT)
+        try:
+            n = reconfigure_mesh(trainer, live) if changed else None
+            sfx = f"minibatch_steps={n}" if changed else "unchanged; reusing mesh."
+            trainer._step_log("[ELASTIC][SCALE] devices=%s %s", len(live), sfx)
+        finally:
+            trainer._maybe_record_event(measurement.Event.END_ACCELERATOR_INIT)
+        trainer._maybe_record_event(measurement.Event.START_TRAINING_PREPARATION)
+        try:
+            trainer.checkpointer.cancel(wait=not changed)
+            if trainer.restore_checkpoint() is None:
+                raise RuntimeError("Failed to restore from both snapshot and checkpoint.")
+        finally:
+            trainer._maybe_record_event(measurement.Event.END_TRAINING_PREPARATION)
+    finally:
+        trainer._maybe_record_event(measurement.Event.END_ELASTIC_REINIT)
+        trainer._record_slice_counts(stepping=True)
 
 
 def wrap_train_loop(trainer: Any, train_loop: Any) -> Any:
@@ -89,5 +134,5 @@ def wrap_train_loop(trainer: Any, train_loop: Any) -> Any:
     return trainer._elastic_manager.elastic_retry(
         minimum_slice_count=trainer._config.elastic_min_slice_count, poll_interval=5,
         pre_callback=lambda: restore_after_event(trainer),
-        on_elastic_event_callback=lambda: setattr(trainer, "_trainer_state", None),
+        on_elastic_event_callback=trainer._on_elastic_event,
     )(_in_mesh)
