@@ -3,7 +3,7 @@
 ARG TARGET=base
 ARG BASE_IMAGE=ubuntu:24.04
 ARG BASE_IMAGE_COLOCATED=us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/anowusu/colocated_sidecar_cancel_fix:jax0.8.3
-ARG ORBAX_CHECKPOINT_GIT="orbax-checkpoint @ https://github.com/anowusu/axlearn-elastic-snapshotting/archive/refs/tags/orbax-v0.12.10-snapshotter1.tar.gz#subdirectory=checkpoint"
+ARG ORBAX_CHECKPOINT_GIT="orbax-checkpoint @ https://github.com/anowusu/axlearn-elastic-snapshotting/archive/refs/tags/orbax-v0.12.10-snapshotter3.tar.gz#subdirectory=checkpoint"
 ARG PATHWAYSUTILS_GIT="pathwaysutils @ https://github.com/anowusu/axlearn-elastic-snapshotting/archive/refs/tags/pathwaysutils-v0.1.14-elastic2.tar.gz"
 
 FROM ${BASE_IMAGE} AS base
