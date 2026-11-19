@@ -565,24 +565,28 @@ class SnapshotterTest(parameterized.TestCase):
 
   def test_load_preserves_slice_locality_and_stripes_donors(self):
     manager = snapshotter.Snapshotter()
-    with mock.patch.object(jax, 'device_put', wraps=jax.device_put) as mock_put:
+    with mock.patch.object(
+        jax, 'device_put', wraps=jax.device_put
+    ) as mock_device_put:
       manager.save(0, self.pytree)
       manager.join()
-    self.assertEqual(mock_put.call_count, 1)
+    self.assertEqual(mock_device_put.call_count, 1)
     assert manager._latest_snapshot is not None
     for leaf in jax.tree.leaves(manager._latest_snapshot[0][0]):
       leaf.delete()
-    with mock.patch.object(jax, 'device_put', wraps=jax.device_put) as mock_put:
+    with mock.patch.object(
+        jax, 'device_put', wraps=jax.device_put
+    ) as mock_device_put:
       restored = manager.load(self.abstract_pytree, reset_snapshot_state=False)
     test_utils.assert_tree_equal(self, self.pytree, restored)
-    local_call, fill_call = mock_put.call_args_list
-    for src, dst in zip(*local_call.args[:2]):
-      self.assertEqual(src.sharding.device_set, dst.device_set)
-    donors = {
-        next(iter(arr.sharding.device_set)).slice_index
-        for arr in fill_call.args[0]
+    local_call, fill_call = mock_device_put.call_args_list
+    for source, target in zip(*local_call.args[:2]):
+      self.assertEqual(source.sharding.device_set, target.device_set)
+    donor_slices = {
+        next(iter(array.sharding.device_set)).slice_index
+        for array in fill_call.args[0]
     }
-    self.assertEqual(donors, {1, 2, 3})
+    self.assertEqual(donor_slices, {1, 2, 3})
 
   def test_try_load_keeps_non_array_leaves_and_handles_errors(self):
     manager = snapshotter.Snapshotter()
