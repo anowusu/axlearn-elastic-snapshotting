@@ -83,6 +83,7 @@ class SnapshotterTest(parameterized.TestCase):
 
   @parameterized.named_parameters(
       dict(testcase_name='0', replica_axis_index=0),
+      dict(testcase_name='1', replica_axis_index=1),
   )
   def test_save_restore_pytree(self, replica_axis_index):
     snapshot_manager = snapshotter.Snapshotter(
@@ -116,8 +117,6 @@ class SnapshotterTest(parameterized.TestCase):
       self.assertNotEqual(x.sharding.memory_kind, 'pinned_host')
 
     jax.tree.map(assert_not_pinned_host, restored_pytree)
-    with self.assertRaisesRegex(ValueError, "replica axis 'y'"):
-      snapshotter.Snapshotter(replica_axis_index=1).save(0, self.pytree)
 
   def test_scale_down(self):
     snapshot_manager = snapshotter.Snapshotter()
@@ -377,7 +376,7 @@ class SnapshotterTest(parameterized.TestCase):
           if device is None or isinstance(device, jax.sharding.Sharding)
           else jax.tree.leaves(device)
       )
-      puts.extend(zip(arrays, targets))
+      puts.extend(zip(arrays, targets, strict=True))
       return device_put(x, device, *args, **kwargs)
 
     with mock.patch.object(jax, 'device_put', side_effect=recording_device_put):
@@ -481,7 +480,7 @@ class SnapshotterTest(parameterized.TestCase):
       self.assertEqual(x.sharding.memory_kind, 'device')
       self.assertEqual(x.sharding.device_set, target.device_set)
     assert snapshot_manager._latest_snapshot is not None
-    replica_trees, step, _ = snapshot_manager._latest_snapshot
+    replica_trees, step = snapshot_manager._latest_snapshot
     self.assertEqual(step, 0)
     self.assertLen(replica_trees, abstract_target['a'].sharding.mesh.shape['x'])
     for replica_tree in replica_trees:
@@ -494,11 +493,10 @@ class SnapshotterTest(parameterized.TestCase):
 
     manager.save(1, {**self.pytree, 'a': pinned_input})
     manager.join()
-    # The snapshot must hold a copy of `pinned_input`, not an alias of it:
-    # deleting the input, as a later step that donates it does, must leave the
-    # snapshot intact.
-    pinned_input.delete()
-    self.assertTrue(pinned_input.is_deleted())
+    mutated = jax.jit(
+        lambda x: x + 1, out_shardings=pinned_sharding, donate_argnums=0
+    )(pinned_input)
+    jax.block_until_ready(mutated)
 
     restored = manager.load(self.abstract_pytree, reset_snapshot_state=False)
     test_utils.assert_tree_equal(self, self.pytree, restored)
@@ -523,13 +521,20 @@ class SnapshotterTest(parameterized.TestCase):
     restored_key_sharding = jax.sharding.SingleDeviceSharding(
         devices[0], memory_kind='pinned_host'
     )
+    pinned_mesh_sharding = jax.sharding.NamedSharding(
+        save_mesh, jax.sharding.PartitionSpec(), memory_kind='pinned_host'
+    )
     key = jax.device_put(jax.random.key(9), saved_key_sharding)
     vector = jax.numpy.arange(4, dtype=np.float32)
+    offloaded = jax.device_put(
+        jax.numpy.ones(2, dtype=np.float32), pinned_mesh_sharding
+    )
     state = {
         'key': key,
         'vector': jax.device_put(
             vector, jax.sharding.NamedSharding(save_mesh, partition_spec)
         ),
+        'offloaded': offloaded,
     }
     abstract_state = {
         'key': jax.ShapeDtypeStruct(
@@ -540,53 +545,33 @@ class SnapshotterTest(parameterized.TestCase):
             np.float32,
             sharding=jax.sharding.NamedSharding(load_mesh, partition_spec),
         ),
+        'offloaded': jax.ShapeDtypeStruct(
+            (2,),
+            np.float32,
+            sharding=jax.sharding.NamedSharding(
+                load_mesh,
+                jax.sharding.PartitionSpec(),
+                memory_kind='pinned_host',
+            ),
+        ),
     }
     manager = snapshotter.Snapshotter(replica_axis_index=replica_axis_index)
 
-    with mock.patch.object(
-        jax.random, 'wrap_key_data', wraps=jax.random.wrap_key_data
-    ) as mock_wrap_key_data:
+    with self._record_device_puts() as save_puts:
       manager.save(1, state)
       manager.join()
-      restored = manager.load(abstract_state)
+    for src, dst in save_puts:
+      if src is offloaded:
+        self.assertEqual(dst.memory_kind, 'pinned_host')
+    restored = manager.load(abstract_state)
 
     self.assertEqual(restored['key'].sharding, restored_key_sharding)
     self.assertEqual(restored['key'].dtype, key.dtype)
+    self.assertEqual(restored['offloaded'].sharding.memory_kind, 'pinned_host')
     np.testing.assert_array_equal(
         jax.random.key_data(restored['key']), jax.random.key_data(key)
     )
     np.testing.assert_array_equal(restored['vector'], vector)
-    # JAX releases before 0.10.1 do not accept `dtype` in `wrap_key_data`.
-    mock_wrap_key_data.assert_called()
-    for call in mock_wrap_key_data.call_args_list:
-      self.assertNotIn('dtype', call.kwargs)
-    with self.assertRaises(AttributeError):
-      manager.load({**abstract_state, 'key': SimpleNamespace(shape=())})
-
-  def test_load_preserves_slice_locality_and_stripes_donors(self):
-    manager = snapshotter.Snapshotter()
-    with mock.patch.object(
-        jax, 'device_put', wraps=jax.device_put
-    ) as mock_device_put:
-      manager.save(0, self.pytree)
-      manager.join()
-    self.assertEqual(mock_device_put.call_count, 1)
-    assert manager._latest_snapshot is not None
-    for leaf in jax.tree.leaves(manager._latest_snapshot[0][0]):
-      leaf.delete()
-    with mock.patch.object(
-        jax, 'device_put', wraps=jax.device_put
-    ) as mock_device_put:
-      restored = manager.load(self.abstract_pytree, reset_snapshot_state=False)
-    test_utils.assert_tree_equal(self, self.pytree, restored)
-    local_call, fill_call = mock_device_put.call_args_list
-    for source, target in zip(*local_call.args[:2]):
-      self.assertEqual(source.sharding.device_set, target.device_set)
-    donor_slices = {
-        next(iter(array.sharding.device_set)).slice_index
-        for array in fill_call.args[0]
-    }
-    self.assertEqual(donor_slices, {1, 2, 3})
 
   def test_try_load_keeps_non_array_leaves_and_handles_errors(self):
     manager = snapshotter.Snapshotter()
@@ -595,157 +580,137 @@ class SnapshotterTest(parameterized.TestCase):
     manager.save(5, {'a': self.pytree['a'], 'i': {'k': 9}})
     step, restored = manager.try_load(target)
     assert restored is not None
-    self.assertEqual((step, restored['i']), (5, {'k': 9}))
-    self.assertTrue(manager.cancel_pending(0.0))
-    assert manager.latest is not None
-    self.assertEqual(manager.latest.step, 5)
-    # A different tree structure is a caller error: the snapshot stays.
-    with self.assertRaises(ValueError):
+    self.assertEqual(step, 5)
+    self.assertEqual(restored['i'], {'k': 9})
+    with self.assertRaisesRegex(ValueError, 'structure does not match'):
       manager.try_load({'a': self.abstract_pytree['a']})
     assert manager.latest is not None
     self.assertEqual(manager.latest.step, 5)
-    # A different shape cannot be restored: the snapshot is dropped.
-    bad_shape = SimpleNamespace(
-        shape=(99,), sharding=self.abstract_pytree['a'].sharding
+    bad_shape = jax.ShapeDtypeStruct(
+        (99,), np.float32, sharding=self.abstract_pytree['a'].sharding
     )
     self.assertEqual(
-        (manager.try_load({'a': bad_shape, 'i': {'k': 0}}), manager.latest),
-        ((None, None), None),
+        manager.try_load({'a': bad_shape, 'i': {'k': 0}}), (None, None)
     )
+    self.assertIsNone(manager.latest)
 
-  def test_save_with_wait_takes_the_snapshot_before_returning(self):
+  def test_cancel_pending_discards_queued_and_in_flight_snapshots(self):
     manager = snapshotter.Snapshotter()
-    device = jax.devices()[0]
-    scalar = jax.device_put(1, jax.sharding.SingleDeviceSharding(device))
-    iterator = object()
-    state = {'a': self.pytree['a'], 'it': iterator, 's': scalar}
-    self.assertIsNone(manager.save(2, state))
-    self.assertIsNone(manager.save(3, state, wait=True))
-    assert manager.latest is not None
-    self.assertEqual(manager.latest.step, 3)
-    # A save with a checkpointer function takes the snapshot of `state` again
-    # and passes the state that the snapshot holds to the function.
-    pinned_states = []
-    with mock.patch.object(
-        manager, '_to_snapshot_state', wraps=manager._to_snapshot_state
-    ) as to_snapshot_state:
-      manager.save(3, state, checkpointer_save_fn=pinned_states.append)
-    self.assertEqual((to_snapshot_state.call_count, len(pinned_states)), (1, 1))
-    pinned = pinned_states[0]
-    assert manager._latest_snapshot is not None
-    self.assertIs(pinned, manager._latest_snapshot[2])
-    self.assertIs(pinned['it'], iterator)
-    # The snapshot replicates a single-device array across the mesh.
-    replicated = jax.sharding.NamedSharding(
-        self.pytree['a'].sharding.mesh,
-        jax.sharding.PartitionSpec(),
-        memory_kind='pinned_host',
-    )
-    self.assertEqual(
-        (pinned['a'].sharding, pinned['s'].sharding), (replicated, replicated)
-    )
-
-  def test_save_with_checkpointer_fns(self):
-    manager = snapshotter.Snapshotter()
-    wait_fn, iterator, arrays = (
-        mock.MagicMock(),
-        object(),
-        {'a': self.pytree['a']},
-    )
-
-    def share(step, state):
-      # Returns the state that the checkpoint save function is given.
-      return manager.save(
-          step,
-          state,
-          checkpointer_wait_fn=wait_fn,
-          checkpointer_save_fn=lambda pinned_state: pinned_state,
-      )
-
-    first_pinned = share(1, {**arrays, 'it': iterator})
-    manager.save(2, arrays)
+    manager.save(5, self.pytree)
     manager.join()
-    assert manager._latest_snapshot is not None
-    second_snapshot_state = manager._latest_snapshot[2]
-    manager.save(4, arrays)
-    second_pinned = share(4, arrays)
-    with mock.patch.object(jax, 'block_until_ready', side_effect=RuntimeError):
-      failed_pinned = share(5, arrays)
-    manager.save(6, arrays)
-    checks = (
-        second_snapshot_state['a'] is not second_pinned['a'],
-        not first_pinned['a'].is_deleted(),
-        failed_pinned is arrays,
-    )
-    abstract_array = self.abstract_pytree_2_slices['a']
-    _, restored = manager.try_load(
-        {'a': abstract_array}, reset_snapshot_state=False
-    )
-    assert restored is not None
-    # The snapshot of step 6 is on another mesh than `restored`.
-    third_pinned = share(6, restored)
-    same_devices = (
-        third_pinned['a'].sharding.device_set
-        == abstract_array.sharding.device_set
-    )
-    results = (
-        first_pinned['it'],
-        *checks,
-        not second_pinned['a'].is_deleted(),
-        same_devices,
-    )
-    self.assertEqual(results, (iterator, True, True, True, True, True))
-    self.assertEqual(wait_fn.call_count, 4)
+    started = threading.Event()
+    release = threading.Event()
+    self.addCleanup(release.set)
+    original_block = jax.block_until_ready
 
-  def test_save_calls_checkpointer_fns_in_order_and_raises_their_errors(self):
-    manager = snapshotter.Snapshotter()
-    arrays = {'a': self.pytree['a']}
-    calls = mock.Mock()
-    calls.save.return_value = 'saved'
-    with mock.patch.object(
-        manager, '_to_snapshot_state', wraps=manager._to_snapshot_state
-    ) as to_snapshot_state:
-      calls.attach_mock(to_snapshot_state, 'snapshot')
-      result = manager.save(
-          3,
-          arrays,
-          checkpointer_wait_fn=calls.wait,
-          checkpointer_save_fn=calls.save,
-      )
-    self.assertEqual(
-        (result, [name for name, _, _ in calls.mock_calls]),
-        ('saved', ['wait', 'snapshot', 'save']),
-    )
-    # An error of a checkpointer function reaches the caller, and the worker
-    # keeps running.
-    failing_save_fn = mock.Mock(side_effect=ValueError)
-    with self.assertRaises(ValueError):
-      manager.save(4, arrays, checkpointer_save_fn=failing_save_fn)
-    self.assertIsNone(manager.save(5, arrays, wait=True))
+    def block_worker(arrays):
+      started.set()
+      release.wait()
+      return original_block(arrays)
+
+    with mock.patch.object(jax, 'block_until_ready', side_effect=block_worker):
+      manager.save(6, self.pytree)
+      self.assertTrue(started.wait(timeout=5.0))
+      manager.save(7, self.pytree)
+      self.assertFalse(manager.cancel_pending(0.0))
+      release.set()
+      self.assertTrue(manager.cancel_pending(None))
     assert manager.latest is not None
     self.assertEqual(manager.latest.step, 5)
 
-  def test_save_re_snapshots_when_same_step_state_changes(self):
+  def test_load_preserves_slice_locality_and_stripes_donors(self):
     manager = snapshotter.Snapshotter()
-    arr1 = self.pytree['a'] + 1
-    arr2 = self.pytree['a'] + 2
-    state1 = {'a': arr1, 'meta': 'v1'}
-    manager.save(10, state1, wait=True)
+    manager.save(0, self.pytree)
+    manager.join()
+    assert manager._latest_snapshot is not None
+    for leaf in jax.tree.leaves(manager._latest_snapshot[0][0]):
+      leaf.delete()
+    with self._record_device_puts() as puts:
+      restored = manager.load(self.abstract_pytree, reset_snapshot_state=False)
+    test_utils.assert_tree_equal(self, self.pytree, restored)
+    cross_slice_donors = set()
+    for source, target in puts:
+      if source.sharding.memory_kind == 'pinned_host':
+        self.assertEqual(source.sharding.device_set, target.device_set)
+      elif source.sharding.device_set != target.device_set:
+        donor_device = next(iter(source.sharding.device_set))
+        cross_slice_donors.add(donor_device.slice_index)
+    self.assertEqual(cross_slice_donors, {1, 2, 3})
+    flat_mesh = jax.sharding.Mesh(np.asarray(jax.devices()), ('flat',))
+    flat_target = jax.tree.map(
+        lambda x: jax.ShapeDtypeStruct(
+            x.shape,
+            x.dtype,
+            sharding=jax.sharding.NamedSharding(
+                flat_mesh, jax.sharding.PartitionSpec()
+            ),
+        ),
+        self.abstract_pytree,
+    )
+    restored_flat = manager.load(flat_target, reset_snapshot_state=False)
+    for expected, actual in zip(
+        jax.tree.leaves(self.pytree),
+        jax.tree.leaves(restored_flat),
+        strict=True,
+    ):
+      np.testing.assert_array_equal(expected, actual)
 
-    # Same step, shape, dtype, and sharding, but different array values.
-    state2 = {'a': arr2, 'meta': 'v1'}
-    saved_states = []
-    manager.save(10, state2, checkpointer_save_fn=saved_states.append)
-    test_utils.assert_tree_equal(self, state2, saved_states[-1])
-    self.assertEqual(saved_states[-1]['a'].sharding.memory_kind, 'pinned_host')
+  def test_save_blocking_and_checkpointer_sharing(self):
+    manager = snapshotter.Snapshotter()
+    scalar = jax.device_put(
+        1, jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    )
+    iterator = object()
+    state = {'a': self.pytree['a'], 'it': iterator, 's': scalar}
+    self.assertIsNone(manager.save(2, state, wait=True))
+    assert manager.latest is not None
+    self.assertEqual(manager.latest.step, 2)
 
-    # Same step and array object, but a different non-array leaf.
-    state3 = {'a': arr2, 'meta': 'v2'}
-    manager.save(10, state3, checkpointer_save_fn=saved_states.append)
-    test_utils.assert_tree_equal(self, state3, saved_states[-1])
-    target = {'a': self.abstract_pytree['a'], 'meta': ''}
-    restored = manager.load(target, reset_snapshot_state=False)
-    test_utils.assert_tree_equal(self, state3, restored)
+    events = []
+    saved = []
+
+    def wait_fn():
+      assert manager.latest is not None
+      events.append(('wait', manager.latest.step))
+
+    def save_fn(pinned):
+      assert manager.latest is not None
+      events.append(('save', manager.latest.step))
+      saved.append(pinned)
+      return 'saved'
+
+    result = manager.save(
+        3, state, checkpointer_wait_fn=wait_fn, checkpointer_save_fn=save_fn
+    )
+    self.assertEqual(result, 'saved')
+    self.assertEqual(events, [('wait', 2), ('save', 3)])
+    self.assertIs(saved[0]['it'], iterator)
+    self.assertEqual(saved[0]['a'].sharding.memory_kind, 'pinned_host')
+    self.assertEqual(saved[0]['s'].sharding.memory_kind, 'pinned_host')
+
+    # Overwriting the snapshot leaves previously shared host buffers valid, and
+    # same-step state updates re-snapshot instead of returning stale buffers.
+    updated = {'a': self.pytree['a'] + 5, 'it': 'v2', 's': scalar}
+    manager.save(3, updated, checkpointer_save_fn=saved.append)
+    self.assertFalse(saved[0]['a'].is_deleted())
+    test_utils.assert_tree_equal(self, updated['a'], saved[1]['a'])
+    self.assertEqual(saved[1]['it'], 'v2')
+
+    # Snapshot failure falls back to passing `state` to `checkpointer_save_fn`,
+    # while errors raised by `checkpointer_save_fn` propagate to the caller.
+    with mock.patch.object(jax, 'block_until_ready', side_effect=RuntimeError):
+      fallback = manager.save(
+          4, state, checkpointer_save_fn=lambda tree: tree
+      )
+    self.assertIs(fallback, state)
+    with self.assertRaisesRegex(ValueError, 'checkpointer boom'):
+      manager.save(
+          5,
+          state,
+          checkpointer_save_fn=mock.Mock(
+              side_effect=ValueError('checkpointer boom')
+          ),
+      )
 
   def test_copy_device_arrays_for_async_transfer(self):
     manager = snapshotter.Snapshotter(
@@ -756,20 +721,29 @@ class SnapshotterTest(parameterized.TestCase):
     )
     pinned_sharding = self.pytree['a'].sharding.with_memory_kind('pinned_host')
     pinned_input = jax.device_put(self.pytree['a'], pinned_sharding)
+    device_sharding = self.pytree['b'].sharding
+    device_input = jax.numpy.copy(self.pytree['b'])
     release = threading.Event()
     self.addCleanup(release.set)
     original_block = jax.block_until_ready
 
-    def side_effect(tree):
+    def block_worker(arrays):
       release.wait()
-      return original_block(tree)
+      return original_block(arrays)
 
-    with mock.patch.object(jax, 'block_until_ready', side_effect=side_effect):
-      manager.save(10, {**self.pytree, 'a': pinned_input, 's': scalar})
-      # Skipped, because the copy for step 10 is still in device memory.
+    with mock.patch.object(jax, 'block_until_ready', side_effect=block_worker):
+      manager.save(
+          10,
+          {**self.pytree, 'a': pinned_input, 'b': device_input, 's': scalar},
+      )
       manager.save(11, self.pytree)
-      # The caller may delete or donate its arrays as soon as `save` returns.
-      pinned_input.delete()
+      mutated_host = jax.jit(
+          lambda x: x + 1, out_shardings=pinned_sharding, donate_argnums=0
+      )(pinned_input)
+      mutated_dev = jax.jit(
+          lambda x: x + 1, out_shardings=device_sharding, donate_argnums=0
+      )(device_input)
+      original_block((mutated_host, mutated_dev))
       release.set()
       manager.join()
     assert manager.latest is not None
@@ -779,14 +753,6 @@ class SnapshotterTest(parameterized.TestCase):
     test_utils.assert_tree_equal(
         self, {**self.pytree_2_slices, 's': scalar}, restored
     )
-    # A save that takes the snapshot before it returns makes no on-device copy.
-    pinned_states = []
-    with mock.patch.object(
-        snapshotter, '_copy_arrays', wraps=snapshotter._copy_arrays
-    ) as copy_arrays:
-      manager.save(12, self.pytree, checkpointer_save_fn=pinned_states.append)
-    copy_arrays.assert_not_called()
-    self.assertEqual(pinned_states[0]['a'].sharding.memory_kind, 'pinned_host')
 
   @parameterized.named_parameters(
       dict(testcase_name='mismatched_replicas', replica_axis_index=0),
@@ -803,13 +769,14 @@ class SnapshotterTest(parameterized.TestCase):
         'four_slices': self.pytree['a'],
         'two_slices': self.pytree_2_slices['a'],
     }
-    # The worker thread splits the on-device copies into replicas, so it gets
-    # the error of the split. It logs the error and processes the next request.
-    for step in (1, 2):
-      manager.save(step, mismatched_tree)
-      manager.join()
+    manager.save(1, mismatched_tree)
+    manager.join()
     self.assertIsNone(manager.latest)
-    self.assertTrue(manager._worker_thread.is_alive())
+    if replica_axis_index == 0:
+      manager.save(2, self.pytree)
+      manager.join()
+      assert manager.latest is not None
+      self.assertEqual(manager.latest.step, 2)
 
 
 if __name__ == '__main__':

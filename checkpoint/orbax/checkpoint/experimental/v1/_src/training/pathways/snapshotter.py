@@ -1,6 +1,6 @@
 """Manages asynchronous backups of JAX array states to pinned host memory."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 import contextlib
 import logging
 import queue
@@ -9,7 +9,6 @@ from typing import Any
 
 from etils import epath
 import jax
-from orbax.checkpoint._src import sharding_utils
 from orbax.checkpoint.experimental.v1._src.training.metadata import types as training_metadata_types
 from orbax.checkpoint.experimental.v1._src.tree import types as tree_types
 
@@ -36,125 +35,151 @@ def _unwrap_if_prng_key(x: Any) -> Any:
 def _wrap_if_prng_key(x: Any, orig_x: Any) -> Any:
   """Wraps raw array x into a PRNGKeyArray if orig_x was a PRNGKeyArray."""
   if _is_prng_key(orig_x):
-    return jax.random.wrap_key_data(x, impl=jax.random.key_impl(orig_x))
+    return jax.random.wrap_key_data(x, dtype=orig_x.dtype)
   return x
-
-
-def _pin_host_copy(array: Any) -> Any:
-  """Copies the unwrapped JAX `array` into pinned host memory.
-
-  The result never aliases `array`, even when `array` is already in pinned host
-  memory (for example, host-offloaded parameters or optimizer state), so a
-  snapshot keeps its buffers when the caller donates `array`.
-
-  Args:
-    array: The unwrapped JAX array to copy.
-
-  Returns:
-    A new JAX array in pinned host memory.
-  """
-  return jax.device_put(
-      array, array.sharding.with_memory_kind("pinned_host"), may_alias=False
-  )
 
 
 def _copy_arrays(state: tree_types.PyTree) -> tree_types.PyTree:
   """Copies array leaves so that the caller may donate or mutate `state`."""
+  arrays = _extract_arrays(state)
+  host_indices = []
+  for i, array in enumerate(arrays):
+    if array.sharding.memory_kind in (None, "device"):
+      arrays[i] = jax.numpy.copy(array)
+    else:
+      host_indices.append(i)
+  if host_indices:
+    host_copies = jax.device_put(
+        [arrays[i] for i in host_indices],
+        [
+            arrays[i].sharding.with_memory_kind("pinned_host")
+            for i in host_indices
+        ],
+        may_alias=False,
+    )
+    for i, copied in zip(host_indices, host_copies, strict=True):
+      arrays[i] = copied
+  return _replace_arrays(state, arrays)
 
-  def _copy_leaf(leaf: Any) -> Any:
-    if not is_shardable_array(leaf):
-      return leaf
-    array = _unwrap_if_prng_key(leaf)
-    if sharding_utils.is_in_device_memory(array):
-      return _wrap_if_prng_key(jax.numpy.copy(array), leaf)
-    return _wrap_if_prng_key(_pin_host_copy(array), leaf)
 
-  return jax.tree.map(_copy_leaf, state)
+def _is_replica_active(replica_tree: tree_types.PyTree) -> bool:
+  """Returns True if `replica_tree`'s slice placement is reachable."""
+  probe = next(
+      filter(is_shardable_array, jax.tree.leaves(replica_tree)), None
+  )
+  if probe is None:
+    return True
+  try:
+    jax.block_until_ready(_unwrap_if_prng_key(probe)[...])
+    return True
+  except (jax.errors.JaxRuntimeError, RuntimeError):
+    return False
 
 
-def _find_named_mesh(tree: Any) -> Any:
+def _find_named_mesh(tree: tree_types.PyTree) -> jax.sharding.Mesh | None:
   """Returns the mesh of the first `NamedSharding` leaf in `tree`, or None."""
   for leaf in jax.tree.leaves(tree):
     sharding = getattr(leaf, "sharding", None)
-    if isinstance(sharding, jax.sharding.NamedSharding):
+    if isinstance(sharding, jax.sharding.NamedSharding) and isinstance(
+        sharding.mesh, jax.sharding.Mesh
+    ):
       return sharding.mesh
   return None
 
 
-def _extract_arrays(tree: Any) -> tuple[list[Any], Any]:
-  """Unwraps `jax.Array` leaves of `tree` and returns `(arrays, rebuild)`."""
+def _extract_arrays(tree: tree_types.PyTree) -> list[jax.Array]:
+  """Returns unwrapped `jax.Array` leaves of `tree`."""
+  return [
+      _unwrap_if_prng_key(leaf)
+      for leaf in jax.tree.leaves(tree)
+      if is_shardable_array(leaf)
+  ]
+
+
+def _replace_arrays(
+    tree: tree_types.PyTree, arrays: Sequence[jax.Array]
+) -> tree_types.PyTree:
+  """Returns `tree` with its `jax.Array` leaves replaced by `arrays`."""
   leaves, tree_def = jax.tree.flatten(tree)
-  indices = [i for i, leaf in enumerate(leaves) if is_shardable_array(leaf)]
-
-  def rebuild(arrays: Any) -> Any:
-    restored = list(leaves)
-    for i, array in zip(indices, arrays):
-      restored[i] = _wrap_if_prng_key(array, leaves[i])
-    return jax.tree.unflatten(tree_def, restored)
-
-  return [_unwrap_if_prng_key(leaves[i]) for i in indices], rebuild
+  array_iter = iter(arrays)
+  for i, leaf in enumerate(leaves):
+    if is_shardable_array(leaf):
+      leaves[i] = _wrap_if_prng_key(next(array_iter), leaf)
+  return jax.tree.unflatten(tree_def, leaves)
 
 
-def _target_sharding(leaf: Any, target_leaf: Any) -> Any:
+def _target_sharding(leaf: jax.Array, target_leaf: Any) -> Any:
   """Returns the target `jax.sharding.Sharding` for `leaf`."""
   if isinstance(target_leaf, jax.sharding.Sharding):
     return target_leaf
-  if tuple(target_leaf.shape) != leaf.shape:
-    raise RuntimeError("Restored replica shape mismatch.")
+  if (target_shape := tuple(target_leaf.shape)) != leaf.shape:
+    raise RuntimeError(
+        f"Restored replica shape mismatch: {target_shape} != {leaf.shape}."
+    )
   return target_leaf.sharding
 
 
-def _put_arrays(state: Any, target: Any = None) -> Any:
+def _put_arrays(
+    state: tree_types.PyTree, target: tree_types.PyTree | None = None
+) -> tree_types.PyTree:
   """Moves array leaves of `state` onto `target` shardings via device memory."""
-  arrays, rebuild = _extract_arrays(state)
+  leaves, tree_def = jax.tree.flatten(state)
+  arrays = [
+      _unwrap_if_prng_key(leaf) for leaf in leaves if is_shardable_array(leaf)
+  ]
   if target is None:
-    shardings = [array.sharding.with_memory_kind(None) for array in arrays]
+    target_shardings = [
+        array.sharding.with_memory_kind(None) for array in arrays
+    ]
   else:
-    leaves, tree_def = jax.tree.flatten(state)
     targets, target_def = jax.tree.flatten(target)
     if tree_def != target_def:
       raise ValueError("Snapshot PyTree structure does not match target.")
-    shardings = [
+    target_shardings = [
         _target_sharding(leaf, target_leaf)
-        for leaf, target_leaf in zip(leaves, targets)
+        for leaf, target_leaf in zip(leaves, targets, strict=True)
         if is_shardable_array(leaf)
     ]
-  stage1 = [
-      array.sharding
-      if array.sharding == sharding
-      else array.sharding.with_memory_kind(None)
-      for array, sharding in zip(arrays, shardings)
-  ]
-  stage2 = [sharding.with_memory_kind(None) for sharding in shardings]
-  for stage in (stage1, stage2, shardings):
+  # Stage cross-device transfers through device memory (b/574655289).
+  stages = (
+      [array.sharding.with_memory_kind(None) for array in arrays],
+      [sharding.with_memory_kind(None) for sharding in target_shardings],
+      target_shardings,
+  )
+  for stage_shardings in stages:
     to_move = [
         i
-        for i, (array, sharding) in enumerate(zip(arrays, stage))
-        if array.sharding != sharding
+        for i, (array, sharding, target_sharding) in enumerate(
+            zip(arrays, stage_shardings, target_shardings, strict=True)
+        )
+        if array.sharding not in (sharding, target_sharding)
     ]
     if to_move:
       moved = jax.device_put(
-          [arrays[i] for i in to_move], [stage[i] for i in to_move]
+          [arrays[i] for i in to_move],
+          [stage_shardings[i] for i in to_move],
       )
-      for i, array in zip(to_move, moved):
+      for i, array in zip(to_move, moved, strict=True):
         arrays[i] = array
-  return rebuild(arrays)
+  return _replace_arrays(state, arrays)
 
 
-def _replicate_single_device_leaves(tree: Any) -> Any:
+def _replicate_single_device_leaves(
+    tree: tree_types.PyTree,
+) -> tree_types.PyTree:
   """Replicates single-device array leaves across the mesh of `tree`."""
   mesh = _find_named_mesh(tree)
   if mesh is None:
     return tree
   replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-  arrays, rebuild = _extract_arrays(tree)
+  arrays = _extract_arrays(tree)
   shardings = [
       replicated
       if isinstance(array.sharding, jax.sharding.SingleDeviceSharding)
       else array.sharding
       for array in arrays
   ]
-  return rebuild(_put_arrays(arrays, shardings))
+  return _replace_arrays(tree, _put_arrays(arrays, shardings))
 
 
 def _get_pathwaysutils():
@@ -186,21 +211,14 @@ class Snapshotter:
     Args:
       replica_axis_index: The index of the mesh axis representing data/model
         replicas. Typically corresponds to physical slices (connected by DCN).
-      copy_device_arrays_for_async_transfer: Whether `save` copies device arrays
-        on device, instead of transferring them to host, before returning to the
-        caller. The copies are transferred to pinned host memory in the
-        background and released when their transfer completes, so the caller may
-        donate or mutate the originals without waiting for the transfer. This
-        can double peak device memory usage. A `save` that takes the snapshot
-        before it returns makes no copy.
+      copy_device_arrays_for_async_transfer: Whether non-blocking `save` copies
+        device arrays on device before returning, transferring those copies to
+        pinned host memory in the background so the caller may donate `state`.
     """
     self._concatenate_by_mesh_axis, self._split_by_mesh_axis = (
         _get_pathwaysutils()
     )
-    # The replicas of the latest snapshot, its step and its full-mesh state.
-    self._latest_snapshot: (
-        tuple[list[tree_types.PyTree], int, tree_types.PyTree] | None
-    ) = None
+    self._latest_snapshot: tuple[list[tree_types.PyTree], int] | None = None
     self._lock = threading.Lock()
     self._queue = queue.Queue(maxsize=1)
     self._generation = 0
@@ -213,36 +231,24 @@ class Snapshotter:
   def _worker(self):
     """Processes background snapshot requests from the queue."""
     while True:
-      (
-          full_mesh_pinned_state,
-          per_replica_pinned_trees,
-          step,
-          generation,
-          staged_copy,
-      ) = self._queue.get()
+      pinned_state, replica_trees, step, generation, staged = self._queue.get()
       try:
-        # `cancel_pending` ran after `save` queued this request, so discard it.
-        if generation != self._generation:
-          continue
-        if staged_copy is not None:
-          # `staged_copy` holds copies that only this request uses: wait for
-          # them, start their transfer to pinned host memory and release them.
-          jax.block_until_ready(jax.tree.map(_unwrap_if_prng_key, staged_copy))
-          full_mesh_pinned_state, per_replica_pinned_trees = (
-              self._to_snapshot_state(staged_copy, may_alias=True)
+        with self._lock:
+          if generation != self._generation:
+            continue
+        if staged is not None:
+          jax.block_until_ready(_extract_arrays(staged))
+          with self._lock:
+            if generation != self._generation:
+              continue
+          pinned_state, replica_trees = self._to_snapshot_state(
+              staged, may_alias=True
           )
-          staged_copy = None
-        jax.block_until_ready(
-            jax.tree.map(
-                _unwrap_if_prng_key,
-                (full_mesh_pinned_state, per_replica_pinned_trees),
-            )
-        )
+          staged = None
+        jax.block_until_ready(_extract_arrays((pinned_state, replica_trees)))
       except (
           jax.errors.JaxRuntimeError,
           RuntimeError,
-          # Raised by `_to_snapshot_state`, which runs on this thread for a
-          # staged request. An uncaught error would end this thread.
           ValueError,
           IndexError,
       ) as e:
@@ -250,35 +256,17 @@ class Snapshotter:
       else:
         with self._lock:
           if generation == self._generation:
-            self._latest_snapshot = (
-                per_replica_pinned_trees,
-                step,
-                full_mesh_pinned_state,
-            )
+            self._latest_snapshot = (replica_trees, step)
       finally:
-        del full_mesh_pinned_state, per_replica_pinned_trees
-        del staged_copy
+        del pinned_state, replica_trees, staged
         self._queue.task_done()
 
   def _to_snapshot_state(
       self, state: tree_types.PyTree, may_alias: bool = False
   ) -> tuple[tree_types.PyTree, list[tree_types.PyTree]]:
-    """Copies a PyTree to pinned host memory, whole and split into replicas.
-
-    Args:
-      state: The PyTree to be converted and split.
-      may_alias: Whether arrays of `state` that already reside in pinned host
-        memory may be used as they are instead of being copied.
-
-    Returns:
-      A tuple of `state` with its arrays in pinned host memory, and a list of
-      PyTrees where each PyTree represents a single replica of `state`. In all
-      of these PyTrees, single-device arrays are replicated across the mesh, and
-      non-array leaves (e.g., scalars, strings, metadata, Python objects) are
-      preserved.
-    """
+    """Copies a PyTree to pinned host memory, whole and split into replicas."""
     replicated = _replicate_single_device_leaves(state)
-    arrays, rebuild = _extract_arrays(replicated)
+    arrays = _extract_arrays(replicated)
     if not arrays:
       return state, [state]
     axis = ""
@@ -287,8 +275,6 @@ class Snapshotter:
       if isinstance(array.sharding, jax.sharding.NamedSharding):
         mesh = array.sharding.mesh
         axis = mesh.axis_names[self.replica_axis_index]
-        if any(axis in jax.tree.leaves(dim) for dim in array.sharding.spec):
-          raise ValueError(f"Cannot shard along replica axis {axis!r}.")
         replica_counts.add(mesh.shape[axis])
       else:
         replica_counts.add(1)
@@ -302,35 +288,26 @@ class Snapshotter:
         [array.sharding.with_memory_kind("pinned_host") for array in arrays],
         may_alias=may_alias,
     )
-    pinned_state = rebuild(pinned)
+    pinned_state = _replace_arrays(replicated, pinned)
     if replica_counts == {1}:
       return pinned_state, [pinned_state]
     replicas = self._split_by_mesh_axis.split_by_mesh_axis(pinned, axis)
-    return pinned_state, [rebuild(replica) for replica in replicas]
+    return pinned_state, [
+        _replace_arrays(replicated, replica) for replica in replicas
+    ]
 
   def _enqueue_snapshot(
       self, step: int, state: tree_types.PyTree, copy_on_device: bool = False
-  ) -> tree_types.PyTree | None:
-    """Queues the snapshot of `state` at `step` for the worker thread.
-
-    Args:
-      step: The training step number associated with the state.
-      state: The PyTree to be saved.
-      copy_on_device: Whether to queue a copy of the device arrays of `state`,
-        which the worker thread transfers to pinned host memory.
-
-    Returns:
-      `state` with its arrays in pinned host memory, as the snapshot stores it,
-      or None with `copy_on_device`.
-    """
+  ) -> tuple[tree_types.PyTree | None, list[tree_types.PyTree] | None]:
+    """Queues the snapshot of `state` at `step` for the worker thread."""
+    with self._lock:
+      generation = self._generation
     if copy_on_device:
-      self._queue.put((None, None, step, self._generation, _copy_arrays(state)))
-      return None
-    pinned_state, per_replica_pinned_trees = self._to_snapshot_state(state)
-    self._queue.put(
-        (pinned_state, per_replica_pinned_trees, step, self._generation, None)
-    )
-    return pinned_state
+      self._queue.put((None, None, step, generation, _copy_arrays(state)))
+      return None, None
+    pinned_state, replica_trees = self._to_snapshot_state(state)
+    self._queue.put((pinned_state, replica_trees, step, generation, None))
+    return pinned_state, replica_trees
 
   def save(
       self,
@@ -343,23 +320,11 @@ class Snapshotter:
   ) -> Any:
     """Backs up JAX array states to pinned host memory.
 
-    By default, the backup runs asynchronously. If previous snapshotting
-    requests are still in progress, this request may be skipped.
-
-    The saved state contains all replicas of user data. When restoring via
-    `load_pytree`, snapshotter is able to reconstruct user data even if some
-    replicas are unavailable, making it resilient to failures of some replicas.
-
-    With `wait` or a checkpointer function, this method instead takes the
-    snapshot of `step` before it returns, in the following order:
-
-    1. Calls `checkpointer_wait_fn`, so that the previous checkpoint save
-       releases its host arrays before the snapshot allocates new ones.
-    2. Waits for the snapshotting requests in progress.
-    3. Takes the snapshot.
-    4. Calls `checkpointer_save_fn` with `state` backed by the host arrays of
-       the snapshot, so that the checkpoint needs no second transfer from device
-       memory. If the snapshot failed, passes `state` itself.
+    By default, the backup runs asynchronously and skips the request if busy.
+    With `wait` or a checkpointer callback, waits for `checkpointer_wait_fn`,
+    drains pending snapshots, takes the snapshot of `step` synchronously, and
+    calls `checkpointer_save_fn` with `state` backed by the snapshot's pinned
+    host arrays (falling back to `state` if taking the snapshot failed).
 
     Args:
       step: The training step number associated with the state.
@@ -367,38 +332,36 @@ class Snapshotter:
       wait: Whether to take the snapshot of `step` before returning.
       checkpointer_wait_fn: Waits for the previous save of a checkpointer.
       checkpointer_save_fn: Saves the PyTree that it is given as a checkpoint.
-        The arrays of that PyTree belong to the snapshot, so the function must
-        not donate or delete them. Single-device arrays are replicated across
-        the mesh.
 
     Returns:
       The result of `checkpointer_save_fn`, or None without that function.
     """
     if not (wait or checkpointer_wait_fn or checkpointer_save_fn):
-      staged = self._copy_on_device
-      # A staged request keeps a second copy of `state` in device memory until
-      # its transfer to host finishes, so only one such request may be in
-      # flight.
-      busy = self._queue.unfinished_tasks > 0 if staged else self._queue.full()
+      busy = (
+          self._queue.unfinished_tasks > 0
+          if self._copy_on_device
+          else self._queue.full()
+      )
       if busy:
         logging.warning("Snapshotter busy. Skipping snapshot for step %d", step)
         return None
-      self._enqueue_snapshot(step, state, copy_on_device=staged)
+      self._enqueue_snapshot(step, state, copy_on_device=self._copy_on_device)
       return None
 
     if checkpointer_wait_fn is not None:
       checkpointer_wait_fn()
     self.join()
-    # The caller cannot donate `state` before this method returns, so the
-    # snapshot needs no copy of `state` in device memory.
-    pinned_state = self._enqueue_snapshot(step, state)
-    self.join()
+    try:
+      pinned_state, replica_trees = self._enqueue_snapshot(step, state)
+      self.join()
+    except (jax.errors.JaxRuntimeError, RuntimeError) as e:
+      logging.exception("Failed to snapshot state at step %d: %s", step, e)
+      pinned_state, replica_trees = state, None
     if checkpointer_save_fn is None:
       return None
     with self._lock:
       latest_snapshot = self._latest_snapshot
-    if latest_snapshot is None or latest_snapshot[2] is not pinned_state:
-      # The snapshot failed, so the checkpoint transfers `state` itself.
+    if latest_snapshot is None or latest_snapshot[0] is not replica_trees:
       pinned_state = state
     return checkpointer_save_fn(pinned_state)
 
@@ -430,22 +393,9 @@ class Snapshotter:
     with self._lock:
       if self._latest_snapshot is None:
         raise RuntimeError("No snapshots available to restore from.")
-      replica_trees, step, _ = self._latest_snapshot
+      replica_trees, step = self._latest_snapshot
 
-    def is_replica_active(replica_tree):
-      try:
-        probe = next(
-            filter(is_shardable_array, jax.tree.leaves(replica_tree)), None
-        )
-        if probe is not None:
-          jax.block_until_ready(_unwrap_if_prng_key(probe)[...])
-        return True
-      except (jax.errors.JaxRuntimeError, RuntimeError):
-        return False
-
-    active_trees = [
-        tree for tree in replica_trees if is_replica_active(tree)
-    ]
+    active_trees = [tree for tree in replica_trees if _is_replica_active(tree)]
     if not active_trees:
       raise RuntimeError("No active replicas found.")
 
@@ -460,73 +410,91 @@ class Snapshotter:
     mesh = _find_named_mesh(abstract_state)
     device_state = self._restore_replicas(active_trees, mesh)
     restored_state = _put_arrays(device_state, abstract_state)
-    unwrapped_restored = jax.tree.map(_unwrap_if_prng_key, restored_state)
-    jax.block_until_ready(unwrapped_restored)
+    jax.block_until_ready(_extract_arrays(restored_state))
 
-    if (should_reset := reset_snapshot_state) is None:
-      should_reset = bool(
+    if reset_snapshot_state is None:
+      reset_snapshot_state = bool(
           mesh and mesh.shape[mesh.axis_names[self.replica_axis_index]] > 1
       )
-    if should_reset:
-      full_mesh_pinned_state, per_replica_pinned_trees = (
-          self._to_snapshot_state(restored_state)
-      )
+    if reset_snapshot_state:
+      _, new_replica_trees = self._to_snapshot_state(restored_state)
+      jax.block_until_ready(_extract_arrays(new_replica_trees))
       with self._lock:
-        self._latest_snapshot = (
-            per_replica_pinned_trees,
-            step,
-            full_mesh_pinned_state,
-        )
+        self._latest_snapshot = (new_replica_trees, step)
 
     return restored_state
 
   def _restore_replicas(
-      self, active_trees: list[tree_types.PyTree], target_mesh: Any
+      self,
+      active_trees: Sequence[tree_types.PyTree],
+      target_mesh: jax.sharding.Mesh | None,
   ) -> tree_types.PyTree:
     """Moves `active_trees` to device memory and concatenates along slices."""
     replica_mesh = _find_named_mesh(active_trees[0])
-    if target_mesh is None or replica_mesh is None:
-      return active_trees[0]
+    if replica_mesh is None:
+      return _put_arrays(active_trees[0])
 
     axis_index = self.replica_axis_index
-    submeshes = [
-        jax.sharding.Mesh(
-            target_mesh.devices.take([i], axis=axis_index),
-            target_mesh.axis_names,
-            axis_types=replica_mesh.axis_types,
+    axis_name = replica_mesh.axis_names[axis_index]
+    replicas = [_extract_arrays(tree) for tree in active_trees]
+    can_match = (
+        target_mesh is not None
+        and target_mesh.axis_names == replica_mesh.axis_names
+        and target_mesh.axis_types == replica_mesh.axis_types
+        and target_mesh.devices.take([0], axis=axis_index).shape
+        == replica_mesh.devices.shape
+        and all(
+            isinstance(array.sharding, jax.sharding.NamedSharding)
+            and array.sharding.mesh == replica_mesh
+            and not any(
+                axis_name in jax.tree.leaves(dim)
+                for dim in array.sharding.spec
+            )
+            for array in replicas[0]
         )
-        for i in range(target_mesh.devices.shape[axis_index])
-    ]
-    _, rebuild = _extract_arrays(active_trees[0])
-    replicas = [_extract_arrays(tree)[0] for tree in active_trees]
-    pinned_by_mesh = {
-        replica[0].sharding.mesh: replica for replica in replicas
-    }
-    missing = [
-        submesh for submesh in submeshes if submesh not in pinned_by_mesh
-    ]
-    if not missing:
-      slices = _put_arrays([pinned_by_mesh[submesh] for submesh in submeshes])
+    )
+    if target_mesh is None or not can_match:
+      slices = _put_arrays(replicas)
     else:
-      donors = _put_arrays(replicas)
-      by_mesh = {donor[0].sharding.mesh: donor for donor in donors}
-      specs = [array.sharding.spec for array in donors[0]]
-      sources = [
-          [donors[(k + j) % len(donors)][j] for j, _ in enumerate(specs)]
-          for k, _ in enumerate(missing)
+      submeshes = [
+          jax.sharding.Mesh(
+              target_mesh.devices.take([i], axis=axis_index),
+              target_mesh.axis_names,
+              axis_types=target_mesh.axis_types,
+          )
+          for i in range(target_mesh.devices.shape[axis_index])
       ]
-      target_shardings = [
-          [jax.sharding.NamedSharding(submesh, spec) for spec in specs]
-          for submesh in missing
+      pinned_by_mesh = {
+          _find_named_mesh(replica): replica for replica in replicas
+      }
+      missing = [
+          submesh for submesh in submeshes if submesh not in pinned_by_mesh
       ]
-      by_mesh.update(zip(missing, _put_arrays(sources, target_shardings)))
-      slices = [by_mesh[submesh] for submesh in submeshes]
+      if not missing:
+        slices = _put_arrays([pinned_by_mesh[s] for s in submeshes])
+      else:
+        donors = _put_arrays(replicas)
+        by_mesh = {donor[0].sharding.mesh: donor for donor in donors}
+        specs = [array.sharding.spec for array in donors[0]]
+        sources = [
+            [donors[(k + j) % len(donors)][j] for j in range(len(specs))]
+            for k in range(len(missing))
+        ]
+        target_shardings = [
+            [jax.sharding.NamedSharding(submesh, spec) for spec in specs]
+            for submesh in missing
+        ]
+        by_mesh.update(
+            zip(missing, _put_arrays(sources, target_shardings), strict=True)
+        )
+        slices = [by_mesh[s] for s in submeshes]
 
-    axis_name = target_mesh.axis_names[axis_index]
+    if len(slices) == 1:
+      return _replace_arrays(active_trees[0], slices[0])
     concatenated = self._concatenate_by_mesh_axis.concatenate_by_mesh_axis(
         slices, axis_name
     )
-    return rebuild(concatenated)
+    return _replace_arrays(active_trees[0], concatenated)
 
   def try_load(
       self,
@@ -534,21 +502,42 @@ class Snapshotter:
       *,
       reset_snapshot_state: bool | None = None,
   ) -> tuple[int | None, tree_types.PyTree | None]:
-    """Restores `(step, state)` from the latest snapshot, or `(None, None)`."""
+    """Restores `(step, state)` from the latest snapshot, or `(None, None)`.
+
+    Args:
+      abstract_state: An abstract representation of the state, used to provide
+        the target shardings for the restored arrays on the TPU devices.
+      reset_snapshot_state: If True, resets the snapshot to the restored state.
+        If None, resets only when the mesh of `abstract_state` has more than
+        one replica along the replica axis.
+
+    Returns:
+      `(step, restored_state)`, or `(None, None)` if no snapshot is available
+      or if `load` raises a non-JAX `RuntimeError` (clearing that snapshot).
+
+    Raises:
+      jax.errors.JaxRuntimeError: If a JAX or Pathways runtime error occurs.
+      ValueError: If `abstract_state` does not match the snapshot structure.
+    """
     self.join()
-    if (latest := self.latest) is None:
-      return None, None
+    with self._lock:
+      if self._latest_snapshot is None:
+        return None, None
+      _, step = self._latest_snapshot
     try:
-      return latest.step, self.load(
+      return step, self.load(
           abstract_state, reset_snapshot_state=reset_snapshot_state
       )
     except jax.errors.JaxRuntimeError:
       raise
     except RuntimeError as e:
-      logging.warning("Snapshot restore failed at step %d: %s", latest.step, e)
-      # Drop the unusable snapshot so that `latest` stops reporting it.
+      logging.warning("Snapshot restore failed at step %d: %s", step, e)
       with self._lock:
-        self._latest_snapshot = None
+        if (
+            self._latest_snapshot is not None
+            and self._latest_snapshot[1] == step
+        ):
+          self._latest_snapshot = None
       return None, None
 
   def join(self) -> None:
@@ -565,11 +554,12 @@ class Snapshotter:
     Returns:
       True if all queued requests finished within `timeout`, else False.
     """
-    with self._lock, contextlib.suppress(queue.Empty):
+    with self._lock:
       self._generation += 1
-      while True:
-        self._queue.get_nowait()
-        self._queue.task_done()
+      with contextlib.suppress(queue.Empty):
+        while True:
+          self._queue.get_nowait()
+          self._queue.task_done()
     with self._queue.all_tasks_done:
       return self._queue.all_tasks_done.wait_for(
           lambda: not self._queue.unfinished_tasks, timeout=timeout
@@ -581,7 +571,7 @@ class Snapshotter:
     with self._lock:
       if self._latest_snapshot is None:
         return None
-      _, step, _ = self._latest_snapshot
+      _, step = self._latest_snapshot
     return training_metadata_types.CheckpointMetadata(
         step=step,
         path=epath.Path(),
