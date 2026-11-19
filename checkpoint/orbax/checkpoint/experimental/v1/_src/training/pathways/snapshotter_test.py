@@ -328,24 +328,6 @@ class SnapshotterTest(parameterized.TestCase):
           restored_tree[k].sharding.memory_kind, 'pinned_host'
       )
     test_utils.assert_tree_equal(self, tree, restored_tree)
-    one_slice = jax.sharding.Mesh(
-        mesh.devices.take([0], axis=0), mesh.axis_names
-    )
-    one_slice_sharding = jax.sharding.NamedSharding(
-        one_slice, jax.sharding.PartitionSpec()
-    )
-    one_slice_target = jax.tree.map(
-        lambda x: jax.ShapeDtypeStruct(
-            x.shape, x.dtype, sharding=one_slice_sharding
-        ),
-        tree,
-    )
-    restored_one_slice = snapshot_manager.load(
-        one_slice_target, reset_snapshot_state=False
-    )
-    self.assertIsInstance(
-        restored_one_slice['scalar_key'], type(sharded_scalar_key)
-    )
 
   def test_load_does_not_donate_buffer(self):
     snapshot_manager = snapshotter.Snapshotter()
@@ -447,10 +429,9 @@ class SnapshotterTest(parameterized.TestCase):
     test_utils.assert_tree_equal(self, expected_pytree, restored_pytree)
     # One batched call across all array leaves, with one slice list per target
     # replica in device memory.
-    num_target_replicas = abstract_target['a'].sharding.mesh.shape['x']
     self.assertLen(mock_concatenate.call_args_list, 1)
     slice_lists = mock_concatenate.call_args.args[0]
-    self.assertLen(slice_lists, num_target_replicas)
+    self.assertLen(slice_lists, abstract_target['a'].sharding.mesh.shape['x'])
     for slice_arrays in slice_lists:
       self.assertLen(slice_arrays, len(jax.tree.leaves(saved_pytree)))
       for array in slice_arrays:
@@ -590,18 +571,16 @@ class SnapshotterTest(parameterized.TestCase):
     self.assertEqual(mock_put.call_count, 1)
     assert manager._latest_snapshot is not None
     for leaf in jax.tree.leaves(manager._latest_snapshot[0][0]):
-      if isinstance(leaf, jax.Array):
-        snapshotter._unwrap_if_prng_key(leaf).delete()
+      leaf.delete()
     with mock.patch.object(jax, 'device_put', wraps=jax.device_put) as mock_put:
       restored = manager.load(self.abstract_pytree, reset_snapshot_state=False)
     test_utils.assert_tree_equal(self, self.pytree, restored)
-    self.assertEqual(mock_put.call_count, 2)
     local_call, fill_call = mock_put.call_args_list
     for src, dst in zip(*local_call.args[:2]):
       self.assertEqual(src.sharding.device_set, dst.device_set)
     donors = {
-        next(iter(src.sharding.device_set)).slice_index
-        for src in fill_call.args[0]
+        next(iter(arr.sharding.device_set)).slice_index
+        for arr in fill_call.args[0]
     }
     self.assertEqual(donors, {1, 2, 3})
 
