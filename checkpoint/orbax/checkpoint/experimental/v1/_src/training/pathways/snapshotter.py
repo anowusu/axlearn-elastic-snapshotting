@@ -480,15 +480,15 @@ class Snapshotter:
       replica_trees, step, _ = self._latest_snapshot
 
     def is_replica_active(replica_tree):
-      probe = next(
-          (
-              _unwrap_if_prng_key(x)[...]
-              for x in jax.tree.leaves(replica_tree)
-              if is_shardable_array(x)
-          ),
-          None,
-      )
       try:
+        probe = next(
+            (
+                _unwrap_if_prng_key(x)[...]
+                for x in jax.tree.leaves(replica_tree)
+                if is_shardable_array(x)
+            ),
+            None,
+        )
         if probe is not None:
           jax.block_until_ready(probe)
         return True
