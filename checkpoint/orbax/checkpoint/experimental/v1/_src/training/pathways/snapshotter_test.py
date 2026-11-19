@@ -327,6 +327,14 @@ class SnapshotterTest(parameterized.TestCase):
           restored_tree[k].sharding.memory_kind, 'pinned_host'
       )
     test_utils.assert_tree_equal(self, tree, restored_tree)
+    mesh_1 = jax.sharding.Mesh(mesh.devices[:1], mesh.axis_names)
+    sh_1 = jax.sharding.NamedSharding(mesh_1, jax.sharding.PartitionSpec())
+    abs_1 = {
+        k: jax.ShapeDtypeStruct(v.shape, v.dtype, sharding=sh_1)
+        for k, v in tree.items()
+    }
+    restored_1 = snapshot_manager.load(abs_1, reset_snapshot_state=False)
+    self.assertIsInstance(restored_1['scalar_key'], type(sharded_scalar_key))
 
   def test_load_does_not_donate_buffer(self):
     snapshot_manager = snapshotter.Snapshotter()

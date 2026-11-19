@@ -530,7 +530,7 @@ class Snapshotter:
         for idx, row in zip(missing, _put_arrays(srcs, dsts)):
           slice_hbm[idx] = row
       raw = [list(map(_unwrap_if_prng_key, sub)) for sub in slice_hbm]
-      joined = slice_hbm[0] if len(submeshes) == 1 else concat_fn(raw, axis)
+      joined = raw[0] if len(submeshes) == 1 else concat_fn(raw, axis)
       for i, arr, orig in zip(rep_idxs, joined, slice_hbm[0]):
         state_leaves[i] = _wrap_if_prng_key(arr, orig)
 
