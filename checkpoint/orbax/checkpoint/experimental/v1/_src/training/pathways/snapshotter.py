@@ -1,6 +1,6 @@
 """Manages asynchronous backups of JAX array states to pinned host memory."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 import contextlib
 import logging
 import queue
@@ -128,22 +128,31 @@ def _replicate_single_device_leaves(tree: Any) -> Any:
   if mesh is None:
     return tree
   replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-  targets = jax.tree.map(
-      lambda leaf: replicated
-      if is_shardable_array(leaf)
-      and isinstance(leaf.sharding, jax.sharding.SingleDeviceSharding)
-      else (leaf.sharding if is_shardable_array(leaf) else leaf),
-      tree,
-  )
-  return _put_arrays(tree, targets)
+
+  def _target(leaf: Any) -> Any:
+    if is_shardable_array(leaf) and isinstance(
+        leaf.sharding, jax.sharding.SingleDeviceSharding
+    ):
+      return replicated
+    return leaf
+
+  return _put_arrays(tree, jax.tree.map(_target, tree))
 
 
-def _is_replicated_on_axis(leaf: Any, axis: str | None) -> bool:
-  """Returns True if `leaf` has a `NamedSharding` not sharded along `axis`."""
-  sharding = getattr(leaf, "sharding", None)
-  return isinstance(sharding, jax.sharding.NamedSharding) and not (
-      axis and any(axis in jax.tree.leaves(dim) for dim in sharding.spec)
-  )
+def _extract_arrays(
+    tree: Any,
+) -> tuple[list[Any], Callable[[Sequence[Any]], Any]]:
+  """Unwraps `jax.Array` leaves of `tree` and returns `(arrays, rebuild_fn)`."""
+  leaves, tree_def = jax.tree.flatten(tree)
+  indices = [i for i, leaf in enumerate(leaves) if is_shardable_array(leaf)]
+
+  def rebuild(arrays: Sequence[Any]) -> Any:
+    restored = list(leaves)
+    for i, array in zip(indices, arrays):
+      restored[i] = _wrap_if_prng_key(array, leaves[i])
+    return jax.tree.unflatten(tree_def, restored)
+
+  return [_unwrap_if_prng_key(leaves[i]) for i in indices], rebuild
 
 
 def _get_pathwaysutils():
@@ -266,54 +275,36 @@ class Snapshotter:
       non-array leaves (e.g., scalars, strings, metadata, Python objects) are
       preserved.
     """
-    replicated = _replicate_single_device_leaves(state)
-    leaves, tree_def = jax.tree_util.tree_flatten(replicated)
-    idxs = [i for i, leaf in enumerate(leaves) if is_shardable_array(leaf)]
-    if not idxs:
+    arrays, rebuild = _extract_arrays(_replicate_single_device_leaves(state))
+    if not arrays:
       return state, [state]
-    raw = [_unwrap_if_prng_key(leaves[i]) for i in idxs]
-    pinned = jax.device_put(
-        raw,
-        [arr.sharding.with_memory_kind("pinned_host") for arr in raw],
-        may_alias=may_alias,
-    )
-    by_mesh: dict[Any, list[int]] = {}
+    axis = ""
     counts = set()
-    for j, array in enumerate(pinned):
+    for array in arrays:
       mesh = getattr(array.sharding, "mesh", None)
-      ax = mesh.axis_names[self.replica_axis_index] if mesh is not None else ""
-      count = mesh.shape[ax] if mesh is not None else 1
-      counts.add(count)
-      if count > 1:
-        by_mesh.setdefault(mesh, []).append(j)
+      axis = mesh.axis_names[self.replica_axis_index] if mesh else ""
+      if axis and any(
+          axis in jax.tree.leaves(dim) for dim in array.sharding.spec
+      ):
+        raise ValueError(
+            f"Arrays sharded along replica axis {axis!r} cannot be snapshotted."
+        )
+      counts.add(mesh.shape[axis] if mesh else 1)
     if len(counts) > 1:
       raise ValueError(
           "All JAX arrays must have the same number of replicas along the"
           f" replica axis, got {sorted(counts)}."
       )
-    per_replica = [list(pinned) for _ in range(next(iter(counts)))]
-    split_fn = self._split_by_mesh_axis.split_by_mesh_axis
-    for mesh, pos in by_mesh.items():
-      axis = mesh.axis_names[self.replica_axis_index]
-      for k, row in enumerate(split_fn([pinned[j] for j in pos], axis)):
-        for j, rep in zip(pos, row):
-          per_replica[k][j] = rep
-    per_replica_pinned_trees = []
-    for row in per_replica:
-      rep_leaves = list(leaves)
-      for i, rep in zip(idxs, row):
-        rep_leaves[i] = _wrap_if_prng_key(rep, leaves[i])
-      per_replica_pinned_trees.append(
-          jax.tree_util.tree_unflatten(tree_def, rep_leaves)
-      )
-
-    full_mesh_leaves = list(leaves)
-    for i, arr in zip(idxs, pinned):
-      full_mesh_leaves[i] = _wrap_if_prng_key(arr, leaves[i])
-    full_mesh_pinned_state = jax.tree_util.tree_unflatten(
-        tree_def, full_mesh_leaves
+    pinned = jax.device_put(
+        arrays,
+        [array.sharding.with_memory_kind("pinned_host") for array in arrays],
+        may_alias=may_alias,
     )
-    return full_mesh_pinned_state, per_replica_pinned_trees
+    pinned_state = rebuild(pinned)
+    if counts == {1}:
+      return pinned_state, [pinned_state]
+    replicas = self._split_by_mesh_axis.split_by_mesh_axis(pinned, axis)
+    return pinned_state, [rebuild(replica) for replica in replicas]
 
   def _enqueue_snapshot(
       self, step: int, state: tree_types.PyTree, copy_on_device: bool = False
@@ -409,6 +400,71 @@ class Snapshotter:
       pinned_state = state
     return checkpointer_save_fn(pinned_state)
 
+  def _restore_on_mesh(
+      self,
+      active_trees: Sequence[tree_types.PyTree],
+      mesh: jax.sharding.Mesh,
+      rep_mesh: jax.sharding.Mesh,
+  ) -> tree_types.PyTree | None:
+    """Restores `active_trees` onto `mesh`, or None if slice meshes differ."""
+    if rep_mesh.axis_names != mesh.axis_names:
+      return None
+    axis = mesh.axis_names[self.replica_axis_index]
+    submeshes = [
+        jax.sharding.Mesh(
+            mesh.devices.take([k], axis=self.replica_axis_index),
+            mesh.axis_names,
+            axis_types=rep_mesh.axis_types,
+        )
+        for k in range(mesh.shape[axis])
+    ]
+    if rep_mesh.axis_sizes != submeshes[0].axis_sizes:
+      return None
+
+    # TODO(b/574655289): Keep cross-slice transfers in device memory and copy
+    # before `concatenate_by_mesh_axis` (which donates inputs) for retry safety.
+    _, rebuild = _extract_arrays(active_trees[0])
+    replicas = [_extract_arrays(tree)[0] for tree in active_trees]
+    if not replicas[0]:
+      return None
+    by_devices = {
+        tuple(replica[0].sharding.mesh.devices.flat): i
+        for i, replica in enumerate(replicas)
+    }
+    matched = [by_devices.get(tuple(sub.devices.flat)) for sub in submeshes]
+    missing = [sub for sub, donor in zip(submeshes, matched) if donor is None]
+    donors = [donor for donor in matched if donor is not None]
+    if missing:
+      donors = list(range(len(replicas)))
+    on_device = dict(
+        zip(donors, _put_arrays([replicas[donor] for donor in donors]))
+    )
+    filled = iter(())
+    if missing:
+      srcs = [
+          [
+              on_device[donors[(k + j) % len(donors)]][j]
+              for j in range(len(replicas[0]))
+          ]
+          for k in range(len(missing))
+      ]
+      dsts = [
+          [
+              jax.sharding.NamedSharding(sub, array.sharding.spec)
+              for array in replicas[0]
+          ]
+          for sub in missing
+      ]
+      filled = iter(_put_arrays(srcs, dsts))
+    per_slice = [
+        next(filled) if donor is None else on_device[donor]
+        for donor in matched
+    ]
+    if len(submeshes) == 1:
+      return rebuild(per_slice[0])
+    concat_fn = self._concatenate_by_mesh_axis.concatenate_by_mesh_axis
+    return rebuild(concat_fn(per_slice, axis))
+
   def load(
       self,
       abstract_state: tree_types.PyTree,
@@ -441,8 +497,9 @@ class Snapshotter:
 
     def is_replica_active(replica_tree):
       try:
-        leaves = jax.tree.leaves(replica_tree)
-        probe = next(filter(is_shardable_array, leaves), None)
+        probe = next(
+            filter(is_shardable_array, jax.tree.leaves(replica_tree)), None
+        )
         if probe is not None:
           jax.block_until_ready(_unwrap_if_prng_key(probe)[...])
         return True
@@ -452,105 +509,28 @@ class Snapshotter:
     active_trees = [tree for tree in replica_trees if is_replica_active(tree)]
     if not active_trees:
       raise RuntimeError("No active replicas found.")
-
-    abs_leaves, tree_def = jax.tree.flatten(abstract_state)
-    if any(jax.tree.structure(tree) != tree_def for tree in active_trees):
+    if jax.tree.structure(active_trees[0]) != jax.tree.structure(
+        abstract_state
+    ):
       raise ValueError("Snapshot PyTree structure does not match target.")
-    reps_flat = [jax.tree.flatten(tree)[0] for tree in active_trees]
+
     mesh = _find_named_mesh(abstract_state)
-    axis = mesh.axis_names[self.replica_axis_index] if mesh else None
-    rep_idxs = [
-        i
-        for i, abs_leaf in enumerate(abs_leaves)
-        if is_shardable_array(reps_flat[0][i])
-        and _is_replicated_on_axis(abs_leaf, axis)
-        and abs_leaf.sharding.mesh == mesh
-        and all(_is_replicated_on_axis(rep[i], axis) for rep in reps_flat)
-    ]
-
-    # TODO(b/574655289): Keep cross-slice transfers in device memory and copy
-    # before `concatenate_by_mesh_axis` (which donates inputs) for retry safety.
-    submeshes, matched, missing, same_sub = [], [], [], False
-    if rep_idxs and mesh is not None and axis is not None:
-      rep_mesh = reps_flat[0][rep_idxs[0]].sharding.mesh
-      same_names = rep_mesh.axis_names == mesh.axis_names
-      submeshes = [
-          jax.sharding.Mesh(
-              mesh.devices.take([k], axis=self.replica_axis_index),
-              mesh.axis_names,
-              axis_types=rep_mesh.axis_types if same_names else mesh.axis_types,
-          )
-          for k in range(mesh.shape[axis])
-      ]
-      same_sub = same_names and rep_mesh.axis_sizes == submeshes[0].axis_sizes
-      by_devs = {
-          tuple(rep[rep_idxs[0]].sharding.mesh.devices.flat): idx
-          for idx, rep in enumerate(reps_flat)
-          if same_sub
-      }
-      matched = [by_devs.get(tuple(sub.devices.flat)) for sub in submeshes]
-      missing = [k for k, donor in enumerate(matched) if donor is None]
-
-    pure_rep = len(rep_idxs) == sum(map(is_shardable_array, reps_flat[0]))
-    all_reps = list(range(len(active_trees)))
-    found = [donor for donor in matched if donor is not None]
-    donors = found if submeshes and not missing and pure_rep else all_reps
-    dev_trees = _put_arrays([active_trees[donor] for donor in donors])
-    dev_flat = [jax.tree.flatten(tree)[0] for tree in dev_trees]
-    by_donor = dict(zip(donors, dev_flat))
-    state_leaves = list(dev_flat[0])
-    rep_set = set(rep_idxs)
-    concat_fn = self._concatenate_by_mesh_axis.concatenate_by_mesh_axis
-
-    if submeshes and axis is not None:
-      slice_hbm = [
-          [by_donor[donor][i] for i in rep_idxs] if donor is not None else []
-          for donor in matched
-      ]
-      if missing:
-        srcs = [
-            [
-                by_donor[donors[(k + j) % len(donors)]][i]
-                for j, i in enumerate(rep_idxs)
-            ]
-            for k in range(len(missing))
-        ]
-        specs = [
-            (reps_flat[0][i] if same_sub else abs_leaves[i]).sharding.spec
-            for i in rep_idxs
-        ]
-        dsts = [
-            [jax.sharding.NamedSharding(submeshes[idx], spec) for spec in specs]
-            for idx in missing
-        ]
-        for idx, row in zip(missing, _put_arrays(srcs, dsts)):
-          slice_hbm[idx] = row
-      raw = [list(map(_unwrap_if_prng_key, sub)) for sub in slice_hbm]
-      joined = raw[0] if len(submeshes) == 1 else concat_fn(raw, axis)
-      for i, arr, orig in zip(rep_idxs, joined, slice_hbm[0]):
-        state_leaves[i] = _wrap_if_prng_key(arr, orig)
-
-    for i, abs_leaf in enumerate(abs_leaves):
-      if i in rep_set or not is_shardable_array(state_leaves[i]):
-        continue
-      reps = [row[i] for row in dev_flat]
-      if isinstance(abs_leaf.sharding, jax.sharding.SingleDeviceSharding):
-        dev_set = abs_leaf.sharding.device_set
-        matches = [rep for rep in reps if dev_set <= rep.sharding.device_set]
-        state_leaves[i] = matches[0] if matches else reps[0]
-      else:
-        sh_axis = abs_leaf.sharding.mesh.axis_names[self.replica_axis_index]
-        cat = concat_fn([_unwrap_if_prng_key(rep) for rep in reps], sh_axis)
-        state_leaves[i] = _wrap_if_prng_key(cat, reps[0])
-
+    rep_mesh = _find_named_mesh(active_trees[0])
+    device_state = None
+    if mesh is not None and rep_mesh is not None:
+      device_state = self._restore_on_mesh(active_trees, mesh, rep_mesh)
     restored_state = _put_arrays(
-        jax.tree.unflatten(tree_def, state_leaves), abstract_state
+        active_trees[0] if device_state is None else device_state,
+        abstract_state,
     )
     unwrapped_restored = jax.tree.map(_unwrap_if_prng_key, restored_state)
     jax.block_until_ready(unwrapped_restored)
 
     if (should_reset := reset_snapshot_state) is None:
-      should_reset = bool(mesh and axis and mesh.shape[axis] > 1)
+      mesh = _find_named_mesh(abstract_state)
+      should_reset = bool(
+          mesh and mesh.shape[mesh.axis_names[self.replica_axis_index]] > 1
+      )
     if should_reset:
       full_mesh_pinned_state, per_replica_pinned_trees = (
           self._to_snapshot_state(restored_state)

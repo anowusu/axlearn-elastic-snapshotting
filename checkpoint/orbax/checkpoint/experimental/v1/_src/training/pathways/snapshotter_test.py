@@ -83,7 +83,6 @@ class SnapshotterTest(parameterized.TestCase):
 
   @parameterized.named_parameters(
       dict(testcase_name='0', replica_axis_index=0),
-      dict(testcase_name='1', replica_axis_index=1),
   )
   def test_save_restore_pytree(self, replica_axis_index):
     snapshot_manager = snapshotter.Snapshotter(
@@ -117,6 +116,8 @@ class SnapshotterTest(parameterized.TestCase):
       self.assertNotEqual(x.sharding.memory_kind, 'pinned_host')
 
     jax.tree.map(assert_not_pinned_host, restored_pytree)
+    with self.assertRaisesRegex(ValueError, "replica axis 'y'"):
+      snapshotter.Snapshotter(replica_axis_index=1).save(0, self.pytree)
 
   def test_scale_down(self):
     snapshot_manager = snapshotter.Snapshotter()
@@ -327,14 +328,24 @@ class SnapshotterTest(parameterized.TestCase):
           restored_tree[k].sharding.memory_kind, 'pinned_host'
       )
     test_utils.assert_tree_equal(self, tree, restored_tree)
-    mesh_1 = jax.sharding.Mesh(mesh.devices[:1], mesh.axis_names)
-    sh_1 = jax.sharding.NamedSharding(mesh_1, jax.sharding.PartitionSpec())
-    abs_1 = {
-        k: jax.ShapeDtypeStruct(v.shape, v.dtype, sharding=sh_1)
-        for k, v in tree.items()
-    }
-    restored_1 = snapshot_manager.load(abs_1, reset_snapshot_state=False)
-    self.assertIsInstance(restored_1['scalar_key'], type(sharded_scalar_key))
+    one_slice = jax.sharding.Mesh(
+        mesh.devices.take([0], axis=0), mesh.axis_names
+    )
+    one_slice_sharding = jax.sharding.NamedSharding(
+        one_slice, jax.sharding.PartitionSpec()
+    )
+    one_slice_target = jax.tree.map(
+        lambda x: jax.ShapeDtypeStruct(
+            x.shape, x.dtype, sharding=one_slice_sharding
+        ),
+        tree,
+    )
+    restored_one_slice = snapshot_manager.load(
+        one_slice_target, reset_snapshot_state=False
+    )
+    self.assertIsInstance(
+        restored_one_slice['scalar_key'], type(sharded_scalar_key)
+    )
 
   def test_load_does_not_donate_buffer(self):
     snapshot_manager = snapshotter.Snapshotter()
