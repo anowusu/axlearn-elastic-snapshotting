@@ -72,14 +72,6 @@ def _copy_arrays(state: tree_types.PyTree) -> tree_types.PyTree:
   return jax.tree.map(_copy_leaf, state)
 
 
-def _has_sharding_without_mesh(leaf: Any) -> bool:
-  """Returns True if `leaf` has a JAX `Sharding` without a `Mesh`."""
-  sharding = getattr(leaf, "sharding", None)
-  return isinstance(sharding, jax.sharding.Sharding) and not hasattr(
-      sharding, "mesh"
-  )
-
-
 def _find_named_mesh(tree: Any) -> Any:
   """Returns the mesh of the first `NamedSharding` leaf in `tree`, or None."""
   for leaf in jax.tree.leaves(tree):
@@ -97,18 +89,21 @@ def _put_arrays(state: Any, target: Any = None) -> Any:
     raise ValueError("Snapshot PyTree structure does not match target.")
   idxs, curr, shardings = [], [], []
   for i, (leaf, target_leaf) in enumerate(zip(leaves, targets)):
-    sharding = (
-        leaf.sharding.with_memory_kind(None)
-        if target is None and is_shardable_array(leaf)
-        else getattr(target_leaf, "sharding", target_leaf)
-    )
-    if is_shardable_array(leaf) and isinstance(sharding, jax.sharding.Sharding):
-      shape = None if target is None else getattr(target_leaf, "shape", None)
-      if shape is not None and tuple(shape) != leaf.shape:
+    if not is_shardable_array(leaf):
+      continue
+    if target is None:
+      sharding = leaf.sharding.with_memory_kind(None)
+    elif isinstance(target_leaf, jax.sharding.Sharding):
+      sharding = target_leaf
+    else:
+      if tuple(target_leaf.shape) != leaf.shape:
         raise RuntimeError("Restored replica shape mismatch.")
-      idxs.append(i)
-      curr.append(_unwrap_if_prng_key(leaf))
-      shardings.append(sharding)
+      sharding = target_leaf.sharding
+      if not isinstance(sharding, jax.sharding.Sharding):
+        raise TypeError(f"Expected jax.sharding.Sharding, got {sharding!r}.")
+    idxs.append(i)
+    curr.append(_unwrap_if_prng_key(leaf))
+    shardings.append(sharding)
   stage1 = [
       arr.sharding.with_memory_kind(None)
       if arr.sharding != dst and arr.sharding.memory_kind == "pinned_host"
@@ -135,8 +130,9 @@ def _replicate_single_device_leaves(tree: Any) -> Any:
   replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
   targets = jax.tree.map(
       lambda leaf: replicated
-      if is_shardable_array(leaf) and _has_sharding_without_mesh(leaf)
-      else leaf,
+      if is_shardable_array(leaf)
+      and isinstance(leaf.sharding, jax.sharding.SingleDeviceSharding)
+      else (leaf.sharding if is_shardable_array(leaf) else leaf),
       tree,
   )
   return _put_arrays(tree, targets)
@@ -535,16 +531,11 @@ class Snapshotter:
         state_leaves[i] = _wrap_if_prng_key(arr, orig)
 
     for i, abs_leaf in enumerate(abs_leaves):
-      sharding = getattr(abs_leaf, "sharding", None)
-      if (
-          i in rep_set
-          or not is_shardable_array(state_leaves[i])
-          or not isinstance(sharding, jax.sharding.Sharding)
-      ):
+      if i in rep_set or not is_shardable_array(state_leaves[i]):
         continue
       reps = [row[i] for row in dev_flat]
-      if _has_sharding_without_mesh(abs_leaf):
-        dev_set = sharding.device_set
+      if isinstance(abs_leaf.sharding, jax.sharding.SingleDeviceSharding):
+        dev_set = abs_leaf.sharding.device_set
         matches = [rep for rep in reps if dev_set <= rep.sharding.device_set]
         state_leaves[i] = matches[0] if matches else reps[0]
       else:

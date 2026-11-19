@@ -568,6 +568,8 @@ class SnapshotterTest(parameterized.TestCase):
     mock_wrap_key_data.assert_called()
     for call in mock_wrap_key_data.call_args_list:
       self.assertNotIn('dtype', call.kwargs)
+    with self.assertRaises(AttributeError):
+      manager.load({**abstract_state, 'key': SimpleNamespace(shape=())})
 
   def test_load_preserves_slice_locality_and_stripes_donors(self):
     manager = snapshotter.Snapshotter()
