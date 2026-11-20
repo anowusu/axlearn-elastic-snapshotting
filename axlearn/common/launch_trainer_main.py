@@ -13,6 +13,13 @@ def main(_):
     launch.setup()
     trainer_config = launch_trainer.get_trainer_config()
     trainer_config.set(recorder=config_for_function(lambda: measurement.global_recorder))
+    if hasattr(trainer_config.checkpointer, "logger") and hasattr(
+        measurement.global_recorder, "checkpoint_logger"
+    ):
+        # Log checkpoint statistics to the goodput log, so that they count as checkpoint badput.
+        trainer_config.checkpointer.logger = config_for_function(
+            lambda: measurement.global_recorder.checkpoint_logger()
+        )
     measurement.start_monitoring()
     launch_trainer.run_trainer(trainer_config)
 

@@ -2,7 +2,9 @@
 
 ARG TARGET=base
 ARG BASE_IMAGE=ubuntu:24.04
-ARG BASE_IMAGE_COLOCATED=us-docker.pkg.dev/cloud-tpu-v2-images/pathways-colocated-python/sidecar:2026_02_09-python_3.12-jax_0.8.3
+ARG BASE_IMAGE_COLOCATED=us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/colocated_python_image:20261120-python_3.12-jax_0.8.3-cancel-fix-v2@sha256:e1f358c1d2a2376d6e1f94202c0b34f7c9ca05d6350f7d3da25cc9a4ae49c798
+ARG ORBAX_CHECKPOINT_GIT="orbax-checkpoint @ https://github.com/anowusu/axlearn-elastic-snapshotting/archive/refs/tags/orbax-v0.12.10-snapshotter10.tar.gz#subdirectory=checkpoint"
+ARG PATHWAYSUTILS_GIT="pathwaysutils @ https://github.com/anowusu/axlearn-elastic-snapshotting/archive/refs/tags/pathwaysutils-v0.1.14-elastic3-cand.tar.gz"
 
 FROM ${BASE_IMAGE} AS base
 
@@ -72,12 +74,15 @@ ENTRYPOINT ["/opt/apache/beam/boot"]
 FROM base AS tpu
 
 ARG EXTRAS=
+ARG ORBAX_CHECKPOINT_GIT
+ARG PATHWAYSUTILS_GIT
 
 # Ensure we install the TPU version, even if building locally.
 # Jax will fallback to CPU when run on a machine without TPU.
 COPY pyproject.toml README.md /root/
-RUN uv pip install -qq --prerelease=allow .[core,tpu] && uv cache clean
+RUN uv pip install -qq --prerelease=allow .[core,tpu,orbax] && uv cache clean
 RUN if [ -n "$EXTRAS" ]; then uv pip install -qq .[$EXTRAS] && uv cache clean; fi
+RUN uv pip install --no-deps "${PATHWAYSUTILS_GIT}" "${ORBAX_CHECKPOINT_GIT}" && uv cache clean
 COPY . .
 
 ################################################################################
@@ -85,6 +90,9 @@ COPY . .
 ################################################################################
 
 FROM ${BASE_IMAGE_COLOCATED} AS colocated-python
+
+ARG ORBAX_CHECKPOINT_GIT
+ARG PATHWAYSUTILS_GIT
 
 WORKDIR /app
 COPY . .
@@ -95,7 +103,9 @@ RUN \
     # 1. Install user-provided dependencies with modified constraints
     grep -v "^numpy" /opt/venv/server_constraints.txt | grep -v "^scipy" > /tmp/modified_constraints.txt && \
     echo "--> Installing user-provided dependencies..." && \
-    uv pip install ".[core,gcp]" -c /tmp/modified_constraints.txt && \
+    # fastapi and uvicorn: imported by pathwaysutils, which is installed without dependencies below.
+    uv pip install ".[core,gcp,orbax]" fastapi uvicorn -c /tmp/modified_constraints.txt && \
+    uv pip install --no-deps "${PATHWAYSUTILS_GIT}" "${ORBAX_CHECKPOINT_GIT}" && \
     \
     # 2. Override numpy and scipy with specific versions
     uv pip install numpy==2.1.1 scipy==1.15.3 && \
