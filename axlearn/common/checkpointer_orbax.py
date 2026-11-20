@@ -12,6 +12,7 @@ See also checkpointer.py for other checkpointing utilities and checkpointer_test
 """
 
 import asyncio
+import contextlib
 import copy
 import dataclasses
 import functools
@@ -23,9 +24,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import jax
 import numpy as np
 import orbax.checkpoint as ocp
+import pathwaysutils
 import tensorflow as tf
 from absl import logging
 from etils import epath
+from orbax.checkpoint import pathways as orbax_pathways
 from orbax.checkpoint._src.metadata import array_metadata_store as array_metadata_store_lib
 from orbax.checkpoint._src.serialization.type_handlers import ArrayHandler
 from orbax.checkpoint.checkpoint_manager import CheckpointInfo, _ShouldSaveFnPolicy
@@ -42,7 +45,7 @@ from axlearn.common.checkpointer import (
     maybe_restore_python_savables,
     maybe_save_python_savables,
 )
-from axlearn.common.config import config_class
+from axlearn.common.config import InstantiableConfig, config_class, maybe_instantiate
 from axlearn.common.module import Module
 from axlearn.common.utils import Nested, Tensor, TensorSpec
 
@@ -250,6 +253,15 @@ if _GRAIN_INSTALLED:
     )
 
 
+def _iterator_restore_arg(x: Any) -> Optional[ocp.RestoreArgs]:
+    """Returns the Orbax `RestoreArgs` for dataset iterator leaves, or None."""
+    if isinstance(x, tf.data.Iterator):
+        return _TfIteratorHandler.RestoreArgs(item=x)
+    if _GRAIN_INSTALLED and isinstance(x, _GrainIterator):
+        return _GrainDatasetIteratorHandler.RestoreArgs(item=x)
+    return None
+
+
 class _CheckpointManagerWithTrackerFile(ocp.CheckpointManager):
     # pylint: disable=line-too-long
     """
@@ -368,6 +380,12 @@ class OrbaxCheckpointer(BaseCheckpointer):
         skip_uncommitted_checkpoint: bool = True
         # Read only the latest checkpoint recorded in the tracker file if set to `True`
         read_latest_checkpoint_from_tracker_file: bool = False
+        # If set, GCS checkpoints are renamed into this path, relative to the bucket root, instead
+        # of being deleted, and something else must empty it. See `ocp.CheckpointManagerOptions`.
+        todelete_full_path: Optional[str] = None
+        # Optional Orbax Pathways Snapshotter config for host-RAM snapshots.
+        snapshotter: Optional[InstantiableConfig[Any]] = None
+        snapshot_every_n_steps: int = 5
 
     @classmethod
     def checkpoint_paths(cls, base_dir: str) -> List[str]:
@@ -431,6 +449,30 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
             return is_save
 
+        self._save_fn_with_summaries = save_fn_with_summaries
+        self.snapshotter = maybe_instantiate(cfg.snapshotter)
+        self._create_manager()
+
+    def _snapshot_iterators(self, state: Nested[Any]) -> Nested[Any]:
+        # pylint: disable-next=protected-access
+        return jax.tree.map(lambda x: x._save().numpy() if _iterator_restore_arg(x) else x, state)
+
+    def _restore_snapshot_iterators(self, snap: Nested[Any], target: Nested[Any]) -> Nested[Any]:
+        def _restore_leaf(saved: Any, live: Any) -> Any:
+            if _iterator_restore_arg(live):
+                live._restore(saved)  # pylint: disable=protected-access
+                return live
+            return saved
+
+        return jax.tree.map(_restore_leaf, snap, target)
+
+    def _create_manager(self):
+        cfg: OrbaxCheckpointer.Config = self.config
+        if pathwaysutils.is_pathways_backend_used():
+            orbax_pathways.register_type_handlers(
+                checkpointing_impl=orbax_pathways.CheckpointingImpl.COLOCATED_PYTHON,
+                enable_write_sharding_file=False,
+            )
         CheckpointManager = (  # pylint: disable=invalid-name
             _CheckpointManagerWithTrackerFile
             if cfg.read_latest_checkpoint_from_tracker_file
@@ -444,17 +486,18 @@ class OrbaxCheckpointer(BaseCheckpointer):
                 keep_period=cfg.keep_period,
                 enable_async_checkpointing=True,
                 step_name_format=self._name_format,
-                should_save_fn=save_fn_with_summaries,
+                should_save_fn=self._save_fn_with_summaries,
                 enable_background_delete=True,
+                todelete_full_path=cfg.todelete_full_path,
                 async_options=ocp.options.AsyncOptions(
                     timeout_secs=cfg.async_timeout_secs,
                     create_directories_asynchronously=False,
                 ),
                 # Explicitly wrapped in `_ShouldSaveFnPolicy`, otherwise
                 # `PreemptionCheckpointingPolicy` is auto injected
-                save_decision_policy=_ShouldSaveFnPolicy(save_fn_with_summaries),
+                save_decision_policy=_ShouldSaveFnPolicy(self._save_fn_with_summaries),
                 lightweight_initialize=True,
-                cleanup_tmp_directories=True,
+                cleanup_tmp_directories=not hasattr(self, "_manager"),
             ),
             item_handlers={
                 # NOTE: we make a relatively weak assumption that index files are JSON serialized
@@ -469,6 +512,15 @@ class OrbaxCheckpointer(BaseCheckpointer):
                 ),
             },
         )
+
+    def _save_snapshot(self, step: int, state: Nested[Any], *, wait: bool = True) -> None:
+        if (snap := self.snapshotter) is not None:
+            snap.join()
+            s, n = getattr(snap.latest, "step", None), self.config.snapshot_every_n_steps
+            if s is not None and n > 0 and s < step - n:
+                jax.block_until_ready(state)
+            if s != step:
+                snap.save(step, self._snapshot_iterators(state), wait=wait)
 
     def _get_spec(self, *, step: int, state: Nested[Any]) -> Nested[Any]:
         spec = {"index": [("step", step)]}
@@ -507,6 +559,17 @@ class OrbaxCheckpointer(BaseCheckpointer):
         self._eval_summaries = copy.deepcopy(evaler_summaries or {})
 
         try:
+            if self.snapshotter is not None:
+                if not self._manager.should_save(step):
+                    n = self.config.snapshot_every_n_steps
+                    if self.snapshotter.latest is None or (n > 0 and step > 0 and step % n == 0):
+                        self._save_snapshot(step, state, wait=self.snapshotter.latest is None)
+                    return
+                self._manager.wait_until_finished()
+                pinned = self.snapshotter.save(step, self._snapshot_iterators(state), wait=True)
+                state = jax.tree.map(
+                    lambda p, v: v if _iterator_restore_arg(v) else p, pinned, state
+                )
             # Note that save() waits for prior serialization to finish.
             self._manager.save(
                 step=step,
@@ -525,6 +588,11 @@ class OrbaxCheckpointer(BaseCheckpointer):
             if self._manager.reached_preemption(step):
                 self._manager.wait_until_finished()
                 raise SystemExit(f"Exiting after saving checkpoint at {step=} due to pre-emption.")
+        except jax.errors.JaxRuntimeError as e:
+            if "SidecarSession is cancelled" not in str(e):
+                raise
+            logging.warning("Cancelled interrupted async checkpoint save: %s", e)
+            self.cancel()
         finally:
             self._eval_summaries = None
 
@@ -537,6 +605,13 @@ class OrbaxCheckpointer(BaseCheckpointer):
         """See `BaseCheckpointer.restore` for details."""
 
         cfg: OrbaxCheckpointer.Config = self.config
+
+        if step is None and self.snapshotter is not None:
+            latest_ckpt = self._manager.latest_step()
+            snap_step, snap_state = self.snapshotter.try_load(state)
+            if snap_step is not None and (latest_ckpt is None or snap_step >= latest_ckpt):
+                logging.info("[ELASTIC] Restored trainer_state from snapshot at step=%s", snap_step)
+                return snap_step, self._restore_snapshot_iterators(snap_state, state)
 
         def _restore_args(x: Any) -> ocp.RestoreArgs:
             if isinstance(x, (Tensor, TensorSpec)):
@@ -565,12 +640,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
                         ),
                     )
                 return arg
-            elif isinstance(x, tf.data.Iterator):
-                return _TfIteratorHandler.RestoreArgs(item=x)
-            elif _GRAIN_INSTALLED and isinstance(x, _GrainIterator):
-                return _GrainDatasetIteratorHandler.RestoreArgs(item=x)
-            else:
-                return None
+            return _iterator_restore_arg(x)
 
         restore_args = jax.tree.map(_restore_args, state)
 
@@ -605,14 +675,30 @@ class OrbaxCheckpointer(BaseCheckpointer):
             target_structure=self._get_spec(step=step, state=state)["index"],
             validation=cfg.validation_type,
         )
+        if step is not None:
+            self._save_snapshot(step, restored_state)
         return step, restored_state
 
     def wait_until_finished(self):
         """See `BaseCheckpointer.wait_until_finished` docstring for details."""
         self._manager.wait_until_finished()
 
+    def cancel(self, *, recreate: bool = True):
+        """Cancels pending snapshots/saves and optionally recreates the checkpoint manager."""
+        if self.snapshotter is not None:
+            self.snapshotter.cancel_pending()
+        for fn in (self._manager.cancel, self._manager.close):
+            with contextlib.suppress(Exception):
+                fn()
+        if recreate:
+            self._create_manager()
+
     def stop(self, *, has_exception: bool = False):
         """See `BaseCheckpointer.stop` for details."""
+        if has_exception:
+            return self.cancel(recreate=False)
+        if self.snapshotter is not None:
+            self.snapshotter.join()
         self._manager.close()
 
 
