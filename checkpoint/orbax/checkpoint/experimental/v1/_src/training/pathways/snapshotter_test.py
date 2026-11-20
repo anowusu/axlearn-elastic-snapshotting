@@ -582,16 +582,23 @@ class SnapshotterTest(parameterized.TestCase):
     assert restored is not None
     self.assertEqual(step, 5)
     self.assertEqual(restored['i'], {'k': 9})
-    with self.assertRaisesRegex(ValueError, 'structure does not match'):
+    with self.assertRaises(ValueError):
       manager.try_load({'a': self.abstract_pytree['a']})
     assert manager.latest is not None
     self.assertEqual(manager.latest.step, 5)
     bad_shape = jax.ShapeDtypeStruct(
         (99,), np.float32, sharding=self.abstract_pytree['a'].sharding
     )
-    self.assertEqual(
-        manager.try_load({'a': bad_shape, 'i': {'k': 0}}), (None, None)
-    )
+    with self.assertRaisesRegex(ValueError, 'shape mismatch'):
+      manager.try_load({'a': bad_shape, 'i': {'k': 0}})
+    assert manager.latest is not None
+    self.assertEqual(manager.latest.step, 5)
+    assert manager._latest_snapshot is not None
+    for replica_tree in manager._latest_snapshot[0]:
+      for leaf in jax.tree.leaves(replica_tree):
+        if snapshotter.is_shardable_array(leaf):
+          leaf.delete()
+    self.assertEqual(manager.try_load(target), (None, None))
     self.assertIsNone(manager.latest)
 
   def test_cancel_pending_discards_queued_and_in_flight_snapshots(self):
@@ -612,9 +619,9 @@ class SnapshotterTest(parameterized.TestCase):
       manager.save(6, self.pytree)
       self.assertTrue(started.wait(timeout=5.0))
       manager.save(7, self.pytree)
-      self.assertFalse(manager.cancel_pending(0.0))
+      manager.cancel_pending()
       release.set()
-      self.assertTrue(manager.cancel_pending(None))
+      manager.join()
     assert manager.latest is not None
     self.assertEqual(manager.latest.step, 5)
 
@@ -655,62 +662,37 @@ class SnapshotterTest(parameterized.TestCase):
     ):
       np.testing.assert_array_equal(expected, actual)
 
-  def test_save_blocking_and_checkpointer_sharing(self):
+  def test_save_blocking_returns_pinned_host_state(self):
     manager = snapshotter.Snapshotter()
     scalar = jax.device_put(
         1, jax.sharding.SingleDeviceSharding(jax.devices()[0])
     )
     iterator = object()
     state = {'a': self.pytree['a'], 'it': iterator, 's': scalar}
-    self.assertIsNone(manager.save(2, state, wait=True))
+    pinned = manager.save(2, state, wait=True)
+    assert pinned is not None
     assert manager.latest is not None
     self.assertEqual(manager.latest.step, 2)
+    self.assertIs(pinned['it'], iterator)
+    self.assertEqual(pinned['a'].sharding.memory_kind, 'pinned_host')
+    self.assertEqual(pinned['s'].sharding.memory_kind, 'pinned_host')
 
-    events = []
-    saved = []
-
-    def wait_fn():
-      assert manager.latest is not None
-      events.append(('wait', manager.latest.step))
-
-    def save_fn(pinned):
-      assert manager.latest is not None
-      events.append(('save', manager.latest.step))
-      saved.append(pinned)
-      return 'saved'
-
-    result = manager.save(
-        3, state, checkpointer_wait_fn=wait_fn, checkpointer_save_fn=save_fn
-    )
-    self.assertEqual(result, 'saved')
-    self.assertEqual(events, [('wait', 2), ('save', 3)])
-    self.assertIs(saved[0]['it'], iterator)
-    self.assertEqual(saved[0]['a'].sharding.memory_kind, 'pinned_host')
-    self.assertEqual(saved[0]['s'].sharding.memory_kind, 'pinned_host')
-
-    # Overwriting the snapshot leaves previously shared host buffers valid, and
-    # same-step state updates re-snapshot instead of returning stale buffers.
+    # Overwriting the snapshot leaves previously returned host buffers valid,
+    # and same-step state updates re-snapshot instead of returning stale ones.
     updated = {'a': self.pytree['a'] + 5, 'it': 'v2', 's': scalar}
-    manager.save(3, updated, checkpointer_save_fn=saved.append)
-    self.assertFalse(saved[0]['a'].is_deleted())
-    test_utils.assert_tree_equal(self, updated['a'], saved[1]['a'])
-    self.assertEqual(saved[1]['it'], 'v2')
+    pinned_updated = manager.save(2, updated, wait=True)
+    assert pinned_updated is not None
+    self.assertFalse(pinned['a'].is_deleted())
+    test_utils.assert_tree_equal(self, updated['a'], pinned_updated['a'])
+    self.assertEqual(pinned_updated['it'], 'v2')
 
-    # Snapshot failure falls back to passing `state` to `checkpointer_save_fn`,
-    # while errors raised by `checkpointer_save_fn` propagate to the caller.
+    # Synchronous snapshot errors propagate to the caller without overwriting
+    # the previous snapshot.
     with mock.patch.object(jax, 'block_until_ready', side_effect=RuntimeError):
-      fallback = manager.save(
-          4, state, checkpointer_save_fn=lambda tree: tree
-      )
-    self.assertIs(fallback, state)
-    with self.assertRaisesRegex(ValueError, 'checkpointer boom'):
-      manager.save(
-          5,
-          state,
-          checkpointer_save_fn=mock.Mock(
-              side_effect=ValueError('checkpointer boom')
-          ),
-      )
+      with self.assertRaises(RuntimeError):
+        manager.save(3, state, wait=True)
+    assert manager.latest is not None
+    self.assertEqual(manager.latest.step, 2)
 
   def test_copy_device_arrays_for_async_transfer(self):
     manager = snapshotter.Snapshotter(
@@ -755,11 +737,19 @@ class SnapshotterTest(parameterized.TestCase):
     )
 
   @parameterized.named_parameters(
-      dict(testcase_name='mismatched_replicas', replica_axis_index=0),
-      dict(testcase_name='replica_axis_out_of_range', replica_axis_index=5),
+      dict(
+          testcase_name='mismatched_replicas',
+          replica_axis_index=0,
+          expected_error=ValueError,
+      ),
+      dict(
+          testcase_name='replica_axis_out_of_range',
+          replica_axis_index=5,
+          expected_error=IndexError,
+      ),
   )
-  def test_worker_survives_split_errors_of_on_device_copies(
-      self, replica_axis_index
+  def test_copy_device_arrays_validates_state_synchronously(
+      self, replica_axis_index, expected_error
   ):
     manager = snapshotter.Snapshotter(
         replica_axis_index=replica_axis_index,
@@ -769,7 +759,8 @@ class SnapshotterTest(parameterized.TestCase):
         'four_slices': self.pytree['a'],
         'two_slices': self.pytree_2_slices['a'],
     }
-    manager.save(1, mismatched_tree)
+    with self.assertRaises(expected_error):
+      manager.save(1, mismatched_tree)
     manager.join()
     self.assertIsNone(manager.latest)
     if replica_axis_index == 0:
