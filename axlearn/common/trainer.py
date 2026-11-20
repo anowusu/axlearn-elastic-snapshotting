@@ -20,8 +20,8 @@ from jax.experimental import multihost_utils
 from jax.experimental.pjit import pjit
 from pathwaysutils.elastic import manager as elastic_manager
 
+from axlearn.common import elastic_utils, measurement, utils
 from axlearn.common import file_system as fs
-from axlearn.common import measurement, utils
 from axlearn.common.base_layer import ParameterSpec
 from axlearn.common.base_model import BaseModel
 from axlearn.common.checkpointer import BaseCheckpointer, Checkpointer
@@ -151,6 +151,8 @@ class SpmdTrainer(Module):
         # The checkpointer config.
         checkpointer: BaseCheckpointer.Config = Checkpointer.default_config()
         elastic_enabled: bool = False
+        elastic_min_slice_count: int = -1
+        elastic_scale_grad_accumulation: bool = True
         # A dict of evaler names to configs, each name must be non-empty.
         evalers: dict[str, SpmdEvaler.Config] = {}
 
@@ -301,15 +303,14 @@ class SpmdTrainer(Module):
                 [device.platform for device in local_devices],
             )
         self._step_log("Mesh shape: %s", cfg.mesh_shape)
-        devices = (
-            utils.create_device_mesh(mesh_shape=cfg.mesh_shape) if devices is None else devices
-        )
-        mesh = jax.sharding.Mesh(devices, cfg.mesh_axis_names)
+        kw = dict(minimum_slice_count=cfg.elastic_min_slice_count, poll_interval=5)
+        self._elastic_manager = mgr = elastic_manager.Manager(**kw) if cfg.elastic_enabled else None
+        if devices is None:
+            devices = utils.create_device_mesh(cfg.mesh_shape, devices=mgr and mgr.active_devices)
+        self._mesh = mesh = jax.sharding.Mesh(devices, cfg.mesh_axis_names)
         self._step_log("Global mesh: %s", mesh)
-        self._mesh = mesh
-        if cfg.elastic_enabled:
-            self._elastic_manager = elastic_manager.Manager(minimum_slice_count=-1, poll_interval=5)
-            self._step_log("[ELASTIC][SCALE] devices=%s", mesh.size)
+        if mgr is not None:
+            jax.config.update("jax_default_device", mgr.default_device)
         self._context_manager: Callable[[], ContextManager] = (
             maybe_instantiate(cfg.context_manager) or contextlib.nullcontext
         )
@@ -324,6 +325,7 @@ class SpmdTrainer(Module):
                 xsc_check_policy = maybe_instantiate(cfg.xsc_check_policy)
         self._xsc_check_policy: Optional[Callable[[int], bool]] = xsc_check_policy
         self._compiled_train_step: Optional[jax.stages.Compiled] = None
+        self._compiled_train_steps: dict[tuple[int, ...], jax.stages.Compiled] = {}
 
         # Create all children within the mesh context so that utils.input_partition_spec() works
         # properly.
@@ -332,9 +334,10 @@ class SpmdTrainer(Module):
                 cfg.input = maybe_set_config(
                     cfg.input, partition_spec=PartitionSpec(cfg.batch_axis_names)
                 )
-            self.input: Input = self._add_child(
-                "input", maybe_set_config(cfg.input, is_training=True)
-            )
+            with elastic_utils.input_mesh(self, cfg.input):
+                self.input: Input = self._add_child(
+                    "input", maybe_set_config(cfg.input, is_training=True)
+                )
             # Start from the beginning of the input dataset by default.
             self._input_iter = iter(self.input.dataset())
             cfg.summary_writer.dir = cfg.summary_writer.dir or os.path.join(
@@ -428,14 +431,6 @@ class SpmdTrainer(Module):
 
     def mesh(self):
         return jax.sharding.Mesh(self._mesh.devices, self._mesh.axis_names)
-
-    def _restore_after_elastic_event(self):
-        if self._trainer_state is not None:
-            return
-        self._step_log("[ELASTIC][SCALE] devices=%s unchanged; reusing mesh.", self._mesh.size)
-        self.checkpointer.cancel()
-        if self.restore_checkpoint() is None:
-            raise RuntimeError("Failed to restore from both snapshot and checkpoint.")
 
     @contextlib.contextmanager
     def _watchdog(self):
@@ -642,7 +637,7 @@ class SpmdTrainer(Module):
                 while True:
                     self._maybe_record_event(measurement.Event.START_DATA_LOADING)
                     try:
-                        input_batch = next(input_iterator)
+                        input_batch = elastic_utils.next_batch(self, input_iterator)
                         self._maybe_record_event(measurement.Event.END_DATA_LOADING)
                         logging.log_first_n(
                             logging.INFO, "host_input_batch=%s", 3, utils.shapes(input_batch)
@@ -686,17 +681,8 @@ class SpmdTrainer(Module):
                     self._step_log("Reached end of inputs. Stopping")
                 return jax.block_until_ready(output) if cfg.elastic_enabled else output
 
-            if cfg.elastic_enabled:
-                _train_loop = self._elastic_manager.elastic_retry(
-                    max_retries=100,
-                    timeout=3600,
-                    poll_interval=5,
-                    pre_callback=self._restore_after_elastic_event,
-                    on_elastic_event_callback=lambda: setattr(self, "_trainer_state", None),
-                )(_train_loop)
-
             with self.checkpointer:
-                output = _train_loop()
+                output = elastic_utils.wrap_train_loop(self, _train_loop)()
             self._step_log("Checkpointer flushed.")
             return output
 
@@ -895,6 +881,8 @@ class SpmdTrainer(Module):
                 value.shape,
                 state_spec_map.get(path),
             )
+            if jax.dtypes.issubdtype(value.dtype, jax.dtypes.prng_key):
+                value = jax.random.key_data(value)
             total_state_bytes += value.size * value.dtype.itemsize
             shard_shape = value.sharding.shard_shape(value.shape)
             total_sharded_state_bytes += math.prod(shard_shape) * value.dtype.itemsize
@@ -966,6 +954,7 @@ class SpmdTrainer(Module):
             return False
 
         self._jit_train_step = self._pjit_train_step()
+        elastic_utils.aot_compile(self)
         self._maybe_record_event(measurement.Event.END_TRAINING_PREPARATION)
         return True
 
@@ -1054,6 +1043,12 @@ class SpmdTrainer(Module):
             self.checkpointer.save(
                 step=self.step, state=ckpt_state, evaler_summaries=evaler_summaries
             )
+            if (mgr := self._elastic_manager) and mgr.available_inactive_slices:
+                fn = getattr(self.checkpointer, "flush_for_scale_up", lambda **_: True)
+                ready = self._is_initialized and self.step < cfg.max_step
+                if ready and fn(step=self.step, state=ckpt_state):
+                    self._step_log("[ELASTIC] New slice ready at step=%s; scaling up", self.step)
+                    raise elastic_manager.ScaleUpSignalError(f"Scale-up at step {self.step}")
 
     def _restore_from_builder(self) -> Optional[TrainerStateBuilder.State]:
         """Restores trainer state by building it with init_state_builder."""
@@ -1078,7 +1073,7 @@ class SpmdTrainer(Module):
         return built_state
 
     def _get_compiled_train_step_fn(
-        self, *, trainer_state: TrainerState, input_batch: NestedTensor, with_xsc: bool = False
+        self, *, trainer_state: Any = None, input_batch: Any = None, with_xsc: bool = False
     ) -> Callable[[TrainerState, NestedTensor], tuple[TrainerState, NestedTensor]]:
         """Build a fully compiled train step function.
 
@@ -1104,20 +1099,12 @@ class SpmdTrainer(Module):
             return self._compiled_train_step
         cfg: SpmdTrainer.Config = self.config
         # Get device kinds and assert that they are homogenous.
-        # TODO(markblee): Get devices from self._mesh.devices.
-        device_kinds = set(d.device_kind for d in jax.devices())
+        device_kinds = {d.device_kind for d in self._mesh.devices.flat}
         if len(device_kinds) != 1:
             raise RuntimeError(f"Heterogenous device kinds ({device_kinds}) are not supported.")
         device_kind = device_kinds.pop()
 
-        mesh_shape = cfg.mesh_shape
-        if isinstance(mesh_shape, HybridMeshShape):
-            # Combine dcn_mesh_shape and ici_mesh_shape.
-            dcn_mesh_shape = mesh_shape.dcn_mesh_shape
-            ici_mesh_shape = mesh_shape.ici_mesh_shape
-            assert len(dcn_mesh_shape) == len(ici_mesh_shape)
-            mesh_shape = tuple(x * y for x, y in zip(dcn_mesh_shape, ici_mesh_shape))
-
+        mesh_shape = self._mesh.devices.shape
         options = infer_xla_performance_flags(
             mesh_shape=mesh_shape, mesh_axis_names=cfg.mesh_axis_names, device_kind=device_kind
         )
@@ -1127,9 +1114,10 @@ class SpmdTrainer(Module):
                 measurement.Event.START_CUSTOM_BADPUT_EVENT,
                 custom_badput_event_type="COMPILATION_NO_XSC",
             )
-            self._compiled_train_step = self.compile_train_step(
+            compiled = self._compiled_train_step = self.compile_train_step(
                 trainer_state=trainer_state, input_batch=input_batch, compiler_options=options
             )
+            self._compiled_train_steps[tuple(d.id for d in self._mesh.devices.flat)] = compiled
             self._maybe_record_event(
                 measurement.Event.END_CUSTOM_BADPUT_EVENT,
                 custom_badput_event_type="COMPILATION_NO_XSC",
@@ -1182,12 +1170,9 @@ class SpmdTrainer(Module):
 
         n = self._config.log_every_n_steps or 100
         if self.step % n == 0 or 0 <= self.step <= 5:
-            # Fetch the loss here: logging formats lazily and swallows errors, which would hide
-            # device errors (e.g. after a slice goes down) from elastic retry.
-            loss = outputs["loss"].item() if hasattr(outputs["loss"], "item") else outputs["loss"]
             self._step_log(
                 "loss=%s aux=%s",
-                loss,
+                outputs["loss"].item() if hasattr(outputs["loss"], "item") else outputs["loss"],
                 jax.tree.map(lambda x: x.item() if x.ndim == 0 else f"T{x.shape}", outputs["aux"]),
             )
 
@@ -1273,21 +1258,27 @@ class SpmdTrainer(Module):
         Returns:
             A compiled training step, with signature matching self._pjit_train_step's return.
         """
+        mgr = self._elastic_manager
+
+        def _as_struct(x: Any, s: Any = None) -> jax.ShapeDtypeStruct:
+            sh = (s or x).sharding
+            sh = sh.with_memory_kind(sh.memory_kind or "device") if mgr else None
+            return jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=sh)
+
         with self.mesh(), self._context_manager():
             if trainer_state is None:
                 # Do not run init(), which requires real devices.
-                trainer_state = jax.tree.map(
-                    lambda spec: jax.ShapeDtypeStruct(shape=spec.shape, dtype=spec.dtype),
-                    self.trainer_state_specs,
-                )
+                specs = self.trainer_state_specs
+                trainer_state = jax.tree.map(_as_struct, self._trainer_state or specs, specs)
             if input_batch is None:
                 # Infer global input batch shapes from input element spec.
-                host_batch = self.input.element_spec()
+                host_batch = elastic_utils.next_batch(self, None, specs=self.input.element_spec())
                 if "input_dispatcher" in self.input.children:
                     host_batch = self.input.input_dispatcher.logical_to_physical_shapes(host_batch)
                 input_batch = host_to_global_specs(
                     host_batch, partition=self._train_step_input_partition_specs()
                 )
+                input_batch = jax.tree.map(_as_struct, input_batch) if mgr else input_batch
 
             # Rely on the instance handle to ensure that we hit the compilation cache if possible.
             jit_train_step = self._jit_train_step or self._pjit_train_step()
@@ -1296,6 +1287,8 @@ class SpmdTrainer(Module):
             lowered_train_step = jit_train_step.lower(trainer_state, input_batch)
             compiled = lowered_train_step.compile(compiler_options=compiler_options)
             logging.info("AOT Model Analysis:\n%s", aot_model_analysis(compiled))
+            if mgr:
+                mgr.record_baseline_memory(compiled, num_devices=self._mesh.size)
             return compiled
 
     def _train_step(
