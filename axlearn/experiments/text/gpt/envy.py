@@ -25,6 +25,7 @@ Architecture names follow apple varieties: Fuji, Gala, etc.
 import functools
 from typing import Any, Literal, Sequence, Union
 
+import jax
 from jax.ad_checkpoint import checkpoint_policies as jax_remat_policies
 
 from axlearn.common import causal_lm, config
@@ -274,22 +275,32 @@ def get_trainer_kwargs(
             ),
             learner_kwargs=dict(peak_lr=0.01, weight_decay=1e-4, lr_warmup_steps=5_000),
             max_sequence_length=max_sequence_length,
-            train_batch_size=tokens_per_batch // max_sequence_length,  # 8M tokens.
+            train_batch_size=len(jax.devices()),
             max_step=250_000,  # Most of the evals were done at 100k steps in the paper.
             mesh_shape=mesh_shape_from_axes(fsdp=-1, expert=16),
             mesh_rules=(
                 (
-                    "tpu-v5p-(1024|2048)",
+                    "tpu-v5p-.*",
                     ChainConfigModifier.default_config().set(
                         config_modifiers=[
                             MeshShapeModifier.default_config().set(
-                                mesh_shape=mesh_shape_from_axes(data=-1, expert=16, fsdp=16)
+                                mesh_shape=HybridMeshShape(
+                                    ici_mesh_shape=mesh_shape_from_axes(fsdp=-1, expert=16),
+                                    dcn_mesh_shape=mesh_shape_from_axes(data=-1),
+                                )
                             ),
                             RematSpecModifier.default_config().set(
                                 remat_policies={
                                     "model.decoder.transformer.layer": RematSpec(
                                         prevent_cse=True,
-                                        policy=offload_attention_proj_policy,
+                                        policy=config_for_function(
+                                            save_and_offload_only_these_names_regex
+                                        ).set(
+                                            names_which_can_be_saved=RematRegexSavePatterns.QKV_PROJ.value,
+                                            names_which_can_be_offloaded=RematRegexSavePatterns.INPUT.value,
+                                            offload_src="device",
+                                            offload_dst="pinned_host",
+                                        ),
                                     ),
                                 }
                             ),

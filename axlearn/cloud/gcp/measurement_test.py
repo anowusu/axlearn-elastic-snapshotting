@@ -8,9 +8,13 @@ from unittest import mock
 from absl import flags, logging
 from absl.testing import absltest, parameterized
 
+from axlearn.cloud.gcp import measurement as measurement_gcp
 from axlearn.cloud.gcp.measurement import GoodputRecorder
-from axlearn.common import measurement
+from axlearn.common import elastic_utils, measurement
 from axlearn.common.config import RequiredFieldMissingError
+
+_ELASTIC_RECORDER = "ml_goodput_measurement.src.goodput_elastic.ElasticGoodputRecorder"
+_ELASTIC_MONITOR = "ml_goodput_measurement.src.monitoring_elastic.ElasticGoodputMonitor"
 
 
 class GoodputRecorderTest(parameterized.TestCase):
@@ -59,6 +63,17 @@ class GoodputRecorderTest(parameterized.TestCase):
             expected_jax_backend=None,
             expected_enable_monitoring=False,
         ),
+        dict(
+            recorder_spec=[
+                "name=test-name",
+                "upload_dir=/test/path",
+                "upload_interval=15",
+                "enable_checkpoint_logging=false",
+            ],
+            expected_rolling_window_size=[],
+            expected_jax_backend=None,
+            expected_enable_checkpoint_logging=False,
+        ),
     )
     def test_from_flags(
         self,
@@ -66,6 +81,7 @@ class GoodputRecorderTest(parameterized.TestCase):
         expected_rolling_window_size,
         expected_jax_backend,
         expected_enable_monitoring=True,
+        expected_enable_checkpoint_logging=True,
     ):
         """Tests that flags are correctly parsed into the config."""
         mock_fv = mock.MagicMock(spec=flags.FlagValues)
@@ -80,6 +96,9 @@ class GoodputRecorderTest(parameterized.TestCase):
         self.assertEqual(expected_rolling_window_size, recorder.config.rolling_window_size)
         self.assertEqual(expected_jax_backend, recorder.config.jax_backend)
         self.assertEqual(expected_enable_monitoring, recorder.config.enable_monitoring)
+        self.assertEqual(
+            expected_enable_checkpoint_logging, recorder.config.enable_checkpoint_logging
+        )
 
     def test_from_flags_missing_required(self):
         """Tests that missing required flags raise an error."""
@@ -151,7 +170,7 @@ class GoodputRecorderTest(parameterized.TestCase):
         )
         recorder = GoodputRecorder(cfg)
 
-        with mock.patch("ml_goodput_measurement.goodput.GoodputRecorder") as mock_recorder_cls:
+        with mock.patch(_ELASTIC_RECORDER) as mock_recorder_cls:
             mock_instance = mock_recorder_cls.return_value
 
             start_mock = mock.MagicMock()
@@ -178,7 +197,7 @@ class GoodputRecorderTest(parameterized.TestCase):
 
         with mock.patch("jax.process_index", return_value=0):
             with (
-                mock.patch("ml_goodput_measurement.goodput.GoodputRecorder") as mock_recorder_cls,
+                mock.patch(_ELASTIC_RECORDER) as mock_recorder_cls,
                 mock.patch.object(logging, "warning") as mock_warning,
             ):
                 mock_instance = mock_recorder_cls.return_value
@@ -496,7 +515,7 @@ class GoodputRecorderTest(parameterized.TestCase):
         recorder = GoodputRecorder(cfg)
 
         # Verify that goodput recording still works (not monitoring/uploading)
-        with mock.patch("ml_goodput_measurement.goodput.GoodputRecorder") as mock_recorder_cls:
+        with mock.patch(_ELASTIC_RECORDER) as mock_recorder_cls:
             mock_instance = mock_recorder_cls.return_value
             mock_instance.record_job_start_time = mock.MagicMock()
             mock_instance.record_job_end_time = mock.MagicMock()
@@ -515,6 +534,364 @@ class GoodputRecorderTest(parameterized.TestCase):
             with recorder.maybe_monitor_all():
                 pass
             mock_monitor_cls.assert_not_called()
+
+    @parameterized.parameters(
+        dict(enable_checkpoint_logging=True, process_index=0, expect_logger=True),
+        dict(enable_checkpoint_logging=False, process_index=0, expect_logger=False),
+        # As in MaxText, every process logs its checkpoint statistics.
+        dict(enable_checkpoint_logging=True, process_index=1, expect_logger=True),
+    )
+    def test_checkpoint_logger(self, enable_checkpoint_logging, process_index, expect_logger):
+        """Tests that the checkpoint logger writes to the goodput log."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-ckpt-logger",
+            upload_dir="/test",
+            upload_interval=30,
+            enable_checkpoint_logging=enable_checkpoint_logging,
+        )
+        recorder = GoodputRecorder(cfg)
+        with (
+            mock.patch("jax.process_index", return_value=process_index),
+            mock.patch("orbax.checkpoint.logging.CloudLogger") as mock_logger_cls,
+            mock.patch.object(measurement_gcp.logging, "info") as mock_info,
+        ):
+            logger = recorder.checkpoint_logger()
+        if not expect_logger:
+            self.assertIsNone(logger)
+            mock_logger_cls.assert_not_called()
+            return
+        self.assertIsInstance(logger, measurement_gcp._SafeLogger)
+        self.assertIs(mock_logger_cls.return_value, logger._logger)
+        mock_info.assert_any_call(
+            "Successfully set up checkpoint cloud logger: %s", "goodput_logger_test-ckpt-logger"
+        )
+        options = mock_logger_cls.call_args.kwargs["options"]
+        # Same names as the goodput recorder, whose log the library reads.
+        self.assertEqual("test-ckpt-logger", options.job_name)
+        self.assertEqual("goodput_logger_test-ckpt-logger", options.logger_name)
+
+    @mock.patch("jax.process_index", return_value=0)
+    def test_checkpoint_logger_unavailable(self, _):
+        """Tests that no logger is returned if it cannot be created."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-ckpt-logger", upload_dir="/test", upload_interval=30
+        )
+        recorder = GoodputRecorder(cfg)
+        with mock.patch(
+            "orbax.checkpoint.logging.CloudLogger", side_effect=RuntimeError("no credentials")
+        ):
+            self.assertIsNone(recorder.checkpoint_logger())
+
+    @mock.patch("jax.process_index", return_value=0)
+    def test_record_end_job_flushes(self, _):
+        """Tests that goodput logs are flushed at the end of the job."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-flush", upload_dir="/test", upload_interval=30
+        )
+        recorder = GoodputRecorder(cfg)
+        # Flushing before any event is recorded is a no-op.
+        recorder.flush()
+        with mock.patch(_ELASTIC_RECORDER) as mock_recorder_cls:
+            mock_instance = mock_recorder_cls.return_value
+            recorder.record(measurement.Event.START_JOB)
+            mock_instance.flush.assert_not_called()
+            recorder.record(measurement.Event.END_JOB)
+            mock_instance.record_job_end_time.assert_called_once()
+            mock_instance.flush.assert_called_once()
+            # `flush()` can also be called directly, e.g. on the exception path.
+            recorder.flush()
+            self.assertEqual(2, mock_instance.flush.call_count)
+
+    @mock.patch("jax.process_index", return_value=0)
+    def test_maybe_monitor_all_reentrant(self, _):
+        """Tests that only the outermost monitoring context starts and stops the uploaders."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-reentrant", upload_dir="/test", upload_interval=30, rolling_window_size=[5]
+        )
+        recorder = GoodputRecorder(cfg)
+        with mock.patch("ml_goodput_measurement.monitoring.GoodputMonitor") as mock_monitor_cls:
+            mock_monitor = mock_monitor_cls.return_value
+            with recorder.maybe_monitor_all():
+                mock_monitor.start_goodput_uploader.assert_called_once()
+                with recorder.maybe_monitor_all():
+                    pass
+                # The inner context (e.g. `SpmdTrainer.run`) must not trigger the final upload
+                # before the outer one (e.g. `launch_trainer.run_trainer`) records END_JOB.
+                mock_monitor.stop_goodput_uploader.assert_not_called()
+                mock_monitor.stop_rolling_window_goodput_uploader.assert_not_called()
+            mock_monitor.start_goodput_uploader.assert_called_once()
+            mock_monitor.stop_goodput_uploader.assert_called_once()
+            mock_monitor.stop_rolling_window_goodput_uploader.assert_called_once()
+            # The recorder can be monitored again afterwards.
+            with recorder.maybe_monitor_all():
+                pass
+            self.assertEqual(2, mock_monitor.stop_goodput_uploader.call_count)
+
+    @parameterized.parameters(dict(elastic=True), dict(elastic=False))
+    @mock.patch("jax.process_index", return_value=0)
+    def test_maybe_monitor_goodput_elastic(self, _, elastic):
+        """Tests that elastic jobs use the elastic monitor, which uploads the slice efficiency."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-monitor", upload_dir="/test", upload_interval=30, rolling_window_size=[5]
+        )
+        recorder = GoodputRecorder(cfg)
+        with (
+            mock.patch.object(
+                elastic_utils, "elastic_manager", mock.MagicMock() if elastic else None
+            ),
+            mock.patch(_ELASTIC_MONITOR) as mock_elastic_cls,
+            mock.patch("ml_goodput_measurement.monitoring.GoodputMonitor") as mock_monitor_cls,
+            mock.patch(_ELASTIC_RECORDER),
+        ):
+            recorder.record(measurement.Event.START_JOB)
+            with recorder.maybe_monitor_all():
+                pass
+        if not elastic:
+            mock_elastic_cls.assert_not_called()
+            self.assertEqual(2, mock_monitor_cls.call_count)
+            return
+        mock_monitor_cls.assert_not_called()
+        # Both the cumulative and the rolling window monitors.
+        self.assertEqual(2, mock_elastic_cls.call_count)
+        mock_elastic_cls.assert_any_call(
+            job_name="test-monitor",
+            logger_name="goodput_logger_test-monitor",
+            tensorboard_dir="/test",
+            upload_interval=30,
+            monitoring_enabled=True,
+            include_badput_breakdown=True,
+            include_slice_efficiency=True,
+        )
+
+    @parameterized.parameters(
+        dict(recorder_spec=[], expected={}),
+        dict(
+            recorder_spec=["upload_interval=15", "enable_gcp_goodput_metrics=false"],
+            expected=dict(upload_interval=15, enable_gcp_goodput_metrics=False),
+        ),
+    )
+    def test_from_flags_monitoring_options(self, recorder_spec, expected):
+        """Tests the parsing and the defaults (as in MaxText) of the monitoring options."""
+        mock_fv = mock.MagicMock(spec=flags.FlagValues)
+        mock_fv.recorder_spec = ["name=test-name", "upload_dir=/test/path", *recorder_spec]
+        recorder = GoodputRecorder.from_flags(mock_fv)
+        defaults = dict(upload_interval=30, enable_gcp_goodput_metrics=True)
+        for key, value in {**defaults, **expected}.items():
+            self.assertEqual(value, getattr(recorder.config, key), key)
+
+    @mock.patch("jax.process_index", return_value=0)
+    def test_maybe_monitor_all_gcp_options(self, _):
+        """Tests that both monitors get the Google Cloud Monitoring options."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-gcp",
+            upload_dir="/test",
+            rolling_window_size=[5],
+            enable_gcp_goodput_metrics=False,
+        )
+        recorder = GoodputRecorder(cfg)
+        with mock.patch("ml_goodput_measurement.monitoring.GoodputMonitor") as mock_monitor_cls:
+            with recorder.maybe_monitor_all():
+                pass
+        self.assertEqual(2, mock_monitor_cls.call_count)
+        for call in mock_monitor_cls.call_args_list:
+            self.assertEqual(
+                measurement_gcp.goodput_monitoring.GCPOptions(enable_gcp_goodput_metrics=False),
+                call.kwargs["gcp_options"],
+            )
+
+    @mock.patch("jax.process_index", return_value=0)
+    def test_maybe_monitor_goodput_no_step_deviation_uploader(self, _):
+        """Tests that only the goodput uploader runs; it already uploads the step deviation."""
+        cfg = GoodputRecorder.default_config().set(name="test-step-deviation", upload_dir="/test")
+        recorder = GoodputRecorder(cfg)
+        with mock.patch("ml_goodput_measurement.monitoring.GoodputMonitor") as mock_monitor_cls:
+            with recorder._maybe_monitor_goodput():
+                pass
+        mock_monitor = mock_monitor_cls.return_value
+        mock_monitor.start_goodput_uploader.assert_called_once()
+        mock_monitor.start_step_deviation_uploader.assert_not_called()
+        self.assertNotIn("include_step_deviation", mock_monitor_cls.call_args.kwargs)
+
+    @mock.patch("jax.process_index", return_value=0)
+    def test_maybe_monitor_goodput_elastic_fallback(self, _):
+        """Tests that the base monitor is used if the elastic monitor cannot be created."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-monitor", upload_dir="/test", upload_interval=30
+        )
+        recorder = GoodputRecorder(cfg)
+        with (
+            mock.patch.object(elastic_utils, "elastic_manager", mock.MagicMock()),
+            mock.patch(_ELASTIC_MONITOR, side_effect=RuntimeError("unavailable")),
+            mock.patch("ml_goodput_measurement.monitoring.GoodputMonitor") as mock_monitor_cls,
+            mock.patch.object(measurement_gcp.logging, "warning") as mock_warning,
+        ):
+            with recorder._maybe_monitor_goodput():
+                pass
+        mock_warning.assert_called_once()
+        # Elastic jobs run on Pathways.
+        mock_monitor_cls.assert_called_once_with(
+            job_name="test-monitor",
+            logger_name="goodput_logger_test-monitor",
+            tensorboard_dir="/test",
+            upload_interval=30,
+            monitoring_enabled=True,
+            include_badput_breakdown=True,
+            pathway_enabled=True,
+        )
+        mock_monitor_cls.return_value.start_goodput_uploader.assert_called_once()
+
+    @parameterized.parameters(dict(fail_create=False), dict(fail_create=True))
+    @mock.patch("jax.process_index", return_value=0)
+    def test_record_failure_does_not_raise(self, _, fail_create):
+        """Tests that a failure to record an event, e.g. during an elastic recovery, is logged."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-record", upload_dir="/test", upload_interval=30
+        )
+        recorder = GoodputRecorder(cfg)
+        with (
+            mock.patch(_ELASTIC_RECORDER) as mock_recorder_cls,
+            mock.patch.object(measurement_gcp.logging, "log_every_n_seconds") as mock_log,
+        ):
+            if fail_create:
+                mock_recorder_cls.side_effect = RuntimeError("no credentials")
+            else:
+                mock_recorder_cls.return_value.record_elastic_wait_start_time.side_effect = (
+                    RuntimeError("Cloud Logging unavailable")
+                )
+            # Must not raise.
+            recorder.record(measurement.Event.START_ELASTIC_WAIT, "elastic_slice_down")
+        mock_log.assert_called_once()
+        self.assertEqual(logging.WARNING, mock_log.call_args.args[0])
+
+    @mock.patch("jax.process_index", return_value=0)
+    def test_record_and_record_event_share_the_elastic_recorder(self, _):
+        """Tests that `record_event()` and `record()` use the same elastic recorder."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-record", upload_dir="/test", upload_interval=30
+        )
+        recorder = GoodputRecorder(cfg)
+        with mock.patch(_ELASTIC_RECORDER) as mock_recorder_cls:
+            with recorder.record_event(measurement.EventType.JOB):
+                pass
+            recorder.record(measurement.Event.START_ELASTIC_WAIT, "elastic_slice_down")
+        mock_recorder_cls.assert_called_once()
+        mock_recorder_cls.return_value.record_elastic_wait_start_time.assert_called_once_with(
+            "elastic_slice_down"
+        )
+
+    @mock.patch("jax.process_index", return_value=0)
+    def test_record_preemption_logs_zero_slices_and_marker(self, _):
+        """Tests that `record_preemption()` zeroes slice counts, writes marker, and flushes."""
+        cfg = GoodputRecorder.default_config().set(
+            name="test-preempt", upload_dir="/test", upload_interval=30
+        )
+        recorder = GoodputRecorder(cfg)
+        fake_mgr = mock.MagicMock(total_slice_count=2)
+        with (
+            mock.patch.object(elastic_utils, "elastic_manager", fake_mgr),
+            mock.patch(_ELASTIC_RECORDER) as mock_recorder_cls,
+        ):
+            mock_rec = mock_recorder_cls.return_value
+            mock_rec._cloud_logger = mock.MagicMock()
+            recorder.record_preemption()
+        mock_rec.record_elastic_slice_counts.assert_called_once_with(0, 2, 0)
+        mock_rec._cloud_logger.write_cloud_logging_entry.assert_called_once()
+        payload = mock_rec._cloud_logger.write_cloud_logging_entry.call_args.args[0]
+        self.assertEqual("test-preempt", payload["job_name"])
+        self.assertIn("job_preempted_time", payload)
+        mock_rec.flush.assert_called_once()
+
+    def test_preemption_aware_elastic_calculator_excludes_queue_wait_and_stale_end(self):
+        """Tests preemption queue-wait exclusion, wasted-progress retention, and stale end strip."""
+        import datetime
+        import tempfile
+
+        from ml_goodput_measurement.src import goodput_utils
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Timeline:
+            # Attempt 1: t=1000..1110 (steps 0..10 at 10s/step; checkpoint committed at step 5).
+            # Preempted at t=1115 (or stale job_end_time=1114 from prior run).
+            # Unscheduled Kueue queue wait: 3600s (t=1115 -> t=4715).
+            # Attempt 2: resumes at t=4715 from step 5, runs steps 5..15 (t=4725..4825).
+            entries = [
+                {"job_name": "j", "job_start_time": 1000.0},
+                {
+                    "job_name": "j",
+                    "elastic_slice_counts_timestamp": 1000.0,
+                    "active_slices": 2,
+                    "available_slices": 2,
+                    "total_slices": 2,
+                },
+                *[
+                    {"job_name": "j", "step_count": s, "step_start_time": 1010.0 + s * 10.0}
+                    for s in range(11)
+                ],
+                {"job_name": "j", "job_end_time": 1114.0},
+                {
+                    "job_name": "j",
+                    "elastic_slice_counts_timestamp": 1115.0,
+                    "active_slices": 0,
+                    "available_slices": 0,
+                    "total_slices": 2,
+                },
+                {"job_name": "j", "job_preempted_time": 1115.0},
+                # 3600s unscheduled queue wait before Attempt 2 starts at t=4715:
+                {"job_name": "j", "job_start_time": 4715.0},
+                {
+                    "job_name": "j",
+                    "elastic_slice_counts_timestamp": 4715.0,
+                    "active_slices": 2,
+                    "available_slices": 2,
+                    "total_slices": 2,
+                },
+                *[
+                    {
+                        "job_name": "j",
+                        "step_count": s,
+                        "step_start_time": 4725.0 + (s - 5) * 10.0,
+                    }
+                    for s in range(5, 16)
+                ],
+            ]
+            calc = measurement_gcp.PreemptionAwareElasticGoodputCalculator(
+                job_name="j",
+                logger_name="goodput_logger_j",
+                cloud_logger=mock.MagicMock(),
+                using_pathways=True,
+                cache_dir=tmpdir,
+            )
+            now_dt = datetime.datetime.fromtimestamp(4835.0, tz=datetime.timezone.utc)
+            calc._cloud_logger.read_cloud_logging_entries.return_value = (
+                entries,
+                (now_dt, "id-last"),
+            )
+            with mock.patch.object(
+                measurement_gcp.datetime, "datetime", wraps=datetime.datetime
+            ) as m_dt:
+                m_dt.now.return_value = now_dt
+                with mock.patch(
+                    "ml_goodput_measurement.src.goodput.datetime.datetime", wraps=datetime.datetime
+                ) as m_gdt:
+                    m_gdt.now.return_value = now_dt
+                    gp, badput, max_step = calc.get_job_goodput(include_badput_breakdown=True)
+                    details = calc.get_job_goodput_details()
+
+            # Scheduled span = (1115 - 1000) + (4835 - 4715) = 115 + 120 = 235s; excluded = 3600s!
+            self.assertAlmostEqual(3600.0, details["total_excluded_time"], places=2)
+            self.assertAlmostEqual(235.0, details["total_elapsed_time"], places=2)
+            self.assertEqual(14, max_step)
+            # Productive = steps 0..4 (50s) + steps 5..14 (100s) = 150s -> ~63.83% (not ~3.9%!)
+            self.assertGreater(gp, 60.0)
+            # Wasted progress (steps 5..10 before preemption = 50s) is retained;
+            # Infra recovery only counts in-pod delta (1115 - 1110 = 5s), NOT the 3600s queue wait!
+            self.assertGreater(
+                badput[goodput_utils.BadputType.WASTED_PROGRESS_FROM_DISRUPTION], 15.0
+            )
+            self.assertLess(
+                badput[goodput_utils.BadputType.INFRASTRUCTURE_RECOVERY_FROM_DISRUPTION], 5.0
+            )
+            self.assertAlmostEqual(1.0, details["stepping_slice_efficiency"], places=2)
 
 
 if __name__ == "__main__":

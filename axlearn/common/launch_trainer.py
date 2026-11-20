@@ -2,8 +2,10 @@
 
 """Utilities to launch a trainer."""
 
+import contextlib
 import json
 import os
+import signal
 from typing import Any, Optional
 
 import jax
@@ -231,6 +233,25 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
 
     trainer: SpmdTrainer = trainer_config.instantiate(parent=None)
     prng_key = jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
-    output = trainer.run(prng_key)
-    measurement.record_event(measurement.Event.END_JOB)
+    recorder = measurement.global_recorder
+    prev_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _on_sigterm(signum, frame):
+        del signum, frame
+        logging.warning("Received SIGTERM (preemption/eviction); flushing goodput state.")
+        if (rec_preempt := getattr(recorder, "record_preemption", None)) is not None:
+            rec_preempt()
+        raise SystemExit(143)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    try:
+        with recorder.maybe_monitor_all() if recorder is not None else contextlib.nullcontext():
+            try:
+                output = trainer.run(prng_key)
+                measurement.record_event(measurement.Event.END_JOB)
+            finally:
+                if (flush := getattr(recorder, "flush", None)) is not None:
+                    flush()
+    finally:
+        signal.signal(signal.SIGTERM, prev_sigterm)
     return output

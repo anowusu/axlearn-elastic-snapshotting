@@ -34,7 +34,7 @@ from orbax.checkpoint._src.serialization.type_handlers import ArrayHandler
 from orbax.checkpoint.checkpoint_manager import CheckpointInfo, _ShouldSaveFnPolicy
 from tensorflow.python.checkpoint import async_checkpoint_helper
 
-from axlearn.common import utils
+from axlearn.common import measurement, utils
 from axlearn.common.checkpointer import (
     STEP_NUM_DIGITS,
     STEP_PREFIX,
@@ -45,7 +45,7 @@ from axlearn.common.checkpointer import (
     maybe_restore_python_savables,
     maybe_save_python_savables,
 )
-from axlearn.common.config import InstantiableConfig, config_class, maybe_instantiate
+from axlearn.common.config import ConfigOr, InstantiableConfig, config_class, maybe_instantiate
 from axlearn.common.module import Module
 from axlearn.common.utils import Nested, Tensor, TensorSpec
 
@@ -383,6 +383,8 @@ class OrbaxCheckpointer(BaseCheckpointer):
         # If set, GCS checkpoints are renamed into this path, relative to the bucket root, instead
         # of being deleted, and something else must empty it. See `ocp.CheckpointManagerOptions`.
         todelete_full_path: Optional[str] = None
+        # Optional logger of save/restore statistics, e.g. `GoodputRecorder.checkpoint_logger()`.
+        logger: Optional[ConfigOr[ocp.logging.AbstractLogger]] = None
         # Optional Orbax Pathways Snapshotter config for host-RAM snapshots.
         snapshotter: Optional[InstantiableConfig[Any]] = None
         snapshot_every_n_steps: int = 5
@@ -473,6 +475,9 @@ class OrbaxCheckpointer(BaseCheckpointer):
                 checkpointing_impl=orbax_pathways.CheckpointingImpl.COLOCATED_PYTHON,
                 enable_write_sharding_file=False,
             )
+        self._checkpoint_logger: Optional[ocp.logging.AbstractLogger] = maybe_instantiate(
+            cfg.logger
+        )
         CheckpointManager = (  # pylint: disable=invalid-name
             _CheckpointManagerWithTrackerFile
             if cfg.read_latest_checkpoint_from_tracker_file
@@ -511,16 +516,38 @@ class OrbaxCheckpointer(BaseCheckpointer):
                     restore_concurrent_gb=cfg.max_concurrent_restore_gb,
                 ),
             },
+            logger=self._checkpoint_logger,
         )
 
+    def _record_goodput_event(self, event: measurement.Event, *args, **kwargs) -> None:
+        parent_rec = getattr(self.parent, "_maybe_record_event", None)
+        if callable(parent_rec):
+            parent_rec(event, *args, **kwargs)
+        else:
+            measurement.record_event(event, *args, **kwargs)
+
     def _save_snapshot(self, step: int, state: Nested[Any], *, wait: bool = True) -> None:
-        if (snap := self.snapshotter) is not None:
-            snap.join()
-            s, n = getattr(snap.latest, "step", None), self.config.snapshot_every_n_steps
-            if s is not None and n > 0 and s < step - n:
-                jax.block_until_ready(state)
-            if s != step:
-                snap.save(step, self._snapshot_iterators(state), wait=wait)
+        if (snap := self.snapshotter) is None:
+            return
+        snap.join()
+        s, n = getattr(snap.latest, "step", None), self.config.snapshot_every_n_steps
+        if s is not None and n > 0 and s < step - n:
+            jax.block_until_ready(state)
+        if s == step:
+            return
+        if wait:
+            self._record_goodput_event(
+                measurement.Event.START_CUSTOM_BADPUT_EVENT,
+                custom_badput_event_type="SNAPSHOT_SAVE",
+            )
+        try:
+            snap.save(step, self._snapshot_iterators(state), wait=wait)
+        finally:
+            if wait:
+                self._record_goodput_event(
+                    measurement.Event.END_CUSTOM_BADPUT_EVENT,
+                    custom_badput_event_type="SNAPSHOT_SAVE",
+                )
 
     def _get_spec(self, *, step: int, state: Nested[Any]) -> Nested[Any]:
         spec = {"index": [("step", step)]}
@@ -608,7 +635,20 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
         if step is None and self.snapshotter is not None:
             latest_ckpt = self._manager.latest_step()
-            snap_step, snap_state = self.snapshotter.try_load(state)
+            has_snap = self.snapshotter.latest is not None
+            if has_snap:
+                self._record_goodput_event(
+                    measurement.Event.START_CUSTOM_BADPUT_EVENT,
+                    custom_badput_event_type="SNAPSHOT_RESTORE",
+                )
+            try:
+                snap_step, snap_state = self.snapshotter.try_load(state)
+            finally:
+                if has_snap:
+                    self._record_goodput_event(
+                        measurement.Event.END_CUSTOM_BADPUT_EVENT,
+                        custom_badput_event_type="SNAPSHOT_RESTORE",
+                    )
             if snap_step is not None and (latest_ckpt is None or snap_step >= latest_ckpt):
                 logging.info("[ELASTIC] Restored trainer_state from snapshot at step=%s", snap_step)
                 return snap_step, self._restore_snapshot_iterators(snap_state, state)
