@@ -90,10 +90,13 @@ try:
 
 except (ImportError, AttributeError):
   # jax<0.10.0
-  concatenate_by_mesh_axis = _FakeJaxFunction(
-      "jax.jaxlib._pathways._concatenate_by_mesh_axis",
-      "0.10.0",
-  )
+  def concatenate_by_mesh_axis(arrays, sharded_dim_idxs, out_shardings, **_):
+    def _cat(rs, d, sh):
+      ext = (sum(r.shape[d] for r in rs) if i == d else s for i, s in enumerate(rs[0].shape))
+      return jax.make_array_from_single_device_arrays(
+          tuple(ext), sh, [s.data for r in rs for s in r.addressable_shards]
+      )
+    return list(map(_cat, arrays, sharded_dim_idxs, out_shardings))
 
 
 @functools.lru_cache(maxsize=1)

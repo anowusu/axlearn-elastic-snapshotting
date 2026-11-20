@@ -18,11 +18,13 @@ retries a function in case of `jax.errors.JaxRuntimeError` caused by slice down
 events. It also provides a utility for waiting for slices to become active.
 """
 
-from collections.abc import Callable, Mapping, Sequence, Set
+from collections.abc import Callable, Iterator, Mapping, Sequence, Set
+import contextlib
 import functools
 import logging
+import math
 import threading
-from typing import Any, TypeAlias, TypeVar
+from typing import Any, NamedTuple, TypeAlias, TypeVar
 import warnings
 
 import jax
@@ -30,6 +32,15 @@ from pathwaysutils.elastic import elastic
 
 
 _logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
+_F = TypeVar("_F", bound=Callable[..., Any])
+RetryPolicy: TypeAlias = Callable[[int, Exception], bool]
+
+
+class StepPlan(NamedTuple):
+  batch_multiplier: int
+  grad_accum_steps: int
+  slice_batches: int
 
 
 class ElasticRuntimeError(RuntimeError):
@@ -45,10 +56,6 @@ class ScaleUpSignalError(Exception):
   elasticity manager to retry it with an updated slice configuration that
   includes the new hardware.
   """
-
-
-_F = TypeVar("_F", bound=Callable[..., Any])
-RetryPolicy: TypeAlias = Callable[[int, Exception], bool]
 
 
 def _elastic_event_cleanup() -> None:
@@ -101,46 +108,24 @@ class Manager:
   _stop_event: threading.Event | None
   _monitor_thread: threading.Thread | None
   def __init__(
-      self,
-      devices: Sequence[jax.Device] | None = None,
-      *,
+      self, devices: Sequence[jax.Device] | None = None, *,
       minimum_slice_count: int | None = None,
-      poll_interval: float | int = 10,
-      timeout: float | int | None = None,
+      poll_interval: float | int = 10, timeout: float | int | None = None,
   ) -> None:
-    """Initializes the manager.
-
-    Args:
-      devices: The devices to use. If None, jax.devices() is used.
-      minimum_slice_count: Minimum active slices to wait for (< 1 = all). If
-        None, active slices are sampled once without waiting.
-      poll_interval: Seconds between slice health checks when waiting.
-      timeout: Maximum seconds to wait when waiting, or None for no timeout.
-    """
-    if devices is None:
-      devices = jax.devices()
-    self.slice_to_devices = elastic.get_slice_to_devices(devices)
-
-    self.all_slice_indices = frozenset(self.slice_to_devices.keys())
-
-    self._active_slice_indices = frozenset()
-    self.available_inactive_slices = frozenset()
-
-    if minimum_slice_count is not None:
-      slice_count = None if minimum_slice_count < 1 else minimum_slice_count
-      self.active_slice_indices = elastic.wait_for_slices(
-          slice_count=slice_count,
-          poll_interval=poll_interval,
-          timeout=timeout,
-          slice_to_devices=self.slice_to_devices,
-      )
-    else:
-      self.active_slice_indices = elastic.get_active_slice_indices(
-          slice_to_devices=self.slice_to_devices
-      )
-
-    self._stop_event = None
-    self._monitor_thread = None
+    """Initializes the manager, optionally waiting for `minimum_slice_count` slices."""
+    s2d = self.slice_to_devices = elastic.get_slice_to_devices(
+        jax.devices() if devices is None else devices
+    )
+    self.all_slice_indices = frozenset(s2d)
+    self._active_slice_indices = self.available_inactive_slices = frozenset()
+    count = None if (minimum_slice_count or 0) < 1 else minimum_slice_count
+    self.active_slice_indices = (
+        elastic.get_active_slice_indices(slice_to_devices=s2d) if minimum_slice_count is None
+        else elastic.wait_for_slices(
+            slice_count=count, poll_interval=poll_interval, timeout=timeout, slice_to_devices=s2d
+        )
+    )
+    self._stop_event = self._monitor_thread = None
 
   def start_monitoring(self, poll_interval: float | int = 10) -> None:
     """Starts the background monitor thread.
@@ -225,6 +210,78 @@ class Manager:
     for slice_index in sorted(self.active_slice_indices):
       devices.extend(self.slice_to_devices[slice_index])
     return devices
+
+  _HBM_GIB = {"TPU7x": 96, "TPU v5p": 95, "TPU v6 lite": 32, "TPU v6e": 32}
+
+  def _slices_for(self, num_devices: int | None = None) -> int:
+    return self.active_slice_count if num_devices is None else max(
+        1, num_devices // len(self.slice_to_devices[0])
+    )
+
+  def record_baseline_memory(
+      self, compiled: Any, *, device: jax.Device | None = None,
+      num_devices: int | None = None, headroom: float = 0.20,
+  ) -> int:
+    """Infers safe per-device batch multiplier from a full-slice compiled step."""
+    if self._slices_for(num_devices) < self.total_slice_count:
+      return getattr(self, "_max_batch_multiplier", 1)
+    dev = device or self.default_device
+    hbm = self._HBM_GIB.get(dev.device_kind, 16) << 30
+    with contextlib.suppress(Exception):
+      hbm = (dev.memory_stats() or {}).get("bytes_limit") or hbm
+    mem = getattr(compiled, "memory_analysis", lambda: None)()
+    mult = 1
+    if mem and getattr(mem, "temp_size_in_bytes", 0) > 0:
+      avail = (1.0 - headroom) * hbm - mem.argument_size_in_bytes - mem.output_size_in_bytes
+      mult = max(1, int(avail // mem.temp_size_in_bytes))
+    self._max_batch_multiplier = mult
+    _logger.info("[ELASTIC] %s (%.1f GiB): max_batch=%dx", dev.device_kind, hbm / (1 << 30), mult)
+    return mult
+
+  def plan_step_scaling(
+      self, base_grad_accum_steps: int = 0, *, num_devices: int | None = None,
+      scale: bool = True, alignment: int = 1, max_batch_multiplier: int | None = None,
+  ) -> StepPlan:
+    """Factors degraded work into `(batch_multiplier, grad_accum_steps, slice_batches)`."""
+    slices, base_passes = self._slices_for(num_devices), max(1, base_grad_accum_steps)
+    if not scale or not 0 < slices < self.total_slice_count:
+      return StepPlan(1, base_grad_accum_steps, slices * base_passes)
+    caps = getattr(self, "_slice_batch_caps", {})
+    cap = max_batch_multiplier or caps.get(slices, getattr(self, "_max_batch_multiplier", 1))
+    aligned_cap = max(alignment, (cap // alignment) * alignment)
+    needed = math.ceil(self.total_slice_count * base_passes / slices)
+    passes = math.ceil(needed / aligned_cap)
+    batch_mult = math.ceil(needed / (passes * alignment)) * alignment
+    grad_steps = 0 if (passes == 1 and base_grad_accum_steps == 0) else passes
+    return StepPlan(batch_mult, grad_steps, slices * batch_mult * passes)
+
+  def compile_with_backoff(
+      self, compile_fn: Callable[[], _T], *, num_devices: int | None = None
+  ) -> _T:
+    """Runs `compile_fn`, backing off per-slice batch cap on XLA HBM OOM."""
+    slices = self._slices_for(num_devices)
+    caps = self.__dict__.setdefault("_slice_batch_caps", {})
+    for cap in range(caps.get(slices, getattr(self, "_max_batch_multiplier", 1)), 0, -1):
+      caps[slices] = cap
+      try:
+        return compile_fn()
+      except jax.errors.JaxRuntimeError as e:
+        msg = str(e).lower()
+        if cap == 1 or ("resource_exhausted" not in msg and "out of memory" not in msg):
+          raise
+    raise RuntimeError("Unreachable")
+
+  def aot_slice_subsets(self, minimum_slice_count: int | None = None) -> Iterator[list[jax.Device]]:
+    """Yields `active_devices` for each degraded slice prefix, restoring state on exit."""
+    orig_active, orig_available = self.active_slice_indices, self.available_inactive_slices
+    if minimum_slice_count and 0 < minimum_slice_count < len(ordered := sorted(orig_active)):
+      try:
+        for count in range(minimum_slice_count, len(ordered)):
+          self.active_slice_indices = frozenset(ordered[:count])
+          yield self.active_devices
+      finally:
+        self.active_slice_indices = orig_active
+        self.available_inactive_slices = orig_available
 
   def scale_by_active_slices(self, x: int | float) -> int | float:
     """Scale x by the number of active slices."""
@@ -344,7 +401,7 @@ class Manager:
         Deprecated: Use `retry_policy` instead.
         TODO: b/523384843 - Remove max_retries parameter.
       minimum_slice_count: The minimum number of slices required to run the
-        function. If None, defaults to the total number of slices.
+        function. If None or < 1, defaults to the total number of slices.
       poll_interval: The number of seconds to wait between activity checks.
         Defaults to 10 seconds.
       timeout: The maximum number of seconds to wait for slices to become active
@@ -368,7 +425,7 @@ class Manager:
     """
     target_slice_count = (
         self.total_slice_count
-        if minimum_slice_count is None
+        if minimum_slice_count is None or minimum_slice_count < 1
         else minimum_slice_count
     )
 
