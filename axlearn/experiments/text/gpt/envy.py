@@ -25,6 +25,7 @@ Architecture names follow apple varieties: Fuji, Gala, etc.
 import functools
 from typing import Any, Literal, Sequence, Union
 
+import jax
 from jax.ad_checkpoint import checkpoint_policies as jax_remat_policies
 
 from axlearn.common import causal_lm, config
@@ -41,7 +42,7 @@ from axlearn.common.base_layer import RematSpec
 from axlearn.common.config import TrainerConfigFn, config_for_function
 from axlearn.common.embedding import TransformerTextEmbeddings
 from axlearn.common.layers import RMSNorm
-from axlearn.common.mixture_of_experts import TransformerFeedForwardMoE, get_outer_batch_from_mesh
+from axlearn.common.mixture_of_experts import TransformerFeedForwardMoE
 from axlearn.common.trainer import SpmdTrainer
 from axlearn.common.trainer_config_modifier import (
     ChainConfigModifier,
@@ -274,22 +275,32 @@ def get_trainer_kwargs(
             ),
             learner_kwargs=dict(peak_lr=0.01, weight_decay=1e-4, lr_warmup_steps=5_000),
             max_sequence_length=max_sequence_length,
-            train_batch_size=tokens_per_batch // max_sequence_length,  # 8M tokens.
+            train_batch_size=len(jax.devices()),
             max_step=250_000,  # Most of the evals were done at 100k steps in the paper.
             mesh_shape=mesh_shape_from_axes(fsdp=-1, expert=16),
             mesh_rules=(
                 (
-                    "tpu-v5p-(1024|2048)",
+                    "tpu-v5p-.*",
                     ChainConfigModifier.default_config().set(
                         config_modifiers=[
                             MeshShapeModifier.default_config().set(
-                                mesh_shape=mesh_shape_from_axes(data=-1, expert=16, fsdp=16)
+                                mesh_shape=HybridMeshShape(
+                                    ici_mesh_shape=mesh_shape_from_axes(fsdp=-1, expert=16),
+                                    dcn_mesh_shape=mesh_shape_from_axes(data=-1),
+                                )
                             ),
                             RematSpecModifier.default_config().set(
                                 remat_policies={
                                     "model.decoder.transformer.layer": RematSpec(
                                         prevent_cse=True,
-                                        policy=offload_attention_proj_policy,
+                                        policy=config_for_function(
+                                            save_and_offload_only_these_names_regex
+                                        ).set(
+                                            names_which_can_be_saved=RematRegexSavePatterns.QKV_PROJ.value,
+                                            names_which_can_be_offloaded=RematRegexSavePatterns.INPUT.value,
+                                            offload_src="device",
+                                            offload_dst="pinned_host",
+                                        ),
                                     ),
                                 }
                             ),
@@ -433,7 +444,7 @@ def model_config(
         ffn_dim: The feed-forward dimension or config function.
             If None, defaults to a setting from https://arxiv.org/abs/2002.05202.
         flash_attention: If True, use flash attention implementation.
-        mesh_shape: the mesh shape, used to infer the outer batch size.
+        mesh_shape: Unused; outer batch size is inferred dynamically from the active mesh.
         kwargs: Default kwargs forwarded to `common_model_config`.
 
     Returns:
@@ -464,13 +475,9 @@ def model_config(
         query_scale=ScaleQuery.default_config().set(norm=norm_cfg.clone()),
         key_scale=ScaleKey.default_config().set(norm=norm_cfg.clone()),
     )
-    outer_batch_size = get_outer_batch_from_mesh(
-        mesh_axis_names=MESH_AXIS_NAMES,
-        outer_batch_axis_names=MOE_OUTER_BATCH_AXIS_NAMES,
-        mesh_shape=mesh_shape,
-    )
+    del mesh_shape
     expert_config = TransformerFeedForwardMoE.default_config().set(
-        outer_batch=outer_batch_size,
+        outer_batch=None,
         num_experts=num_experts,
         input_dim=hidden_dim,
         num_groups=num_groups,
